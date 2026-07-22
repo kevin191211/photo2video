@@ -2413,11 +2413,9 @@ fn collect_images_in_dir(dir: &Path) -> Vec<PathBuf> {
 
 /// 自然排序：img2.jpg 會排在 img10.jpg 前面
 fn natural_sort(paths: &mut [PathBuf]) {
-    paths.sort_by(|a, b| {
-        let ka = natural_key(&a.to_string_lossy().to_lowercase());
-        let kb = natural_key(&b.to_string_lossy().to_lowercase());
-        ka.cmp(&kb)
-    });
+    // 每個路徑只建一次排序鍵；用 sort_by 逐次比較時每次都要重新轉小寫、
+    // 解析數字並配置字串，大量照片時排序會慢上一個數量級
+    paths.sort_by_cached_key(|p| natural_key(&p.to_string_lossy().to_lowercase()));
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
