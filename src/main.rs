@@ -553,6 +553,8 @@ struct App {
     preview_rx: Option<Receiver<PreviewMsg>>,
     preview_tex: Option<egui::TextureHandle>,
     preview_error: Option<String>,
+    /// 已為哪一張照片的鄰居做過底圖預取（避免每幀重複觸發）
+    prefetch_for: Option<usize>,
     thumbs: HashMap<PathBuf, Thumb>,
     /// 縮圖解碼佇列：常駐工作執行緒從這裡領工作（含喚醒用 Condvar）
     thumb_jobs: Arc<(Mutex<VecDeque<PathBuf>>, Condvar)>,
@@ -632,6 +634,7 @@ impl App {
             preview_rx: None,
             preview_tex: None,
             preview_error: None,
+            prefetch_for: None,
             thumbs: HashMap::new(),
             thumb_jobs,
             thumb_rx,
@@ -671,6 +674,8 @@ impl App {
     fn mark_preview_dirty(&mut self) {
         self.preview_dirty = true;
         self.preview_error = None;
+        // 參數（如解析度）可能變了，閒置時重新評估鄰居預取
+        self.prefetch_for = None;
     }
 
     /// 依選取的照片與目前調色參數，在背景執行 ffmpeg 產生預覽圖
@@ -724,6 +729,23 @@ impl App {
         // 更新頻率被渲染時間自然限流；拖動滑桿的過程即時看到調色變化
         if self.preview_dirty && self.preview_rx.is_none() {
             self.spawn_preview(ctx);
+        }
+
+        // 閒置（目前照片已渲染完、沒在轉檔）時，背景預取前後張照片的底圖，
+        // 逐張瀏覽時切換到下一張直接命中快取
+        if !self.preview_dirty && self.preview_rx.is_none() && !self.is_working() {
+            if let Some(i) = self.preview_selected {
+                if self.prefetch_for != Some(i) {
+                    self.prefetch_for = Some(i);
+                    let (pw, ph) = preview_canvas(self.resolution);
+                    for j in [i.checked_sub(1), Some(i + 1)].into_iter().flatten() {
+                        if let Some(p) = self.photos.get(j) {
+                            let p = p.clone();
+                            thread::spawn(move || prefetch_preview_base(p, pw, ph));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2694,6 +2716,76 @@ const PREVIEW_BASE_CAP: usize = 4;
 /// 底圖檔名全域流水號
 static PREVIEW_BASE_SERIAL: AtomicU64 = AtomicU64::new(0);
 
+/// 預覽畫布尺寸：寬 960、依輸出解析度等比例的高（取偶數）
+fn preview_canvas(res: Resolution) -> (u32, u32) {
+    let pw: u32 = 960;
+    let ph = ((pw as f64 * res.h as f64 / res.w as f64 / 2.0).round() as u32) * 2;
+    (pw, ph)
+}
+
+/// 在背景為指定照片預先建置預覽底圖（已存在、建置中或 ffmpeg 未就緒則跳過）。
+/// 停留在一張照片時先把鄰近照片準備好，切換過去直接命中快取
+fn prefetch_preview_base(photo: PathBuf, pw: u32, ph: u32) {
+    if !FFMPEG_READY.load(Ordering::Relaxed) {
+        return;
+    }
+    let key = (
+        photo.clone(),
+        std::fs::metadata(&photo).and_then(|m| m.modified()).ok(),
+        ph,
+    );
+    let (out, serial) = {
+        let mut g = PREVIEW_BASE.lock().unwrap();
+        if g.iter().any(|b| b.key == key) {
+            return;
+        }
+        if g.len() >= PREVIEW_BASE_CAP {
+            let old = g.remove(0);
+            if let Some(f) = old.file {
+                let _ = std::fs::remove_file(f);
+            }
+        }
+        let serial = PREVIEW_BASE_SERIAL.fetch_add(1, Ordering::Relaxed);
+        g.push(PreviewBase {
+            key: key.clone(),
+            file: None,
+            serial,
+        });
+        (
+            std::env::temp_dir().join(format!("photo2video_prev_base_{serial}.bmp")),
+            serial,
+        )
+    };
+    let ok = (|| {
+        let mut cmd = FfmpegCommand::new();
+        cmd.arg("-y")
+            .input(photo.to_string_lossy())
+            .args([
+                "-vf",
+                &format!("scale={pw}:{ph}:force_original_aspect_ratio=decrease"),
+            ])
+            .args(["-frames:v", "1"])
+            .output(out.to_string_lossy());
+        let mut child = cmd.spawn().ok()?;
+        if let Ok(iter) = child.iter() {
+            for _ in iter {}
+        }
+        child.wait().ok().filter(|s| s.success())
+    })()
+    .is_some();
+    let mut stored = false;
+    if ok {
+        let mut g = PREVIEW_BASE.lock().unwrap();
+        if let Some(b) = g.iter_mut().find(|b| b.serial == serial && b.key == key) {
+            b.file = Some(out.clone());
+            stored = true;
+        }
+    }
+    if !stored {
+        let _ = std::fs::remove_file(&out);
+    }
+}
+
 /// 這次預覽渲染與底圖快取的關係
 enum BaseRole {
     /// 命中：直接以底圖當輸入
@@ -2715,9 +2807,7 @@ fn render_preview(
 ) -> PreviewResult {
     ensure_ffmpeg(|| {})?;
 
-    // 預覽畫布：寬 960、依輸出解析度等比例的高（取偶數）
-    let pw: u32 = 960;
-    let ph: u32 = ((pw as f64 * res.h as f64 / res.w as f64 / 2.0).round() as u32) * 2;
+    let (pw, ph) = preview_canvas(res);
 
     // 查底圖快取：命中就以縮小後的底圖當輸入；未命中（第一次看這張照片）
     // 就在本次渲染順便輸出底圖，原圖只解碼一次
