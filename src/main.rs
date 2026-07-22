@@ -1,9 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Receiver;
-use std::thread;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::OnceLock;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -11,6 +12,25 @@ use ffmpeg_sidecar::command::FfmpegCommand;
 use ffmpeg_sidecar::event::FfmpegEvent;
 
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "bmp", "webp", "tif", "tiff"];
+
+/// 全域配色：深色剪輯工具風格
+mod theme {
+    use eframe::egui::Color32;
+
+    pub const BG: Color32 = Color32::from_rgb(0x13, 0x14, 0x17); // 中央工作區
+    pub const PANEL: Color32 = Color32::from_rgb(0x1B, 0x1C, 0x21); // 側欄與上下欄
+    pub const CARD: Color32 = Color32::from_rgb(0x25, 0x27, 0x2D); // 卡片、按鈕
+    pub const CARD_HOVER: Color32 = Color32::from_rgb(0x2E, 0x30, 0x38);
+    pub const BORDER: Color32 = Color32::from_rgb(0x32, 0x34, 0x3C);
+    pub const TEXT: Color32 = Color32::from_rgb(0xE9, 0xEA, 0xEE);
+    pub const TEXT_WEAK: Color32 = Color32::from_rgb(0x9A, 0x9C, 0xA8);
+    pub const ACCENT: Color32 = Color32::from_rgb(0x5B, 0x8C, 0xFF);
+    pub const ACCENT_HOVER: Color32 = Color32::from_rgb(0x74, 0x9D, 0xFF);
+    pub const ACCENT_ACTIVE: Color32 = Color32::from_rgb(0x48, 0x76, 0xE6);
+    pub const SUCCESS: Color32 = Color32::from_rgb(0x3D, 0xBE, 0x7B);
+    pub const ERROR: Color32 = Color32::from_rgb(0xE5, 0x60, 0x5A);
+    pub const PREVIEW_BG: Color32 = Color32::from_rgb(0x0D, 0x0E, 0x10);
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum OutputFormat {
@@ -59,7 +79,13 @@ struct Resolution {
 
 impl Resolution {
     fn label(&self) -> String {
-        format!("{} x {}", self.w, self.h)
+        match (self.w, self.h) {
+            (1280, 720) => "HD 1280 × 720".into(),
+            (1920, 1080) => "Full HD 1920 × 1080".into(),
+            (2560, 1440) => "2K 2560 × 1440".into(),
+            (3840, 2160) => "4K 3840 × 2160".into(),
+            _ => format!("{} × {}", self.w, self.h),
+        }
     }
 
     const ALL: [Resolution; 4] = [
@@ -304,6 +330,13 @@ enum ConvertState {
 }
 
 type PreviewResult = Result<(u32, u32, Vec<u8>), String>;
+type ThumbMsg = (PathBuf, Option<(u32, u32, Vec<u8>)>);
+
+enum Thumb {
+    Loading,
+    Ready(egui::TextureHandle),
+    Failed,
+}
 
 struct App {
     photos: Vec<PathBuf>,
@@ -322,12 +355,17 @@ struct App {
     preview_rx: Option<Receiver<PreviewResult>>,
     preview_tex: Option<egui::TextureHandle>,
     preview_error: Option<String>,
+    thumbs: HashMap<PathBuf, Thumb>,
+    thumb_tx: Sender<ThumbMsg>,
+    thumb_rx: Receiver<ThumbMsg>,
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, initial_files: Vec<PathBuf>) -> Self {
         setup_chinese_fonts(&cc.egui_ctx);
-        Self {
+        apply_theme(&cc.egui_ctx);
+        let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
+        let mut app = Self {
             photos: Vec::new(),
             fps: 2,
             format: OutputFormat::Mp4,
@@ -344,7 +382,14 @@ impl App {
             preview_rx: None,
             preview_tex: None,
             preview_error: None,
+            thumbs: HashMap::new(),
+            thumb_tx,
+            thumb_rx,
+        };
+        if !initial_files.is_empty() {
+            app.add_photos(initial_files, &cc.egui_ctx);
         }
+        app
     }
 
     fn mark_preview_dirty(&mut self) {
@@ -409,6 +454,27 @@ impl App {
         }
     }
 
+    /// 接收背景執行緒解碼完成的縮圖並上傳為貼圖
+    fn poll_thumbs(&mut self, ctx: &egui::Context) {
+        while let Ok((path, res)) = self.thumb_rx.try_recv() {
+            let state = match res {
+                Some((w, h, rgba)) => {
+                    let img = egui::ColorImage::from_rgba_unmultiplied(
+                        [w as usize, h as usize],
+                        &rgba,
+                    );
+                    Thumb::Ready(ctx.load_texture(
+                        format!("thumb:{}", path.display()),
+                        img,
+                        Default::default(),
+                    ))
+                }
+                None => Thumb::Failed,
+            };
+            self.thumbs.insert(path, state);
+        }
+    }
+
     fn select_photo(&mut self, idx: Option<usize>) {
         if self.preview_selected != idx {
             self.preview_selected = idx;
@@ -423,7 +489,7 @@ impl App {
         matches!(self.state, ConvertState::Working { .. })
     }
 
-    fn add_photos(&mut self, mut files: Vec<PathBuf>) {
+    fn add_photos(&mut self, mut files: Vec<PathBuf>, ctx: &egui::Context) {
         files.retain(|p| is_image(p));
         for f in files {
             if !self.photos.contains(&f) {
@@ -436,6 +502,78 @@ impl App {
         }
         if self.preview_selected.is_some() {
             self.mark_preview_dirty();
+        }
+
+        // 背景載入還沒有縮圖的照片
+        let batch: Vec<PathBuf> = self
+            .photos
+            .iter()
+            .filter(|p| !self.thumbs.contains_key(*p))
+            .cloned()
+            .collect();
+        if !batch.is_empty() {
+            for p in &batch {
+                self.thumbs.insert(p.clone(), Thumb::Loading);
+            }
+            let tx = self.thumb_tx.clone();
+            let ctx = ctx.clone();
+            thread::spawn(move || {
+                for p in batch {
+                    let res = image::open(&p).ok().map(|img| {
+                        let t = img.thumbnail(320, 180).to_rgba8();
+                        (t.width(), t.height(), t.into_raw())
+                    });
+                    let _ = tx.send((p, res));
+                    ctx.request_repaint();
+                }
+            });
+        }
+    }
+
+    fn clear_photos(&mut self) {
+        self.photos.clear();
+        self.thumbs.clear();
+        self.preview_selected = None;
+        self.preview_tex = None;
+        self.preview_error = None;
+    }
+
+    fn remove_photo(&mut self, i: usize) {
+        self.photos.remove(i);
+        match self.preview_selected {
+            Some(s) if s == i => {
+                let next = if self.photos.is_empty() {
+                    None
+                } else {
+                    Some(s.min(self.photos.len() - 1))
+                };
+                self.preview_selected = None;
+                self.select_photo(next);
+            }
+            Some(s) if s > i => {
+                self.preview_selected = Some(s - 1);
+            }
+            _ => {}
+        }
+    }
+
+    fn pick_folder(&mut self, ctx: &egui::Context) {
+        if let Some(dir) = rfd::FileDialog::new()
+            .set_title("選擇照片資料夾")
+            .pick_folder()
+        {
+            let files = collect_images_in_dir(&dir);
+            self.add_photos(files, ctx);
+        }
+    }
+
+    fn pick_files(&mut self, ctx: &egui::Context) {
+        if let Some(files) = rfd::FileDialog::new()
+            .set_title("選擇照片")
+            .add_filter("圖片檔", IMAGE_EXTS)
+            .pick_files()
+        {
+            self.add_photos(files, ctx);
         }
     }
 
@@ -523,12 +661,688 @@ impl App {
             self.rx = None;
         }
     }
+
+    // ---------- UI ----------
+
+    fn ui_top_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("header")
+            .frame(
+                egui::Frame::default()
+                    .fill(theme::PANEL)
+                    .inner_margin(egui::Margin::symmetric(16, 10)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    // 品牌方塊
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 8, theme::ACCENT);
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "▶",
+                        egui::FontId::proportional(15.0),
+                        egui::Color32::WHITE,
+                    );
+                    ui.add_space(6.0);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.label(
+                            egui::RichText::new("Photo2Video")
+                                .strong()
+                                .size(16.0)
+                                .color(theme::TEXT),
+                        );
+                        ui.label(
+                            egui::RichText::new("照片轉影片工具")
+                                .size(10.5)
+                                .color(theme::TEXT_WEAK),
+                        );
+                    });
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if !self.photos.is_empty() {
+                            let secs = self.photos.len() as f32 / self.fps as f32;
+                            egui::Frame::default()
+                                .fill(theme::CARD)
+                                .corner_radius(12)
+                                .inner_margin(egui::Margin::symmetric(10, 4))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} 張照片 · 約 {:.1} 秒",
+                                            self.photos.len(),
+                                            secs
+                                        ))
+                                        .size(11.5)
+                                        .color(theme::TEXT_WEAK),
+                                    );
+                                });
+                        }
+                    });
+                });
+            });
+    }
+
+    fn ui_bottom_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("footer")
+            .frame(
+                egui::Frame::default()
+                    .fill(theme::PANEL)
+                    .inner_margin(egui::Margin::symmetric(16, 12)),
+            )
+            .show(ctx, |ui| {
+                // 狀態列
+                match &self.state {
+                    ConvertState::Idle => {}
+                    ConvertState::Working { progress, status } => {
+                        let (progress, status) = (*progress, status.clone());
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new().size(13.0).color(theme::ACCENT));
+                            ui.label(
+                                egui::RichText::new(status)
+                                    .size(12.0)
+                                    .color(theme::TEXT_WEAK),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{:.0}%",
+                                            progress * 100.0
+                                        ))
+                                        .size(12.0)
+                                        .strong()
+                                        .color(theme::ACCENT),
+                                    );
+                                },
+                            );
+                        });
+                        ui.add(
+                            egui::ProgressBar::new(progress)
+                                .fill(theme::ACCENT)
+                                .desired_height(6.0),
+                        );
+                        ui.add_space(8.0);
+                    }
+                    ConvertState::Done(path) => {
+                        let path = path.clone();
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("✔ 轉換完成")
+                                    .strong()
+                                    .color(theme::SUCCESS),
+                            );
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(path.display().to_string())
+                                        .size(11.5)
+                                        .color(theme::TEXT_WEAK),
+                                )
+                                .truncate(),
+                            );
+                            if ui.small_button("開啟資料夾").clicked() {
+                                if let Some(dir) = path.parent() {
+                                    let _ =
+                                        std::process::Command::new("explorer").arg(dir).spawn();
+                                }
+                            }
+                        });
+                        ui.add_space(8.0);
+                    }
+                    ConvertState::Error(e) => {
+                        let e = e.clone();
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("✖ 轉換失敗：{e}"))
+                                    .color(theme::ERROR),
+                            )
+                            .truncate(),
+                        );
+                        ui.add_space(8.0);
+                    }
+                }
+
+                let working = self.is_working();
+                let res_before = self.resolution;
+
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(!working, |ui| {
+                        ui.label(egui::RichText::new("每秒張數").color(theme::TEXT_WEAK));
+                        ui.add(
+                            egui::DragValue::new(&mut self.fps)
+                                .range(1..=60)
+                                .speed(0.1)
+                                .suffix(" fps"),
+                        );
+                        ui.add_space(12.0);
+                        ui.label(egui::RichText::new("格式").color(theme::TEXT_WEAK));
+                        egui::ComboBox::from_id_salt("format")
+                            .selected_text(self.format.label())
+                            .width(130.0)
+                            .show_ui(ui, |ui| {
+                                for f in OutputFormat::ALL {
+                                    ui.selectable_value(&mut self.format, f, f.label());
+                                }
+                            });
+                        ui.add_space(12.0);
+                        ui.label(egui::RichText::new("解析度").color(theme::TEXT_WEAK));
+                        egui::ComboBox::from_id_salt("resolution")
+                            .selected_text(self.resolution.label())
+                            .width(170.0)
+                            .show_ui(ui, |ui| {
+                                for r in Resolution::ALL {
+                                    ui.selectable_value(&mut self.resolution, r, r.label());
+                                }
+                            });
+                    });
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let can_convert = !self.photos.is_empty() && !working;
+                        if primary_button(ui, "▶  開始轉換", can_convert).clicked() {
+                            self.start_convert(ctx);
+                        }
+                    });
+                });
+
+                if self.resolution != res_before {
+                    self.mark_preview_dirty();
+                }
+            });
+    }
+
+    fn ui_side_panel(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::right("adjust_panel")
+            .frame(
+                egui::Frame::default()
+                    .fill(theme::PANEL)
+                    .inner_margin(egui::Margin::symmetric(14, 12)),
+            )
+            .default_width(330.0)
+            .min_width(300.0)
+            .max_width(430.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.ui_adjust_section(ui);
+                        ui.add_space(14.0);
+                        ui.separator();
+                        ui.add_space(10.0);
+                        self.ui_subtitle_section(ui);
+                        ui.add_space(8.0);
+                    });
+            });
+    }
+
+    fn ui_adjust_section(&mut self, ui: &mut egui::Ui) {
+        let before = self.adj;
+
+        ui.horizontal(|ui| {
+            section_header(ui, "調色");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if !self.adj.is_neutral() && ui.small_button("↺ 重設").clicked() {
+                    self.adj = Adjustments::default();
+                }
+            });
+        });
+        ui.label(
+            egui::RichText::new("套用到影片中的每一張照片，滑桿連點兩下可歸零")
+                .size(11.0)
+                .color(theme::TEXT_WEAK),
+        );
+        ui.add_space(10.0);
+
+        group_label(ui, "白平衡");
+        adj_slider(ui, &mut self.adj.temp, "色溫");
+        adj_slider(ui, &mut self.adj.tint, "色調");
+        ui.add_space(10.0);
+
+        group_label(ui, "光線");
+        adj_slider(ui, &mut self.adj.exposure, "曝光度");
+        adj_slider(ui, &mut self.adj.contrast, "對比");
+        adj_slider(ui, &mut self.adj.brightness, "亮度");
+        adj_slider(ui, &mut self.adj.shadows, "陰影");
+        adj_slider(ui, &mut self.adj.whites, "白色");
+        adj_slider(ui, &mut self.adj.blacks, "黑色");
+        ui.add_space(10.0);
+
+        group_label(ui, "質感與色彩");
+        adj_slider(ui, &mut self.adj.clarity, "清晰度");
+        adj_slider(ui, &mut self.adj.vibrance, "鮮豔度");
+        adj_slider(ui, &mut self.adj.saturation, "飽和度");
+
+        if self.adj != before {
+            self.mark_preview_dirty();
+        }
+    }
+
+    fn ui_subtitle_section(&mut self, ui: &mut egui::Ui) {
+        let style_before = self.sub_style.clone();
+        let total = self.photos.len().max(1);
+        let mut entries_changed = false;
+
+        ui.horizontal(|ui| {
+            section_header(ui, "字幕");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("＋ 新增段落").clicked() {
+                    let start = self.preview_selected.map(|i| i + 1).unwrap_or(1);
+                    self.sub_entries.push(SubtitleEntry {
+                        start,
+                        end: total,
+                        text: String::new(),
+                    });
+                    entries_changed = true;
+                }
+            });
+        });
+        ui.label(
+            egui::RichText::new("一段連續的照片共用同一句字幕；樣式為全部共用")
+                .size(11.0)
+                .color(theme::TEXT_WEAK),
+        );
+        ui.add_space(8.0);
+
+        let mut remove_entry: Option<usize> = None;
+        for (k, entry) in self.sub_entries.iter_mut().enumerate() {
+            egui::Frame::default()
+                .fill(theme::CARD)
+                .corner_radius(8)
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("段落 {}", k + 1))
+                                .strong()
+                                .size(12.5)
+                                .color(theme::ACCENT),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("第").size(12.0).color(theme::TEXT_WEAK));
+                        let r1 =
+                            ui.add(egui::DragValue::new(&mut entry.start).range(1..=total));
+                        ui.label(egui::RichText::new("到").size(12.0).color(theme::TEXT_WEAK));
+                        let r2 = ui.add(egui::DragValue::new(&mut entry.end).range(1..=total));
+                        ui.label(egui::RichText::new("張").size(12.0).color(theme::TEXT_WEAK));
+                        if r1.changed() || r2.changed() {
+                            if entry.end < entry.start {
+                                entry.end = entry.start;
+                            }
+                            entries_changed = true;
+                        }
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui.small_button("🗑").on_hover_text("刪除這個段落").clicked()
+                                {
+                                    remove_entry = Some(k);
+                                }
+                            },
+                        );
+                    });
+                    let resp = ui.add(
+                        egui::TextEdit::multiline(&mut entry.text)
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("這段照片要顯示的字幕（可多行）"),
+                    );
+                    if resp.changed() {
+                        entries_changed = true;
+                    }
+                });
+            ui.add_space(6.0);
+        }
+        if let Some(k) = remove_entry {
+            self.sub_entries.remove(k);
+            entries_changed = true;
+        }
+        if self.sub_entries.is_empty() {
+            ui.label(
+                egui::RichText::new("尚未加入字幕，點右上「＋ 新增段落」開始")
+                    .size(11.5)
+                    .color(theme::TEXT_WEAK),
+            );
+        }
+        if entries_changed {
+            self.mark_preview_dirty();
+        }
+        ui.add_space(10.0);
+
+        if self.fonts.is_empty() {
+            ui.colored_label(theme::ERROR, "找不到可用的系統字型，字幕功能無法使用");
+        } else {
+            group_label(ui, "字幕樣式");
+            ui.add_space(2.0);
+            egui::Frame::default()
+                .fill(theme::CARD)
+                .corner_radius(8)
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("字型").color(theme::TEXT_WEAK));
+                        let cur = self
+                            .fonts
+                            .get(self.sub_style.font_idx)
+                            .map(|(n, _)| n.as_str())
+                            .unwrap_or("？");
+                        egui::ComboBox::from_id_salt("sub_font")
+                            .selected_text(cur)
+                            .width(ui.available_width() - 8.0)
+                            .show_ui(ui, |ui| {
+                                for (i, (name, _)) in self.fonts.iter().enumerate() {
+                                    ui.selectable_value(
+                                        &mut self.sub_style.font_idx,
+                                        i,
+                                        name,
+                                    );
+                                }
+                            });
+                    });
+                    slider_row(ui, &mut self.sub_style.size, 12, 200, "大小");
+                    slider_row(ui, &mut self.sub_style.outline_w, 0, 8, "外框");
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("文字").color(theme::TEXT_WEAK));
+                        ui.color_edit_button_srgba(&mut self.sub_style.color);
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new("外框").color(theme::TEXT_WEAK));
+                        ui.color_edit_button_srgba(&mut self.sub_style.outline_color);
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new("位置").color(theme::TEXT_WEAK));
+                        egui::ComboBox::from_id_salt("sub_pos")
+                            .selected_text(self.sub_style.pos.label())
+                            .width(70.0)
+                            .show_ui(ui, |ui| {
+                                for p in SubPos::ALL {
+                                    ui.selectable_value(&mut self.sub_style.pos, p, p.label());
+                                }
+                            });
+                    });
+                    ui.checkbox(&mut self.sub_style.boxed, "半透明底框");
+                });
+        }
+
+        if self.sub_style != style_before {
+            self.mark_preview_dirty();
+        }
+    }
+
+    fn ui_central(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::default()
+                    .fill(theme::BG)
+                    .inner_margin(egui::Margin::same(16)),
+            )
+            .show(ctx, |ui| {
+                if self.photos.is_empty() {
+                    self.ui_empty_state(ui, ctx);
+                } else {
+                    self.ui_workspace(ui, ctx);
+                }
+            });
+    }
+
+    fn ui_empty_state(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let rect = ui.available_rect_before_wrap();
+        let r = rect.shrink(4.0);
+        ui.painter()
+            .rect_filled(r, 14, egui::Color32::from_rgb(0x17, 0x18, 0x1C));
+        // 虛線外框
+        let dash = egui::Stroke::new(1.2, egui::Color32::from_rgb(0x3A, 0x3D, 0x46));
+        let rr = r.shrink(1.5);
+        for (a, b) in [
+            (rr.left_top(), rr.right_top()),
+            (rr.right_top(), rr.right_bottom()),
+            (rr.right_bottom(), rr.left_bottom()),
+            (rr.left_bottom(), rr.left_top()),
+        ] {
+            ui.painter().extend(egui::Shape::dashed_line(&[a, b], dash, 7.0, 6.0));
+        }
+
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(r)
+                .layout(egui::Layout::top_down(egui::Align::Center)),
+        );
+        let content_h = 210.0;
+        child.add_space(((r.height() - content_h) / 2.0).max(24.0));
+        child.label(egui::RichText::new("🎬").size(46.0));
+        child.add_space(8.0);
+        child.label(
+            egui::RichText::new("將照片拖曳到這裡")
+                .size(17.0)
+                .strong()
+                .color(theme::TEXT),
+        );
+        child.add_space(2.0);
+        child.label(
+            egui::RichText::new("支援 JPG、PNG、BMP、WebP、TIFF，會依檔名自動排序")
+                .size(12.0)
+                .color(theme::TEXT_WEAK),
+        );
+        child.add_space(16.0);
+        child.allocate_ui_with_layout(
+            egui::vec2(330.0, 40.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                if primary_button(ui, "📁  選擇資料夾", true).clicked() {
+                    self.pick_folder(ctx);
+                }
+                ui.add_space(4.0);
+                if ui
+                    .add(egui::Button::new("🖼  選擇照片").min_size(egui::vec2(120.0, 38.0)))
+                    .clicked()
+                {
+                    self.pick_files(ctx);
+                }
+            },
+        );
+    }
+
+    fn ui_workspace(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let working = self.is_working();
+
+        // 工具列
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(!working, |ui| {
+                if ui.button("📁  加入資料夾").clicked() {
+                    self.pick_folder(ctx);
+                }
+                if ui.button("🖼  加入照片").clicked() {
+                    self.pick_files(ctx);
+                }
+                if ui.button("🗑  清空").clicked() {
+                    self.clear_photos();
+                }
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new("拖曳即可加入照片 · ← → 切換預覽 · 右鍵縮圖可移除")
+                        .size(11.0)
+                        .color(theme::TEXT_WEAK),
+                );
+            });
+        });
+        ui.add_space(10.0);
+
+        if self.photos.is_empty() {
+            return;
+        }
+
+        // 預覽卡片
+        let film_h = 96.0;
+        let preview_h = (ui.available_height() - film_h - 14.0).max(160.0);
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), preview_h),
+            egui::Sense::hover(),
+        );
+        let p = ui.painter().clone();
+        p.rect_filled(rect, 10, theme::PREVIEW_BG);
+        p.rect_stroke(
+            rect,
+            10,
+            egui::Stroke::new(1.0, theme::BORDER),
+            egui::StrokeKind::Inside,
+        );
+
+        if let Some(tex) = &self.preview_tex {
+            let img_rect = fit_rect(tex.size_vec2(), rect.shrink(14.0));
+            p.image(
+                tex.id(),
+                img_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        } else if self.preview_selected.is_some() {
+            p.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "預覽產生中…",
+                egui::FontId::proportional(13.0),
+                theme::TEXT_WEAK,
+            );
+        } else {
+            p.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "點選下方縮圖即可預覽調色與字幕效果",
+                egui::FontId::proportional(13.0),
+                theme::TEXT_WEAK,
+            );
+        }
+
+        // 左上角：檔名資訊
+        if let Some(i) = self.preview_selected {
+            if let Some(photo) = self.photos.get(i) {
+                let name = photo.file_name().unwrap_or_default().to_string_lossy();
+                let text = format!("{} / {}　{}", i + 1, self.photos.len(), name);
+                let galley = p.layout_no_wrap(
+                    text,
+                    egui::FontId::proportional(11.5),
+                    theme::TEXT,
+                );
+                let chip = egui::Rect::from_min_size(
+                    rect.min + egui::vec2(10.0, 10.0),
+                    galley.size() + egui::vec2(16.0, 9.0),
+                );
+                p.rect_filled(chip, 6, egui::Color32::from_black_alpha(160));
+                p.galley(chip.min + egui::vec2(8.0, 4.5), galley, theme::TEXT);
+            }
+        }
+
+        // 右上角：預覽更新中
+        if self.preview_rx.is_some() && self.preview_tex.is_some() {
+            ui.put(
+                egui::Rect::from_min_size(
+                    rect.right_top() + egui::vec2(-32.0, 12.0),
+                    egui::vec2(18.0, 18.0),
+                ),
+                egui::Spinner::new().size(16.0).color(theme::ACCENT),
+            );
+        }
+
+        // 預覽錯誤
+        if let Some(e) = &self.preview_error {
+            p.text(
+                rect.center_bottom() - egui::vec2(0.0, 18.0),
+                egui::Align2::CENTER_CENTER,
+                format!("預覽失敗：{e}"),
+                egui::FontId::proportional(12.0),
+                theme::ERROR,
+            );
+        }
+
+        ui.add_space(10.0);
+
+        // 縮圖膠卷
+        let mut click_idx: Option<usize> = None;
+        let mut remove_idx: Option<usize> = None;
+        let mut clear_all = false;
+        egui::ScrollArea::horizontal().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for i in 0..self.photos.len() {
+                    let photo = &self.photos[i];
+                    let tex = match self.thumbs.get(photo) {
+                        Some(Thumb::Ready(t)) => Some(t.clone()),
+                        _ => None,
+                    };
+                    let selected = self.preview_selected == Some(i);
+                    let has_caption = self.sub_entries.iter().any(|e| {
+                        e.start <= i + 1 && i + 1 <= e.end && !e.text.trim().is_empty()
+                    });
+                    let resp = thumb_item(ui, tex.as_ref(), i, selected, has_caption);
+                    if resp.clicked() {
+                        click_idx = Some(i);
+                    }
+                    resp.context_menu(|ui| {
+                        if ui.button("移除這張照片").clicked() {
+                            remove_idx = Some(i);
+                            ui.close_menu();
+                        }
+                        if ui.button("清空全部").clicked() {
+                            clear_all = true;
+                            ui.close_menu();
+                        }
+                    });
+                }
+            });
+        });
+
+        if let Some(i) = click_idx {
+            self.select_photo(Some(i));
+        }
+        if !working {
+            if clear_all {
+                self.clear_photos();
+            } else if let Some(i) = remove_idx {
+                self.remove_photo(i);
+            }
+        }
+    }
+
+    /// 拖曳檔案進視窗時的全螢幕提示
+    fn ui_drop_overlay(&self, ctx: &egui::Context) {
+        let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        if !hovering || self.is_working() {
+            return;
+        }
+        let screen = ctx.screen_rect();
+        let p = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("drop_overlay"),
+        ));
+        p.rect_filled(screen, 0, egui::Color32::from_black_alpha(150));
+        let card = egui::Rect::from_center_size(screen.center(), egui::vec2(340.0, 116.0));
+        p.rect_filled(card, 12, theme::CARD);
+        p.rect_stroke(
+            card,
+            12,
+            egui::Stroke::new(1.5, theme::ACCENT),
+            egui::StrokeKind::Inside,
+        );
+        p.text(
+            card.center() - egui::vec2(0.0, 16.0),
+            egui::Align2::CENTER_CENTER,
+            "⬇",
+            egui::FontId::proportional(26.0),
+            theme::ACCENT,
+        );
+        p.text(
+            card.center() + egui::vec2(0.0, 20.0),
+            egui::Align2::CENTER_CENTER,
+            "放開滑鼠加入照片",
+            egui::FontId::proportional(15.0),
+            theme::TEXT,
+        );
+    }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_worker();
         self.poll_preview(ctx);
+        self.poll_thumbs(ctx);
 
         // 支援直接拖曳檔案/資料夾進視窗
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -547,413 +1361,278 @@ impl eframe::App for App {
                     files.push(p);
                 }
             }
-            self.add_photos(files);
+            self.add_photos(files, ctx);
         }
 
-        egui::SidePanel::right("adjust_panel")
-            .default_width(380.0)
-            .min_width(320.0)
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.heading("調色（套用至整部影片）");
-                    });
-                    ui.label(
-                        egui::RichText::new("下方參數會套用到影片中的每一張照片")
-                            .weak()
-                            .small(),
-                    );
-                    ui.add_space(6.0);
-
-                    // 預覽區
-                    if let Some(tex) = &self.preview_tex {
-                        let max_w = ui.available_width();
-                        ui.add(
-                            egui::Image::new((tex.id(), tex.size_vec2()))
-                                .max_size(egui::vec2(max_w, 240.0)),
-                        );
-                    } else if self.preview_selected.is_some() {
-                        ui.label("（預覽產生中…）");
-                    } else {
-                        ui.label(
-                            egui::RichText::new("加入照片後，點選左側清單中的檔名即可預覽")
-                                .weak(),
-                        );
-                    }
-                    if self.preview_rx.is_some() {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label("更新預覽中…");
-                        });
-                    }
-                    if let Some(e) = &self.preview_error {
-                        ui.colored_label(egui::Color32::RED, format!("預覽失敗：{e}"));
-                    }
-                    ui.add_space(6.0);
-                    ui.separator();
-
-                    let before = self.adj;
-
-                    ui.label(egui::RichText::new("白平衡").strong());
-                    adj_slider(ui, &mut self.adj.temp, "色溫");
-                    adj_slider(ui, &mut self.adj.tint, "色調");
-                    ui.add_space(6.0);
-
-                    ui.label(egui::RichText::new("光線").strong());
-                    adj_slider(ui, &mut self.adj.exposure, "曝光度");
-                    adj_slider(ui, &mut self.adj.contrast, "對比");
-                    adj_slider(ui, &mut self.adj.brightness, "亮度");
-                    adj_slider(ui, &mut self.adj.shadows, "陰影");
-                    adj_slider(ui, &mut self.adj.whites, "白色");
-                    adj_slider(ui, &mut self.adj.blacks, "黑色");
-                    ui.add_space(6.0);
-
-                    ui.label(egui::RichText::new("質感與色彩").strong());
-                    adj_slider(ui, &mut self.adj.clarity, "清晰度");
-                    adj_slider(ui, &mut self.adj.vibrance, "鮮豔度");
-                    adj_slider(ui, &mut self.adj.saturation, "飽和度");
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new("提示：滑桿連點兩下可回到 0")
-                            .weak()
-                            .small(),
-                    );
-                    ui.add_space(8.0);
-
-                    if ui.button("↺ 全部重設").clicked() {
-                        self.adj = Adjustments::default();
-                    }
-
-                    if self.adj != before {
-                        self.mark_preview_dirty();
-                    }
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.heading("字幕");
-                    ui.label(
-                        egui::RichText::new(
-                            "以「段落」設定：一段連續的照片共用同一句字幕；樣式為全部共用",
-                        )
-                        .weak()
-                        .small(),
-                    );
-                    ui.add_space(4.0);
-
-                    let style_before = self.sub_style.clone();
-
-                    // 字幕段落編輯器
-                    let total = self.photos.len().max(1);
-                    let mut remove_entry: Option<usize> = None;
-                    let mut entries_changed = false;
-                    for (k, entry) in self.sub_entries.iter_mut().enumerate() {
-                        ui.group(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(format!("段落 {}：從第", k + 1));
-                                let r1 = ui.add(
-                                    egui::DragValue::new(&mut entry.start).range(1..=total),
-                                );
-                                ui.label("張 到第");
-                                let r2 = ui.add(
-                                    egui::DragValue::new(&mut entry.end).range(1..=total),
-                                );
-                                ui.label("張");
-                                if r1.changed() || r2.changed() {
-                                    if entry.end < entry.start {
-                                        entry.end = entry.start;
-                                    }
-                                    entries_changed = true;
-                                }
-                                if ui.small_button("🗑 刪除").clicked() {
-                                    remove_entry = Some(k);
-                                }
-                            });
-                            let resp = ui.add(
-                                egui::TextEdit::multiline(&mut entry.text)
-                                    .desired_rows(2)
-                                    .desired_width(f32::INFINITY)
-                                    .hint_text("這段照片要顯示的字幕（可多行）"),
-                            );
-                            if resp.changed() {
-                                entries_changed = true;
-                            }
-                        });
-                        ui.add_space(4.0);
-                    }
-                    if let Some(k) = remove_entry {
-                        self.sub_entries.remove(k);
-                        entries_changed = true;
-                    }
-                    if ui.button("＋ 新增字幕段落").clicked() {
-                        // 預設從目前選取的照片開始到最後一張
-                        let start = self.preview_selected.map(|i| i + 1).unwrap_or(1);
-                        self.sub_entries.push(SubtitleEntry {
-                            start,
-                            end: total,
-                            text: String::new(),
-                        });
-                        entries_changed = true;
-                    }
-                    if entries_changed {
-                        self.mark_preview_dirty();
-                    }
-                    ui.add_space(6.0);
-
-                    if self.fonts.is_empty() {
-                        ui.colored_label(
-                            egui::Color32::RED,
-                            "找不到可用的系統字型，字幕功能無法使用",
-                        );
-                    } else {
-                        ui.horizontal(|ui| {
-                            ui.label("字型：");
-                            let cur = self
-                                .fonts
-                                .get(self.sub_style.font_idx)
-                                .map(|(n, _)| n.as_str())
-                                .unwrap_or("？");
-                            egui::ComboBox::from_id_salt("sub_font")
-                                .selected_text(cur)
-                                .show_ui(ui, |ui| {
-                                    for (i, (name, _)) in self.fonts.iter().enumerate() {
-                                        ui.selectable_value(
-                                            &mut self.sub_style.font_idx,
-                                            i,
-                                            name,
-                                        );
-                                    }
-                                });
-                        });
-                        ui.add(
-                            egui::Slider::new(&mut self.sub_style.size, 12..=200)
-                                .text("大小（1080p 基準）"),
-                        );
-                        ui.horizontal(|ui| {
-                            ui.label("文字顏色：");
-                            ui.color_edit_button_srgba(&mut self.sub_style.color);
-                            ui.add_space(12.0);
-                            ui.label("外框顏色：");
-                            ui.color_edit_button_srgba(&mut self.sub_style.outline_color);
-                        });
-                        ui.add(
-                            egui::Slider::new(&mut self.sub_style.outline_w, 0..=8)
-                                .text("外框粗細"),
-                        );
-                        ui.horizontal(|ui| {
-                            ui.label("位置：");
-                            egui::ComboBox::from_id_salt("sub_pos")
-                                .selected_text(self.sub_style.pos.label())
-                                .show_ui(ui, |ui| {
-                                    for p in SubPos::ALL {
-                                        ui.selectable_value(
-                                            &mut self.sub_style.pos,
-                                            p,
-                                            p.label(),
-                                        );
-                                    }
-                                });
-                            ui.add_space(12.0);
-                            ui.checkbox(&mut self.sub_style.boxed, "半透明底框");
-                        });
-                    }
-
-                    if self.sub_style != style_before {
-                        self.mark_preview_dirty();
-                    }
-                    ui.add_space(8.0);
-                });
-            });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("照片轉影片工具");
-            ui.add_space(8.0);
-
-            let working = self.is_working();
-
-            ui.horizontal(|ui| {
-                ui.add_enabled_ui(!working, |ui| {
-                    if ui.button("📁 選擇資料夾").clicked() {
-                        if let Some(dir) = rfd::FileDialog::new()
-                            .set_title("選擇照片資料夾")
-                            .pick_folder()
-                        {
-                            let files = collect_images_in_dir(&dir);
-                            self.add_photos(files);
-                        }
-                    }
-                    if ui.button("🖼 選擇照片（可多選）").clicked() {
-                        if let Some(files) = rfd::FileDialog::new()
-                            .set_title("選擇照片")
-                            .add_filter("圖片檔", IMAGE_EXTS)
-                            .pick_files()
-                        {
-                            self.add_photos(files);
-                        }
-                    }
-                    if ui.button("🗑 清空清單").clicked() {
-                        self.photos.clear();
-                        self.preview_selected = None;
-                        self.preview_tex = None;
-                    }
-                });
-            });
-
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("提示：也可以直接把照片或資料夾拖曳到這個視窗")
-                    .weak()
-                    .small(),
-            );
-            ui.add_space(8.0);
-
-            ui.group(|ui| {
-                ui.label(format!(
-                    "已加入 {} 張照片（依檔名排序，點選檔名可在右側預覽調色效果）",
-                    self.photos.len()
-                ));
-                egui::ScrollArea::vertical()
-                    .max_height(180.0)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        let mut remove_idx: Option<usize> = None;
-                        let mut click_idx: Option<usize> = None;
-                        for (i, p) in self.photos.iter().enumerate() {
-                            ui.horizontal(|ui| {
-                                if ui.small_button("✕").clicked() {
-                                    remove_idx = Some(i);
-                                }
-                                let selected = self.preview_selected == Some(i);
-                                let has_caption = self.sub_entries.iter().any(|e| {
-                                    e.start <= i + 1 && i + 1 <= e.end && !e.text.trim().is_empty()
-                                });
-                                let name = p.file_name().unwrap_or_default().to_string_lossy();
-                                let label = if has_caption {
-                                    format!("💬 {name}")
-                                } else {
-                                    name.into_owned()
-                                };
-                                if ui.selectable_label(selected, label).clicked() {
-                                    click_idx = Some(i);
-                                }
-                            });
-                        }
-                        if let Some(i) = click_idx {
-                            self.select_photo(Some(i));
-                        }
-                        if let Some(i) = remove_idx {
-                            if !working {
-                                self.photos.remove(i);
-                                match self.preview_selected {
-                                    Some(s) if s == i => {
-                                        let next = if self.photos.is_empty() {
-                                            None
-                                        } else {
-                                            Some(s.min(self.photos.len() - 1))
-                                        };
-                                        self.preview_selected = None;
-                                        self.select_photo(next);
-                                    }
-                                    Some(s) if s > i => {
-                                        self.preview_selected = Some(s - 1);
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    });
-            });
-
-            ui.add_space(8.0);
-
-            let res_before = self.resolution;
-            ui.horizontal(|ui| {
-                ui.label("每秒播放張數 (fps)：");
-                ui.add_enabled(
-                    !working,
-                    egui::DragValue::new(&mut self.fps).range(1..=60).speed(0.1),
-                );
-                ui.add_space(16.0);
-                ui.label("輸出格式：");
-                ui.add_enabled_ui(!working, |ui| {
-                    egui::ComboBox::from_id_salt("format")
-                        .selected_text(self.format.label())
-                        .show_ui(ui, |ui| {
-                            for f in OutputFormat::ALL {
-                                ui.selectable_value(&mut self.format, f, f.label());
-                            }
-                        });
-                });
-                ui.add_space(16.0);
-                ui.label("解析度：");
-                ui.add_enabled_ui(!working, |ui| {
-                    egui::ComboBox::from_id_salt("resolution")
-                        .selected_text(self.resolution.label())
-                        .show_ui(ui, |ui| {
-                            for r in Resolution::ALL {
-                                ui.selectable_value(&mut self.resolution, r, r.label());
-                            }
-                        });
-                });
-            });
-
-            if self.resolution != res_before {
-                self.mark_preview_dirty();
-            }
-
-            if !self.photos.is_empty() {
-                let secs = self.photos.len() as f32 / self.fps as f32;
-                ui.label(egui::RichText::new(format!("預估影片長度：約 {secs:.1} 秒")).weak());
-            }
-
-            ui.add_space(12.0);
-
-            let can_convert = !self.photos.is_empty() && !working;
-            if ui
-                .add_enabled(
-                    can_convert,
-                    egui::Button::new(egui::RichText::new("▶ 開始轉換").size(18.0))
-                        .min_size(egui::vec2(160.0, 36.0)),
-                )
-                .clicked()
+        // 左右方向鍵切換預覽（輸入框有焦點時不動作）
+        if !self.photos.is_empty() && ctx.memory(|m| m.focused().is_none()) {
+            let cur = self.preview_selected.unwrap_or(0);
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) && cur + 1 < self.photos.len()
             {
-                self.start_convert(ctx);
+                self.select_photo(Some(cur + 1));
             }
-
-            ui.add_space(8.0);
-
-            match &self.state {
-                ConvertState::Idle => {}
-                ConvertState::Working { progress, status } => {
-                    ui.label(status);
-                    ui.add(egui::ProgressBar::new(*progress).show_percentage());
-                }
-                ConvertState::Done(path) => {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(0, 160, 0),
-                        format!("✔ 轉換完成：{}", path.display()),
-                    );
-                    if ui.button("開啟輸出資料夾").clicked() {
-                        if let Some(dir) = path.parent() {
-                            let _ = std::process::Command::new("explorer").arg(dir).spawn();
-                        }
-                    }
-                }
-                ConvertState::Error(e) => {
-                    ui.colored_label(egui::Color32::RED, format!("✖ 轉換失敗：{e}"));
-                }
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) && cur > 0 {
+                self.select_photo(Some(cur - 1));
             }
-        });
+        }
+
+        self.ui_top_bar(ctx);
+        self.ui_bottom_bar(ctx);
+        self.ui_side_panel(ctx);
+        self.ui_central(ctx);
+        self.ui_drop_overlay(ctx);
     }
 }
 
-/// 調色滑桿：連點兩下重設回 0
+// ---------- UI 元件與主題 ----------
+
+/// 套用整體深色主題
+fn apply_theme(ctx: &egui::Context) {
+    use egui::{
+        Color32, CornerRadius, FontFamily, FontId, Shadow, Stroke, TextStyle, Vec2, Visuals,
+    };
+
+    // 固定使用深色主題，不跟隨系統（本 App 的配色只設計了深色）
+    ctx.set_theme(egui::ThemePreference::Dark);
+
+    let mut style = (*ctx.style()).clone();
+    style.text_styles = [
+        (TextStyle::Heading, FontId::new(17.0, FontFamily::Proportional)),
+        (TextStyle::Body, FontId::new(13.0, FontFamily::Proportional)),
+        (TextStyle::Button, FontId::new(13.0, FontFamily::Proportional)),
+        (TextStyle::Small, FontId::new(11.0, FontFamily::Proportional)),
+        (TextStyle::Monospace, FontId::new(12.5, FontFamily::Monospace)),
+    ]
+    .into();
+    style.spacing.item_spacing = Vec2::new(8.0, 7.0);
+    style.spacing.button_padding = Vec2::new(12.0, 6.0);
+    style.spacing.interact_size = Vec2::new(40.0, 24.0);
+
+    let mut v = Visuals::dark();
+    v.override_text_color = Some(theme::TEXT);
+    v.panel_fill = theme::PANEL;
+    v.window_fill = theme::PANEL;
+    v.extreme_bg_color = Color32::from_rgb(0x0F, 0x10, 0x13);
+    v.faint_bg_color = theme::CARD;
+    v.window_corner_radius = CornerRadius::same(10);
+    v.menu_corner_radius = CornerRadius::same(8);
+    v.window_shadow = Shadow {
+        offset: [0, 6],
+        blur: 20,
+        spread: 0,
+        color: Color32::from_black_alpha(110),
+    };
+    v.popup_shadow = Shadow {
+        offset: [0, 4],
+        blur: 14,
+        spread: 0,
+        color: Color32::from_black_alpha(90),
+    };
+    v.selection.bg_fill = theme::ACCENT;
+    v.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+    v.slider_trailing_fill = false;
+    v.hyperlink_color = theme::ACCENT;
+
+    v.widgets.noninteractive.bg_fill = theme::PANEL;
+    v.widgets.noninteractive.weak_bg_fill = theme::PANEL;
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, theme::BORDER);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, theme::TEXT);
+    v.widgets.noninteractive.corner_radius = CornerRadius::same(6);
+
+    v.widgets.inactive.bg_fill = theme::CARD;
+    v.widgets.inactive.weak_bg_fill = theme::CARD;
+    v.widgets.inactive.bg_stroke = Stroke::NONE;
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0, theme::TEXT);
+    v.widgets.inactive.corner_radius = CornerRadius::same(6);
+
+    v.widgets.hovered.bg_fill = theme::CARD_HOVER;
+    v.widgets.hovered.weak_bg_fill = theme::CARD_HOVER;
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x45, 0x48, 0x52));
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    v.widgets.hovered.corner_radius = CornerRadius::same(6);
+
+    v.widgets.active.bg_fill = theme::CARD_HOVER;
+    v.widgets.active.weak_bg_fill = theme::CARD_HOVER;
+    v.widgets.active.bg_stroke = Stroke::new(1.0, theme::ACCENT);
+    v.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    v.widgets.active.corner_radius = CornerRadius::same(6);
+
+    v.widgets.open.bg_fill = theme::CARD_HOVER;
+    v.widgets.open.weak_bg_fill = theme::CARD_HOVER;
+    v.widgets.open.bg_stroke = Stroke::new(1.0, theme::ACCENT);
+    v.widgets.open.corner_radius = CornerRadius::same(6);
+
+    style.visuals = v;
+    ctx.all_styles_mut(|s| *s = style.clone());
+}
+
+/// 帶色條的區段標題
+fn section_header(ui: &mut egui::Ui, title: &str) {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(3.0, 15.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 2, theme::ACCENT);
+        ui.label(egui::RichText::new(title).strong().size(14.5).color(theme::TEXT));
+    });
+}
+
+/// 小型分組標籤
+fn group_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        egui::RichText::new(text)
+            .size(11.5)
+            .strong()
+            .color(theme::TEXT_WEAK),
+    );
+}
+
+/// 主要動作按鈕（強調色）
+fn primary_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response {
+    ui.scope(|ui| {
+        let w = &mut ui.style_mut().visuals.widgets;
+        for state in [&mut w.inactive, &mut w.hovered, &mut w.active] {
+            state.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+            state.corner_radius = egui::CornerRadius::same(8);
+        }
+        w.inactive.weak_bg_fill = theme::ACCENT;
+        w.inactive.bg_fill = theme::ACCENT;
+        w.hovered.weak_bg_fill = theme::ACCENT_HOVER;
+        w.hovered.bg_fill = theme::ACCENT_HOVER;
+        w.hovered.bg_stroke = egui::Stroke::NONE;
+        w.active.weak_bg_fill = theme::ACCENT_ACTIVE;
+        w.active.bg_fill = theme::ACCENT_ACTIVE;
+        w.active.bg_stroke = egui::Stroke::NONE;
+        ui.add_enabled(
+            enabled,
+            egui::Button::new(egui::RichText::new(text).size(14.5).strong())
+                .min_size(egui::vec2(150.0, 38.0)),
+        )
+    })
+    .inner
+}
+
+/// 調色滑桿：左標籤、右數值，連點兩下歸零
 fn adj_slider(ui: &mut egui::Ui, value: &mut i32, label: &str) {
-    let resp = ui.add(egui::Slider::new(value, -100..=100).text(label));
-    if resp.double_clicked() {
-        *value = 0;
-    }
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(52.0, 18.0), egui::Sense::hover());
+        ui.painter().text(
+            rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(12.5),
+            theme::TEXT_WEAK,
+        );
+        ui.spacing_mut().slider_width = (ui.available_width() - 44.0).max(60.0);
+        let resp = ui.add(egui::Slider::new(value, -100..=100).show_value(false));
+        if resp.double_clicked() {
+            *value = 0;
+        }
+        let (txt, color) = if *value == 0 {
+            ("0".to_string(), theme::TEXT_WEAK)
+        } else {
+            (format!("{value:+}"), theme::ACCENT)
+        };
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(egui::RichText::new(txt).size(11.5).color(color));
+        });
+    });
 }
+
+/// 一般滑桿列：左標籤、右數值
+fn slider_row(ui: &mut egui::Ui, value: &mut i32, min: i32, max: i32, label: &str) {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(30.0, 18.0), egui::Sense::hover());
+        ui.painter().text(
+            rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(12.5),
+            theme::TEXT_WEAK,
+        );
+        ui.spacing_mut().slider_width = (ui.available_width() - 40.0).max(60.0);
+        ui.add(egui::Slider::new(value, min..=max).show_value(false));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                egui::RichText::new(value.to_string())
+                    .size(11.5)
+                    .color(theme::TEXT),
+            );
+        });
+    });
+}
+
+/// 把 tex_size 等比縮放置中放進 bounds
+fn fit_rect(tex_size: egui::Vec2, bounds: egui::Rect) -> egui::Rect {
+    let s = (bounds.width() / tex_size.x).min(bounds.height() / tex_size.y);
+    egui::Rect::from_center_size(bounds.center(), tex_size * s)
+}
+
+/// 膠卷縮圖項目
+fn thumb_item(
+    ui: &mut egui::Ui,
+    tex: Option<&egui::TextureHandle>,
+    idx: usize,
+    selected: bool,
+    has_caption: bool,
+) -> egui::Response {
+    let size = egui::vec2(132.0, 84.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let p = ui.painter();
+    let hovered = resp.hovered();
+
+    p.rect_filled(rect, 8, if hovered { theme::CARD_HOVER } else { theme::CARD });
+
+    if let Some(tex) = tex {
+        let img_rect = fit_rect(tex.size_vec2(), rect.shrink(3.0));
+        p.image(
+            tex.id(),
+            img_rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    } else {
+        p.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "…",
+            egui::FontId::proportional(16.0),
+            theme::TEXT_WEAK,
+        );
+    }
+
+    // 左下角序號
+    let num = (idx + 1).to_string();
+    let galley = p.layout_no_wrap(num, egui::FontId::proportional(10.5), theme::TEXT);
+    let chip = egui::Rect::from_min_size(
+        egui::pos2(rect.min.x + 6.0, rect.max.y - galley.size().y - 11.0),
+        galley.size() + egui::vec2(10.0, 5.0),
+    );
+    p.rect_filled(chip, 4, egui::Color32::from_black_alpha(170));
+    p.galley(chip.min + egui::vec2(5.0, 2.5), galley, theme::TEXT);
+
+    // 右上角字幕標記
+    if has_caption {
+        p.text(
+            egui::pos2(rect.max.x - 12.0, rect.min.y + 12.0),
+            egui::Align2::CENTER_CENTER,
+            "💬",
+            egui::FontId::proportional(11.0),
+            theme::TEXT,
+        );
+    }
+
+    let stroke = if selected {
+        egui::Stroke::new(2.0, theme::ACCENT)
+    } else if hovered {
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(0x4A, 0x4D, 0x58))
+    } else {
+        egui::Stroke::new(1.0, theme::BORDER)
+    };
+    p.rect_stroke(rect, 8, stroke, egui::StrokeKind::Inside);
+
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+// ---------- 檔案與排序 ----------
 
 fn is_image(p: &Path) -> bool {
     p.extension()
@@ -1145,8 +1824,8 @@ fn render_preview(
 ) -> PreviewResult {
     ensure_ffmpeg(|| {})?;
 
-    // 預覽畫布：寬 640、依輸出解析度等比例的高（取偶數）
-    let pw: u32 = 640;
+    // 預覽畫布：寬 960、依輸出解析度等比例的高（取偶數）
+    let pw: u32 = 960;
     let ph: u32 = ((pw as f64 * res.h as f64 / res.w as f64 / 2.0).round() as u32) * 2;
 
     // 與輸出相同順序：先縮放、再調色、後補邊，最後上字幕
@@ -1424,15 +2103,27 @@ fn main() -> eframe::Result {
         return Ok(());
     }
 
+    // 其餘參數視為要開啟的照片或資料夾（支援「開啟方式」與拖曳到執行檔上）
+    let mut initial_files: Vec<PathBuf> = Vec::new();
+    for a in &args[1..] {
+        let p = PathBuf::from(a);
+        if p.is_dir() {
+            initial_files.extend(collect_images_in_dir(&p));
+        } else if p.is_file() {
+            initial_files.push(p);
+        }
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1080.0, 640.0])
-            .with_min_inner_size([860.0, 520.0]),
+            .with_title("Photo2Video — 照片轉影片")
+            .with_inner_size([1280.0, 800.0])
+            .with_min_inner_size([1024.0, 640.0]),
         ..Default::default()
     };
     eframe::run_native(
-        "照片轉影片工具",
+        "Photo2Video — 照片轉影片",
         options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, initial_files)))),
     )
 }
