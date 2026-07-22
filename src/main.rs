@@ -571,6 +571,8 @@ struct App {
     update_status: UpdateStatus,
     update_banner_dismissed: bool,
     about_open: bool,
+    /// fps 最後一次變動的時間；拖動時不即時寫設定檔，停止變動後才寫
+    fps_pending_save: Option<Instant>,
 }
 
 impl App {
@@ -613,6 +615,7 @@ impl App {
             update_status: UpdateStatus::Idle,
             update_banner_dismissed: false,
             about_open: false,
+            fps_pending_save: None,
         };
         // 啟動時在背景檢查是否有新版本（失敗不影響使用）
         app.spawn_update_check(&cc.egui_ctx);
@@ -1218,7 +1221,8 @@ impl App {
                     self.mark_preview_dirty();
                 }
                 if self.fps != fps_before {
-                    save_fps(self.fps);
+                    // 拖動中每格變動都會進來，延後到停止變動再寫檔（見 update）
+                    self.fps_pending_save = Some(Instant::now());
                 }
             });
     }
@@ -2037,8 +2041,27 @@ impl App {
     }
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        // 關閉程式時若還有未寫入的 fps 設定，補寫一次
+        if self.fps_pending_save.is_some() {
+            save_fps(self.fps);
+        }
+    }
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // fps 停止變動 800ms 後才寫設定檔，拖動過程不做磁碟 I/O
+        if let Some(t) = self.fps_pending_save {
+            let elapsed = t.elapsed();
+            if elapsed >= Duration::from_millis(800) {
+                save_fps(self.fps);
+                self.fps_pending_save = None;
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(820) - elapsed);
+            }
+        }
         self.poll_update();
         self.poll_worker();
         self.poll_preview(ctx);
