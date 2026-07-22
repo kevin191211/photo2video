@@ -12,6 +12,10 @@ use ffmpeg_sidecar::command::FfmpegCommand;
 use ffmpeg_sidecar::event::FfmpegEvent;
 
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "bmp", "webp", "tif", "tiff"];
+const AUDIO_EXTS: &[&str] = &["mp3", "wav", "m4a", "aac", "flac", "ogg", "opus", "wma"];
+
+/// 轉場/動態效果啟用時的輸出影格率（純幻燈片模式則維持照片張數 = 影格數）
+const OUT_FPS: u32 = 30;
 
 /// GitHub 儲存庫（檢查更新與下載頁面用）
 const GITHUB_REPO: &str = "kevin191211/photo2video";
@@ -242,6 +246,39 @@ struct SubtitleEntry {
     text: String,
 }
 
+/// 照片之間的轉場效果
+#[derive(Clone, Copy, PartialEq)]
+enum Transition {
+    None,
+    FadeBlack,
+}
+
+impl Transition {
+    fn label(&self) -> &'static str {
+        match self {
+            Transition::None => "無（直接切換）",
+            Transition::FadeBlack => "淡入淡出",
+        }
+    }
+    const ALL: [Transition; 2] = [Transition::None, Transition::FadeBlack];
+}
+
+/// 背景音樂設定
+#[derive(Clone)]
+struct MusicJob {
+    path: PathBuf,
+    volume: i32, // 百分比 0~200
+    fade_out: bool,
+}
+
+/// 輸出效果（轉場、動態縮放、音樂）
+#[derive(Clone)]
+struct OutputFx {
+    transition: Transition,
+    ken_burns: bool,
+    music: Option<MusicJob>,
+}
+
 /// 解析 "v1.2.3" 或 "1.2.3" 為可比較的版本號
 fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
     let s = s.trim().trim_start_matches(['v', 'V']);
@@ -378,6 +415,8 @@ enum UpdateStatus {
 }
 
 type PreviewResult = Result<(u32, u32, Vec<u8>), String>;
+/// 預覽結果附帶「這是第幾張照片的渲染」，避免快速切換時舊結果蓋掉新照片
+type PreviewMsg = (usize, PreviewResult);
 type ThumbMsg = (PathBuf, Option<(u32, u32, Vec<u8>)>);
 
 enum Thumb {
@@ -400,7 +439,7 @@ struct App {
     preview_selected: Option<usize>,
     preview_dirty: bool,
     preview_last_change: Option<Instant>,
-    preview_rx: Option<Receiver<PreviewResult>>,
+    preview_rx: Option<Receiver<PreviewMsg>>,
     preview_tex: Option<egui::TextureHandle>,
     preview_error: Option<String>,
     thumbs: HashMap<PathBuf, Thumb>,
@@ -408,6 +447,14 @@ struct App {
     thumb_rx: Receiver<ThumbMsg>,
     wheel_accum: f32,
     scroll_to_selected: bool,
+    transition: Transition,
+    ken_burns: bool,
+    music_path: Option<PathBuf>,
+    music_volume: i32,
+    music_fade: bool,
+    sec_adjust_open: bool,
+    sec_sub_open: bool,
+    sec_fx_open: bool,
     update_rx: Option<Receiver<Result<Option<String>, String>>>,
     update_status: UpdateStatus,
     update_banner_dismissed: bool,
@@ -441,6 +488,14 @@ impl App {
             thumb_rx,
             wheel_accum: 0.0,
             scroll_to_selected: false,
+            transition: Transition::None,
+            ken_burns: false,
+            music_path: None,
+            music_volume: 100,
+            music_fade: true,
+            sec_adjust_open: true,
+            sec_sub_open: true,
+            sec_fx_open: true,
             update_rx: None,
             update_status: UpdateStatus::Idle,
             update_banner_dismissed: false,
@@ -481,25 +536,28 @@ impl App {
         self.preview_dirty = false;
         let ctx = ctx.clone();
         thread::spawn(move || {
-            let _ = tx.send(render_preview(&photo, &adj, res, &captions, &style, font.as_deref()));
+            let _ = tx.send((idx, render_preview(&photo, &adj, res, &captions, &style, font.as_deref())));
             ctx.request_repaint();
         });
     }
 
     fn poll_preview(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.preview_rx {
-            if let Ok(res) = rx.try_recv() {
+            if let Ok((for_idx, res)) = rx.try_recv() {
                 self.preview_rx = None;
-                match res {
-                    Ok((w, h, rgba)) => {
-                        let img = egui::ColorImage::from_rgba_unmultiplied(
-                            [w as usize, h as usize],
-                            &rgba,
-                        );
-                        self.preview_tex =
-                            Some(ctx.load_texture("preview", img, Default::default()));
+                // 渲染期間使用者已切到別張照片 → 丟棄過期結果（dirty 仍在，會重新渲染）
+                if self.preview_selected == Some(for_idx) {
+                    match res {
+                        Ok((w, h, rgba)) => {
+                            let img = egui::ColorImage::from_rgba_unmultiplied(
+                                [w as usize, h as usize],
+                                &rgba,
+                            );
+                            self.preview_tex =
+                                Some(ctx.load_texture("preview", img, Default::default()));
+                        }
+                        Err(e) => self.preview_error = Some(e),
                     }
-                    Err(e) => self.preview_error = Some(e),
                 }
             }
         }
@@ -680,6 +738,15 @@ impl App {
                 })
                 .collect(),
         };
+        let fx = OutputFx {
+            transition: self.transition,
+            ken_burns: self.ken_burns,
+            music: self.music_path.clone().map(|path| MusicJob {
+                path,
+                volume: self.music_volume,
+                fade_out: self.music_fade,
+            }),
+        };
         let ctx = ctx.clone();
 
         thread::spawn(move || {
@@ -687,7 +754,7 @@ impl App {
                 let _ = tx.send(msg);
                 ctx.request_repaint();
             };
-            match run_conversion(&photos, fps, format, res, &adj, &subs, &output, &send) {
+            match run_conversion(&photos, fps, format, res, &adj, &subs, &fx, &output, &send) {
                 Ok(()) => send(WorkerMsg::Done(output.clone())),
                 Err(e) => send(WorkerMsg::Error(e)),
             }
@@ -948,22 +1015,30 @@ impl App {
                         ui.separator();
                         ui.add_space(10.0);
                         self.ui_subtitle_section(ui);
+                        ui.add_space(14.0);
+                        ui.separator();
+                        ui.add_space(10.0);
+                        self.ui_fx_section(ui);
                         ui.add_space(8.0);
                     });
             });
     }
 
     fn ui_adjust_section(&mut self, ui: &mut egui::Ui) {
-        let before = self.adj;
-
         ui.horizontal(|ui| {
-            section_header(ui, "調色");
+            section_toggle(ui, "調色", &mut self.sec_adjust_open);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if !self.adj.is_neutral() && ui.small_button("↺ 重設").clicked() {
                     self.adj = Adjustments::default();
+                    self.mark_preview_dirty();
                 }
             });
         });
+        if !self.sec_adjust_open {
+            return;
+        }
+        let before = self.adj;
+
         ui.label(
             egui::RichText::new("套用到影片中的每一張照片，滑桿連點兩下可歸零")
                 .size(11.0)
@@ -1001,7 +1076,7 @@ impl App {
         let mut entries_changed = false;
 
         ui.horizontal(|ui| {
-            section_header(ui, "字幕");
+            section_toggle(ui, "字幕", &mut self.sec_sub_open);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("＋ 新增段落").clicked() {
                     let start = self.preview_selected.map(|i| i + 1).unwrap_or(1);
@@ -1011,9 +1086,16 @@ impl App {
                         text: String::new(),
                     });
                     entries_changed = true;
+                    self.sec_sub_open = true; // 收合時新增段落 → 自動展開
                 }
             });
         });
+        if !self.sec_sub_open {
+            if entries_changed {
+                self.mark_preview_dirty();
+            }
+            return;
+        }
         ui.label(
             egui::RichText::new("一段連續的照片共用同一句字幕；樣式為全部共用")
                 .size(11.0)
@@ -1141,6 +1223,96 @@ impl App {
 
         if self.sub_style != style_before {
             self.mark_preview_dirty();
+        }
+    }
+
+    fn ui_fx_section(&mut self, ui: &mut egui::Ui) {
+        section_toggle(ui, "轉場與音樂", &mut self.sec_fx_open);
+        if !self.sec_fx_open {
+            return;
+        }
+        ui.label(
+            egui::RichText::new("啟用轉場或動態縮放時，輸出會提升為 30fps（轉檔時間較長）")
+                .size(11.0)
+                .color(theme::TEXT_WEAK),
+        );
+        ui.add_space(8.0);
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("轉場").color(theme::TEXT_WEAK));
+            egui::ComboBox::from_id_salt("transition")
+                .selected_text(self.transition.label())
+                .width(160.0)
+                .show_ui(ui, |ui| {
+                    for t in Transition::ALL {
+                        ui.selectable_value(&mut self.transition, t, t.label());
+                    }
+                });
+        });
+        ui.checkbox(&mut self.ken_burns, "動態縮放（Ken Burns 緩慢推近）");
+        ui.add_space(10.0);
+
+        group_label(ui, "背景音樂");
+        ui.add_space(2.0);
+        let mut remove_music = false;
+        egui::Frame::default()
+            .fill(theme::CARD)
+            .corner_radius(8)
+            .inner_margin(egui::Margin::same(10))
+            .show(ui, |ui| {
+                match &self.music_path {
+                    None => {
+                        if ui.button("🎵  選擇音樂檔").clicked() {
+                            if let Some(f) = rfd::FileDialog::new()
+                                .set_title("選擇背景音樂")
+                                .add_filter("音訊檔", AUDIO_EXTS)
+                                .pick_file()
+                            {
+                                self.music_path = Some(f);
+                            }
+                        }
+                        ui.label(
+                            egui::RichText::new(
+                                "支援 MP3、WAV、M4A、FLAC、OGG，也可以直接拖進視窗",
+                            )
+                            .size(11.0)
+                            .color(theme::TEXT_WEAK),
+                        );
+                    }
+                    Some(p) => {
+                        let name = p.file_name().unwrap_or_default().to_string_lossy();
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("🎵").size(13.0));
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(name.as_ref())
+                                        .size(12.5)
+                                        .color(theme::TEXT),
+                                )
+                                .truncate(),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("✕").on_hover_text("移除音樂").clicked()
+                                    {
+                                        remove_music = true;
+                                    }
+                                },
+                            );
+                        });
+                        slider_row(ui, &mut self.music_volume, 0, 200, "音量");
+                        ui.checkbox(&mut self.music_fade, "結尾自動淡出（2 秒）");
+                        ui.label(
+                            egui::RichText::new("音樂比影片短會自動循環，比影片長會自動裁切")
+                                .size(11.0)
+                                .color(theme::TEXT_WEAK),
+                        );
+                    }
+                }
+            });
+        if remove_music {
+            self.music_path = None;
         }
     }
 
@@ -1325,15 +1497,22 @@ impl App {
             }
         }
 
-        // 右上角：預覽更新中
+        // 右上角：預覽更新中的轉圈。
+        // 注意：不能用 ui.put()——它會把版面游標拉回這個位置，
+        // 造成後面的縮圖列被畫到視窗上方（跑版）
         if self.preview_rx.is_some() && self.preview_tex.is_some() {
-            ui.put(
-                egui::Rect::from_min_size(
-                    rect.right_top() + egui::vec2(-32.0, 12.0),
-                    egui::vec2(18.0, 18.0),
-                ),
-                egui::Spinner::new().size(16.0).color(theme::ACCENT),
-            );
+            let t = ui.input(|i| i.time) as f32;
+            let center = rect.right_top() + egui::vec2(-22.0, 22.0);
+            let radius = 8.0;
+            let start = t * 5.0;
+            let points: Vec<egui::Pos2> = (0..=18)
+                .map(|k| {
+                    let a = start + k as f32 * (std::f32::consts::TAU * 0.75 / 18.0);
+                    center + egui::vec2(a.cos(), a.sin()) * radius
+                })
+                .collect();
+            p.add(egui::Shape::line(points, egui::Stroke::new(2.5, theme::ACCENT)));
+            ui.ctx().request_repaint();
         }
 
         // 預覽錯誤
@@ -1453,11 +1632,6 @@ impl App {
                             .size(12.5)
                             .color(theme::TEXT_WEAK),
                     );
-                    ui.add_space(2.0);
-                    ui.hyperlink_to(
-                        egui::RichText::new("GitHub 專案頁面").size(12.0),
-                        format!("https://github.com/{GITHUB_REPO}"),
-                    );
                     ui.add_space(8.0);
                     ui.separator();
                     ui.add_space(8.0);
@@ -1576,6 +1750,9 @@ impl eframe::App for App {
             for p in dropped {
                 if p.is_dir() {
                     files.extend(collect_images_in_dir(&p));
+                } else if is_audio(&p) {
+                    // 拖入音訊檔＝設定為背景音樂
+                    self.music_path = Some(p);
                 } else {
                     files.push(p);
                 }
@@ -1694,6 +1871,48 @@ fn section_header(ui: &mut egui::Ui, title: &str) {
         ui.painter().rect_filled(rect, 2, theme::ACCENT);
         ui.label(egui::RichText::new(title).strong().size(14.5).color(theme::TEXT));
     });
+}
+
+/// 可收合的區段標題：色條 + 標題 + 展開/收合三角形，點擊切換
+fn section_toggle(ui: &mut egui::Ui, title: &str, open: &mut bool) {
+    let font = egui::FontId::proportional(14.5);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(title.to_string(), font, theme::TEXT);
+    let w = 10.0 + galley.size().x + 8.0 + 14.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 20.0), egui::Sense::click());
+    let p = ui.painter();
+    let bar = egui::Rect::from_center_size(
+        egui::pos2(rect.min.x + 1.5, rect.center().y),
+        egui::vec2(3.0, 15.0),
+    );
+    p.rect_filled(bar, 2, theme::ACCENT);
+    p.galley(
+        egui::pos2(rect.min.x + 10.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        theme::TEXT,
+    );
+    // 三角形箭頭（開＝朝下、合＝朝右）
+    let cx = rect.max.x - 7.0;
+    let cy = rect.center().y;
+    let color = if resp.hovered() { theme::TEXT } else { theme::TEXT_WEAK };
+    let pts = if *open {
+        vec![
+            egui::pos2(cx - 4.5, cy - 2.5),
+            egui::pos2(cx + 4.5, cy - 2.5),
+            egui::pos2(cx, cy + 3.5),
+        ]
+    } else {
+        vec![
+            egui::pos2(cx - 2.5, cy - 4.5),
+            egui::pos2(cx - 2.5, cy + 4.5),
+            egui::pos2(cx + 3.5, cy),
+        ]
+    };
+    p.add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
+    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+        *open = !*open;
+    }
 }
 
 /// 小型分組標籤
@@ -1864,6 +2083,13 @@ fn is_image(p: &Path) -> bool {
     p.extension()
         .and_then(|e| e.to_str())
         .map(|e| IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+fn is_audio(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| AUDIO_EXTS.contains(&e.to_ascii_lowercase().as_str()))
         .unwrap_or(false)
 }
 
@@ -2126,6 +2352,7 @@ fn run_conversion(
     res: Resolution,
     adj: &Adjustments,
     subs: &SubtitleJob,
+    fx: &OutputFx,
     output: &Path,
     send: &dyn Fn(WorkerMsg),
 ) -> Result<(), String> {
@@ -2142,8 +2369,20 @@ fn run_conversion(
 
     send(WorkerMsg::Status("建立照片清單…".into()));
 
-    // 用 concat demuxer 列出每張照片與顯示時間
+    let animated = fx.ken_burns || fx.transition != Transition::None;
+
+    // 每張照片的顯示秒數。Ken Burns 用 zoompan 以「每張輸出 kb_frames 格」計時，
+    // 需把實際秒數對齊到 30fps 的格數，字幕與轉場時間點才不會累積漂移
     let duration = 1.0 / fps as f64;
+    let (eff_dur, kb_frames) = if fx.ken_burns {
+        let d = ((duration * OUT_FPS as f64).round() as i64).max(1);
+        (d as f64 / OUT_FPS as f64, d)
+    } else {
+        (duration, 0)
+    };
+    let total_secs = photos.len() as f64 * eff_dur;
+
+    // 用 concat demuxer 列出每張照片與顯示時間
     let mut list = String::new();
     for p in photos {
         list.push_str(&format!("file '{}'\nduration {duration}\n", concat_escape(p)));
@@ -2168,11 +2407,24 @@ fn run_conversion(
          pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black"
     );
 
+    // 動態縮放（Ken Burns）：每張照片產生 kb_frames 格緩慢推近/拉遠（奇偶張交替）；
+    // 沒有 Ken Burns 但有轉場時，用 fps 濾鏡升頻，讓淡入淡出有足夠格數呈現
+    if fx.ken_burns {
+        let d = kb_frames;
+        let dm = (d - 1).max(1);
+        vf.push_str(&format!(
+            ",zoompan=z='if(mod(floor(on/{d}),2),1.081-0.08*min(mod(on,{d})/{dm},1),1.001+0.08*min(mod(on,{d})/{dm},1))'\
+             :x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={d}:s={w}x{h}:fps={OUT_FPS}"
+        ));
+    } else if animated {
+        vf.push_str(&format!(",fps={OUT_FPS}"));
+    }
+
     // 字幕：每個段落產生一段 drawtext，用時間區間涵蓋該段照片
     let mut caption_files: Vec<PathBuf> = Vec::new();
     if let Some(font) = &subs.font {
         let fontsize = subs.style.size as f64 * h as f64 / 1080.0;
-        let d = 1.0 / fps as f64;
+        let d = eff_dur;
         for (k, (s, e, text)) in subs.entries.iter().enumerate() {
             let text = text.trim_end();
             if text.is_empty() {
@@ -2194,17 +2446,51 @@ fn run_conversion(
             caption_files.push(cap_path);
         }
     }
+
+    // 轉場（淡入淡出）：eq 以每格評估的週期函數在每個切點附近把亮度與飽和度壓到黑，
+    // 首尾也各有一次淡入/淡出；不用串接大量 fade 濾鏡（fade 的 st 前後會整段變黑）
+    if fx.transition == Transition::FadeBlack {
+        let f = (eff_dur * 0.4).clamp(0.05, 0.5);
+        let dip = format!(
+            "max(0,1-min(mod(t,{d:.6}),{d:.6}-mod(t,{d:.6}))/{f:.6})",
+            d = eff_dur,
+            f = f
+        );
+        vf.push_str(&format!(
+            ",eq=eval=frame:brightness='-{dip}':saturation='max(0,1-{dip})'"
+        ));
+    }
     vf.push_str(",setsar=1,format=yuv420p");
 
+    let out_fps = if animated { OUT_FPS } else { fps };
     let mut cmd = FfmpegCommand::new();
     cmd.arg("-y")
         .args(["-filter_threads", &filter_threads()])
         .args(["-f", "concat", "-safe", "0"])
-        .input(list_path.to_string_lossy())
-        .args(["-vf", &vf])
-        .args(["-r", &fps.to_string()])
+        .input(list_path.to_string_lossy());
+    // 背景音樂：無限循環讀取，總長由 -t 截止（音樂短會循環、長會被裁切）
+    if let Some(m) = &fx.music {
+        cmd.args(["-stream_loop", "-1"]);
+        cmd.input(m.path.to_string_lossy());
+    }
+    cmd.args(["-vf", &vf])
+        .args(["-r", &out_fps.to_string()])
         // 精確限制總長度，避免 concat 清單重複最後一張造成多出一格
-        .args(["-t", &format!("{}", photos.len() as f64 / fps as f64)]);
+        .args(["-t", &format!("{total_secs}")]);
+
+    if let Some(m) = &fx.music {
+        cmd.args(["-map", "0:v", "-map", "1:a"]);
+        let mut af = format!("volume={:.3}", m.volume.max(0) as f64 / 100.0);
+        if m.fade_out && total_secs > 3.0 {
+            af.push_str(&format!(",afade=t=out:st={:.3}:d=2", total_secs - 2.0));
+        }
+        cmd.args(["-af", &af]);
+        if matches!(format, OutputFormat::Webm) {
+            cmd.args(["-c:a", "libopus", "-b:a", "128k"]);
+        } else {
+            cmd.args(["-c:a", "aac", "-b:a", "192k"]);
+        }
+    }
 
     match format {
         OutputFormat::Webm => {
@@ -2227,7 +2513,11 @@ fn run_conversion(
 
     cmd.output(output.to_string_lossy());
 
-    let total_frames = photos.len() as f32;
+    let total_frames = if animated {
+        (total_secs * OUT_FPS as f64) as f32
+    } else {
+        photos.len() as f32
+    };
     let mut error_log: Vec<String> = Vec::new();
 
     let mut child = cmd.spawn().map_err(|e| format!("FFmpeg 啟動失敗：{e}"))?;
@@ -2305,6 +2595,11 @@ fn run_cli(args: &[String]) -> Result<(), String> {
         font: None,
         entries: Vec::new(),
     };
+    let no_fx = OutputFx {
+        transition: Transition::None,
+        ken_burns: false,
+        music: None,
+    };
     run_conversion(
         &photos,
         fps,
@@ -2312,6 +2607,7 @@ fn run_cli(args: &[String]) -> Result<(), String> {
         Resolution { w: 1920, h: 1080 },
         &Adjustments::default(),
         &no_subs,
+        &no_fx,
         &output,
         &send,
     )?;
