@@ -831,18 +831,37 @@ impl App {
             .filter(|p| !self.thumbs.contains_key(*p))
             .cloned()
             .collect();
+        let keep_lo = first.saturating_sub(KEEP);
+        let keep_hi = (last + KEEP).min(n);
         if !need.is_empty() {
             for p in &need {
                 self.thumbs.insert(p.clone(), Thumb::Loading);
             }
             let (lock, cv) = &*self.thumb_jobs;
-            lock.lock().unwrap().extend(need);
+            let mut q = lock.lock().unwrap();
+            // 新請求插到最前面：眼前看得到的優先解碼，
+            // 快速捲動時不用排在已滾走區域的舊工作後面
+            for p in need.into_iter().rev() {
+                q.push_front(p);
+            }
+            // 佇列偏長時，清掉已遠離目前範圍的過時工作
+            // （同時移除 Loading 標記，之後捲回來會重新請求）
+            if q.len() > 64 {
+                let keep: HashSet<&PathBuf> = self.photos[keep_lo..keep_hi].iter().collect();
+                let thumbs = &mut self.thumbs;
+                q.retain(|p| {
+                    if keep.contains(p) {
+                        true
+                    } else {
+                        thumbs.remove(p);
+                        false
+                    }
+                });
+            }
             cv.notify_all();
         }
 
         // 淘汰：貼圖數量明顯超過保留窗時才做一次 O(n) 掃描
-        let keep_lo = first.saturating_sub(KEEP);
-        let keep_hi = (last + KEEP).min(n);
         if self.thumbs.len() > (keep_hi - keep_lo) + SLACK {
             for (i, p) in self.photos.iter().enumerate() {
                 if (i < keep_lo || i >= keep_hi)
