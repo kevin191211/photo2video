@@ -1897,7 +1897,7 @@ impl App {
                     };
                     let selected = self.preview_selected == Some(i);
                     let has_caption = self.sub_entries.iter().any(|e| {
-                        e.start <= i + 1 && i + 1 <= e.end && !e.text.trim().is_empty()
+                        (e.start..=e.end).contains(&(i + 1)) && !e.text.trim().is_empty()
                     });
                     let resp = thumb_item(ui, tex.as_ref(), i, selected, has_caption);
                     if resp.clicked() {
@@ -2262,15 +2262,6 @@ fn apply_theme(ctx: &egui::Context) {
 
     style.visuals = v;
     ctx.all_styles_mut(|s| *s = style.clone());
-}
-
-/// 帶色條的區段標題
-fn section_header(ui: &mut egui::Ui, title: &str) {
-    ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(3.0, 15.0), egui::Sense::hover());
-        ui.painter().rect_filled(rect, 2, theme::ACCENT);
-        ui.label(egui::RichText::new(title).strong().size(14.5).color(theme::TEXT));
-    });
 }
 
 /// 可收合的區段標題：色條 + 標題 + 展開/收合三角形，點擊切換
@@ -2904,9 +2895,7 @@ fn render_preview(
         use ffmpeg_sidecar::event::LogLevel;
         match event {
             FfmpegEvent::OutputFrame(f) => frame = Some((f.width, f.height, f.data)),
-            FfmpegEvent::Log(level, msg)
-                if matches!(level, LogLevel::Error | LogLevel::Fatal) =>
-            {
+            FfmpegEvent::Log(LogLevel::Error | LogLevel::Fatal, msg) => {
                 error_log.push(msg);
             }
             _ => {}
@@ -2950,6 +2939,8 @@ struct SubtitleJob {
     entries: Vec<(usize, usize, String)>,
 }
 
+// 轉換任務的完整參數組，拆包裝反而失去可讀性
+#[allow(clippy::too_many_arguments)]
 fn run_conversion(
     photos: &[PathBuf],
     fps: u32,
