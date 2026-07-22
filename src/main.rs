@@ -315,6 +315,32 @@ fn check_latest_release() -> Result<Option<String>, String> {
     Ok((latest > current).then_some(tag))
 }
 
+/// 設定檔路徑：%APPDATA%\photo2video\config.json
+fn config_path() -> PathBuf {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("photo2video")
+        .join("config.json")
+}
+
+/// 讀取上次儲存的每秒張數；沒有設定檔或值不合法時回傳 None
+fn load_saved_fps() -> Option<u32> {
+    let txt = std::fs::read_to_string(config_path()).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&txt).ok()?;
+    let fps = json.get("fps")?.as_u64()? as u32;
+    (1..=60).contains(&fps).then_some(fps)
+}
+
+/// 儲存每秒張數設定（失敗不影響使用，靜默忽略）
+fn save_fps(fps: u32) {
+    let path = config_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, serde_json::json!({ "fps": fps }).to_string());
+}
+
 /// 掃描 Windows 字型資料夾中常見且支援中文的字型
 fn detect_fonts() -> Vec<(String, PathBuf)> {
     let candidates: [(&str, &str); 12] = [
@@ -411,6 +437,16 @@ enum UpdateStatus {
     Checking,
     UpToDate,
     Available(String),
+    Downloading(f32),
+    ReadyToRestart,
+    Failed(String),
+}
+
+/// 更新背景執行緒回傳的訊息
+enum UpdateMsg {
+    CheckResult(Result<Option<String>, String>),
+    Progress(f32),
+    Ready,
     Failed(String),
 }
 
@@ -470,7 +506,7 @@ impl App {
         let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             photos: Vec::new(),
-            fps: 2,
+            fps: load_saved_fps().unwrap_or(10),
             format: OutputFormat::Mp4,
             resolution: Resolution { w: 1920, h: 1080 },
             state: ConvertState::Idle,
@@ -957,6 +993,7 @@ impl App {
 
                 let working = self.is_working();
                 let res_before = self.resolution;
+                let fps_before = self.fps;
 
                 ui.horizontal(|ui| {
                     ui.add_enabled_ui(!working, |ui| {
@@ -1011,6 +1048,9 @@ impl App {
 
                 if self.resolution != res_before {
                     self.mark_preview_dirty();
+                }
+                if self.fps != fps_before {
+                    save_fps(self.fps);
                 }
             });
     }
