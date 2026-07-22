@@ -1,0 +1,41 @@
+name: Release
+
+# 推送 v 開頭的 tag（例如 v0.2.0）時自動建置並發佈到 GitHub Releases
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust 建置快取
+        uses: Swatinem/rust-cache@v2
+
+      - name: 建置 release 版
+        run: cargo build --release
+
+      - name: 打包（含 FFmpeg 與使用說明）
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory package | Out-Null
+          Copy-Item target/release/photo2video.exe package/
+          Copy-Item 使用說明.md package/
+          # 附上 FFmpeg，讓使用者解壓即用、不需第一次啟動時再下載
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp
+          $exe = Get-ChildItem ffmpeg_tmp -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          Copy-Item $exe.FullName package/
+          Compress-Archive -Path package/* -DestinationPath "photo2video-${{ github.ref_name }}-windows-x64.zip"
+
+      - name: 發佈到 GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          files: photo2video-*.zip
+          generate_release_notes: true

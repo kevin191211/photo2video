@@ -2,6 +2,10 @@
 
 用 Rust + egui 寫的桌面小工具，把一連串照片合成一支影片。
 
+## 下載
+
+不想自己建置的話，直接到 [Releases 頁面](https://github.com/kevin191211/photo2video/releases/latest) 下載最新版 zip（內含 `photo2video.exe`、`ffmpeg.exe` 與使用說明），解壓即可使用。程式啟動時會自動檢查更新並在視窗底部提示。
+
 ## 使用方式
 
 執行 `target\release\photo2video.exe`，操作步驟：

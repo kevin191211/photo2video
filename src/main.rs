@@ -242,6 +242,31 @@ struct SubtitleEntry {
     text: String,
 }
 
+/// 解析 "v1.2.3" 或 "1.2.3" 為可比較的版本號
+fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
+    let s = s.trim().trim_start_matches(['v', 'V']);
+    let mut it = s.split('.');
+    let major = it.next()?.parse().ok()?;
+    let minor = it.next()?.parse().ok()?;
+    let patch = it.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
+}
+
+/// 查詢 GitHub 最新 release，比目前版本新時回傳其 tag（例如 "v0.3.0"）
+fn check_latest_release() -> Option<String> {
+    let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
+    let resp = ureq::get(&url)
+        .set("User-Agent", concat!("photo2video/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(10))
+        .call()
+        .ok()?;
+    let json: serde_json::Value = resp.into_json().ok()?;
+    let tag = json.get("tag_name")?.as_str()?.to_string();
+    let latest = parse_version(&tag)?;
+    let current = parse_version(env!("CARGO_PKG_VERSION"))?;
+    (latest > current).then_some(tag)
+}
+
 /// 掃描 Windows 字型資料夾中常見且支援中文的字型
 fn detect_fonts() -> Vec<(String, PathBuf)> {
     let candidates: [(&str, &str); 12] = [
@@ -363,6 +388,8 @@ struct App {
     thumb_rx: Receiver<ThumbMsg>,
     wheel_accum: f32,
     scroll_to_selected: bool,
+    update_rx: Option<Receiver<Option<String>>>,
+    update_available: Option<String>,
 }
 
 impl App {
@@ -370,6 +397,17 @@ impl App {
         setup_chinese_fonts(&cc.egui_ctx);
         apply_theme(&cc.egui_ctx);
         let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
+
+        // 啟動時在背景檢查 GitHub 是否有新版本（失敗就當作沒有，不影響使用）
+        let (update_tx, update_rx) = std::sync::mpsc::channel();
+        {
+            let ctx = cc.egui_ctx.clone();
+            thread::spawn(move || {
+                let _ = update_tx.send(check_latest_release());
+                ctx.request_repaint();
+            });
+        }
+
         let mut app = Self {
             photos: Vec::new(),
             fps: 2,
@@ -392,6 +430,8 @@ impl App {
             thumb_rx,
             wheel_accum: 0.0,
             scroll_to_selected: false,
+            update_rx: Some(update_rx),
+            update_available: None,
         };
         if !initial_files.is_empty() {
             app.add_photos(initial_files, &cc.egui_ctx);
@@ -639,6 +679,15 @@ impl App {
         });
     }
 
+    fn poll_update(&mut self) {
+        if let Some(rx) = &self.update_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.update_available = res;
+                self.update_rx = None;
+            }
+        }
+    }
+
     fn poll_worker(&mut self) {
         let Some(rx) = &self.rx else { return };
         let mut done = false;
@@ -679,6 +728,35 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(16, 12)),
             )
             .show(ctx, |ui| {
+                // 新版本通知
+                if let Some(tag) = self.update_available.clone() {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("⬆ 有新版本 {tag} 可以下載"))
+                                .size(12.0)
+                                .strong()
+                                .color(theme::SUCCESS),
+                        );
+                        if ui
+                            .link(egui::RichText::new("前往下載頁面").size(12.0).color(theme::ACCENT))
+                            .clicked()
+                        {
+                            ctx.open_url(egui::OpenUrl::new_tab(format!(
+                                "https://github.com/{GITHUB_REPO}/releases/latest"
+                            )));
+                        }
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui.small_button("✕").on_hover_text("隱藏通知").clicked() {
+                                    self.update_available = None;
+                                }
+                            },
+                        );
+                    });
+                    ui.add_space(8.0);
+                }
+
                 // 狀態列
                 match &self.state {
                     ConvertState::Idle => {}
@@ -1334,6 +1412,7 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_update();
         self.poll_worker();
         self.poll_preview(ctx);
         self.poll_thumbs(ctx);
