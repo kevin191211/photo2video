@@ -252,19 +252,30 @@ fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
-/// 查詢 GitHub 最新 release，比目前版本新時回傳其 tag（例如 "v0.3.0"）
-fn check_latest_release() -> Option<String> {
+/// 查詢 GitHub 最新 release：Ok(Some(tag)) 表示有新版、Ok(None) 表示已是最新
+fn check_latest_release() -> Result<Option<String>, String> {
     let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
-    let resp = ureq::get(&url)
+    let resp = match ureq::get(&url)
         .set("User-Agent", concat!("photo2video/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(10))
         .call()
-        .ok()?;
-    let json: serde_json::Value = resp.into_json().ok()?;
-    let tag = json.get("tag_name")?.as_str()?.to_string();
-    let latest = parse_version(&tag)?;
-    let current = parse_version(env!("CARGO_PKG_VERSION"))?;
-    (latest > current).then_some(tag)
+    {
+        Ok(r) => r,
+        // 還沒有任何 release 時 GitHub 回 404，視為沒有新版
+        Err(ureq::Error::Status(404, _)) => return Ok(None),
+        Err(e) => return Err(format!("連線失敗：{e}")),
+    };
+    let json: serde_json::Value = resp
+        .into_json()
+        .map_err(|e| format!("回應解析失敗：{e}"))?;
+    let tag = json
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .ok_or("回應中沒有版本資訊")?
+        .to_string();
+    let latest = parse_version(&tag).ok_or("無法解析最新版本號")?;
+    let current = parse_version(env!("CARGO_PKG_VERSION")).ok_or("無法解析目前版本號")?;
+    Ok((latest > current).then_some(tag))
 }
 
 /// 掃描 Windows 字型資料夾中常見且支援中文的字型
@@ -357,6 +368,15 @@ enum ConvertState {
     Error(String),
 }
 
+/// 檢查更新的狀態
+enum UpdateStatus {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(String),
+    Failed(String),
+}
+
 type PreviewResult = Result<(u32, u32, Vec<u8>), String>;
 type ThumbMsg = (PathBuf, Option<(u32, u32, Vec<u8>)>);
 
@@ -388,8 +408,10 @@ struct App {
     thumb_rx: Receiver<ThumbMsg>,
     wheel_accum: f32,
     scroll_to_selected: bool,
-    update_rx: Option<Receiver<Option<String>>>,
-    update_available: Option<String>,
+    update_rx: Option<Receiver<Result<Option<String>, String>>>,
+    update_status: UpdateStatus,
+    update_banner_dismissed: bool,
+    about_open: bool,
 }
 
 impl App {
@@ -397,17 +419,6 @@ impl App {
         setup_chinese_fonts(&cc.egui_ctx);
         apply_theme(&cc.egui_ctx);
         let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
-
-        // 啟動時在背景檢查 GitHub 是否有新版本（失敗就當作沒有，不影響使用）
-        let (update_tx, update_rx) = std::sync::mpsc::channel();
-        {
-            let ctx = cc.egui_ctx.clone();
-            thread::spawn(move || {
-                let _ = update_tx.send(check_latest_release());
-                ctx.request_repaint();
-            });
-        }
-
         let mut app = Self {
             photos: Vec::new(),
             fps: 2,
@@ -430,9 +441,13 @@ impl App {
             thumb_rx,
             wheel_accum: 0.0,
             scroll_to_selected: false,
-            update_rx: Some(update_rx),
-            update_available: None,
+            update_rx: None,
+            update_status: UpdateStatus::Idle,
+            update_banner_dismissed: false,
+            about_open: false,
         };
+        // 啟動時在背景檢查是否有新版本（失敗不影響使用）
+        app.spawn_update_check(&cc.egui_ctx);
         if !initial_files.is_empty() {
             app.add_photos(initial_files, &cc.egui_ctx);
         }
@@ -679,11 +694,30 @@ impl App {
         });
     }
 
+    /// 在背景執行緒檢查 GitHub 是否有新版本
+    fn spawn_update_check(&mut self, ctx: &egui::Context) {
+        if matches!(self.update_status, UpdateStatus::Checking) {
+            return;
+        }
+        self.update_status = UpdateStatus::Checking;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.update_rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(check_latest_release());
+            ctx.request_repaint();
+        });
+    }
+
     fn poll_update(&mut self) {
         if let Some(rx) = &self.update_rx {
             if let Ok(res) = rx.try_recv() {
-                self.update_available = res;
                 self.update_rx = None;
+                self.update_status = match res {
+                    Ok(Some(tag)) => UpdateStatus::Available(tag),
+                    Ok(None) => UpdateStatus::UpToDate,
+                    Err(e) => UpdateStatus::Failed(e),
+                };
             }
         }
     }
@@ -729,7 +763,13 @@ impl App {
             )
             .show(ctx, |ui| {
                 // 新版本通知
-                if let Some(tag) = self.update_available.clone() {
+                let new_tag = match &self.update_status {
+                    UpdateStatus::Available(tag) if !self.update_banner_dismissed => {
+                        Some(tag.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(tag) = new_tag {
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new(format!("⬆ 有新版本 {tag} 可以下載"))
@@ -749,7 +789,7 @@ impl App {
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
                                 if ui.small_button("✕").on_hover_text("隱藏通知").clicked() {
-                                    self.update_available = None;
+                                    self.update_banner_dismissed = true;
                                 }
                             },
                         );
@@ -867,6 +907,18 @@ impl App {
                         let can_convert = !self.photos.is_empty() && !working;
                         if primary_button(ui, "▶  開始轉換", can_convert).clicked() {
                             self.start_convert(ctx);
+                        }
+                        ui.add_space(6.0);
+                        if ui
+                            .button(
+                                egui::RichText::new(concat!("ℹ v", env!("CARGO_PKG_VERSION")))
+                                    .size(12.0)
+                                    .color(theme::TEXT_WEAK),
+                            )
+                            .on_hover_text("關於與檢查更新")
+                            .clicked()
+                        {
+                            self.about_open = !self.about_open;
                         }
                     });
                 });
@@ -1373,6 +1425,100 @@ impl App {
         }
     }
 
+    /// 「關於」視窗：版本資訊、專案連結與手動檢查更新
+    fn ui_about_window(&mut self, ctx: &egui::Context) {
+        if !self.about_open {
+            return;
+        }
+        let mut open = self.about_open;
+        let mut check_now = false;
+        egui::Window::new("關於")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_width(320.0);
+                ui.vertical_centered(|ui| {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("🎬").size(34.0));
+                    ui.label(
+                        egui::RichText::new("Photo2Video — 照片轉影片")
+                            .size(15.0)
+                            .strong()
+                            .color(theme::TEXT),
+                    );
+                    ui.label(
+                        egui::RichText::new(concat!("版本 v", env!("CARGO_PKG_VERSION")))
+                            .size(12.5)
+                            .color(theme::TEXT_WEAK),
+                    );
+                    ui.add_space(2.0);
+                    ui.hyperlink_to(
+                        egui::RichText::new("GitHub 專案頁面").size(12.0),
+                        format!("https://github.com/{GITHUB_REPO}"),
+                    );
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    match &self.update_status {
+                        UpdateStatus::Idle => {}
+                        UpdateStatus::Checking => {
+                            ui.label(
+                                egui::RichText::new("檢查更新中…")
+                                    .size(12.5)
+                                    .color(theme::TEXT_WEAK),
+                            );
+                        }
+                        UpdateStatus::UpToDate => {
+                            ui.label(
+                                egui::RichText::new("✔ 目前已是最新版本")
+                                    .size(12.5)
+                                    .color(theme::SUCCESS),
+                            );
+                        }
+                        UpdateStatus::Available(tag) => {
+                            ui.label(
+                                egui::RichText::new(format!("⬆ 有新版本 {tag} 可以下載"))
+                                    .size(12.5)
+                                    .strong()
+                                    .color(theme::SUCCESS),
+                            );
+                            ui.hyperlink_to(
+                                egui::RichText::new("前往下載頁面").size(12.5),
+                                format!("https://github.com/{GITHUB_REPO}/releases/latest"),
+                            );
+                        }
+                        UpdateStatus::Failed(e) => {
+                            ui.label(
+                                egui::RichText::new("✖ 檢查更新失敗")
+                                    .size(12.5)
+                                    .color(theme::ERROR),
+                            )
+                            .on_hover_text(e);
+                        }
+                    }
+                    ui.add_space(8.0);
+
+                    let checking = matches!(self.update_status, UpdateStatus::Checking);
+                    if ui
+                        .add_enabled(!checking, egui::Button::new("🔄 檢查更新"))
+                        .clicked()
+                    {
+                        check_now = true;
+                    }
+                    ui.add_space(4.0);
+                });
+            });
+        self.about_open = open;
+        if check_now {
+            // 手動重新檢查時，讓新版通知條可以再次出現
+            self.update_banner_dismissed = false;
+            self.spawn_update_check(ctx);
+        }
+    }
+
     /// 拖曳檔案進視窗時的全螢幕提示
     fn ui_drop_overlay(&self, ctx: &egui::Context) {
         let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
@@ -1454,6 +1600,7 @@ impl eframe::App for App {
         self.ui_bottom_bar(ctx);
         self.ui_side_panel(ctx);
         self.ui_central(ctx);
+        self.ui_about_window(ctx);
         self.ui_drop_overlay(ctx);
     }
 }
