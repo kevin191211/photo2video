@@ -13,6 +13,9 @@ use ffmpeg_sidecar::event::FfmpegEvent;
 
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "bmp", "webp", "tif", "tiff"];
 
+/// GitHub 儲存庫（檢查更新與下載頁面用）
+const GITHUB_REPO: &str = "kevin191211/photo2video";
+
 /// 全域配色：深色剪輯工具風格
 mod theme {
     use eframe::egui::Color32;
@@ -668,66 +671,6 @@ impl App {
 
     // ---------- UI ----------
 
-    fn ui_top_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("header")
-            .frame(
-                egui::Frame::default()
-                    .fill(theme::PANEL)
-                    .inner_margin(egui::Margin::symmetric(16, 10)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    // 品牌方塊
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                    ui.painter().rect_filled(rect, 8, theme::ACCENT);
-                    ui.painter().text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "▶",
-                        egui::FontId::proportional(15.0),
-                        egui::Color32::WHITE,
-                    );
-                    ui.add_space(6.0);
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        ui.label(
-                            egui::RichText::new("Photo2Video")
-                                .strong()
-                                .size(16.0)
-                                .color(theme::TEXT),
-                        );
-                        ui.label(
-                            egui::RichText::new("照片轉影片工具")
-                                .size(10.5)
-                                .color(theme::TEXT_WEAK),
-                        );
-                    });
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if !self.photos.is_empty() {
-                            let secs = self.photos.len() as f32 / self.fps as f32;
-                            egui::Frame::default()
-                                .fill(theme::CARD)
-                                .corner_radius(12)
-                                .inner_margin(egui::Margin::symmetric(10, 4))
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "{} 張照片 · 約 {:.1} 秒",
-                                            self.photos.len(),
-                                            secs
-                                        ))
-                                        .size(11.5)
-                                        .color(theme::TEXT_WEAK),
-                                    );
-                                });
-                        }
-                    });
-                });
-            });
-    }
-
     fn ui_bottom_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("footer")
             .frame(
@@ -1161,8 +1104,25 @@ impl App {
                 }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let secs = self.photos.len() as f32 / self.fps as f32;
+                egui::Frame::default()
+                    .fill(theme::CARD)
+                    .corner_radius(12)
+                    .inner_margin(egui::Margin::symmetric(10, 4))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} 張照片 · 約 {:.1} 秒",
+                                self.photos.len(),
+                                secs
+                            ))
+                            .size(11.5)
+                            .color(theme::TEXT_WEAK),
+                        );
+                    });
+                ui.add_space(8.0);
                 ui.label(
-                    egui::RichText::new("拖曳即可加入照片 · ← → 切換預覽 · 右鍵縮圖可移除")
+                    egui::RichText::new("拖曳即可加入照片 · 滾輪或 ← → 切換預覽 · 右鍵縮圖可移除")
                         .size(11.0)
                         .color(theme::TEXT_WEAK),
                 );
@@ -1412,7 +1372,6 @@ impl eframe::App for App {
             }
         }
 
-        self.ui_top_bar(ctx);
         self.ui_bottom_bar(ctx);
         self.ui_side_panel(ctx);
         self.ui_central(ctx);
@@ -1568,6 +1527,7 @@ fn adj_slider(ui: &mut egui::Ui, value: &mut i32, label: &str) {
             (format!("{value:+}"), theme::ACCENT)
         };
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(8.0);
             ui.label(egui::RichText::new(txt).size(11.5).color(color));
         });
     });
@@ -1587,6 +1547,7 @@ fn slider_row(ui: &mut egui::Ui, value: &mut i32, min: i32, max: i32, label: &st
         ui.spacing_mut().slider_width = (ui.available_width() - 40.0).max(60.0);
         ui.add(egui::Slider::new(value, min..=max).show_value(false));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(8.0);
             ui.label(
                 egui::RichText::new(value.to_string())
                     .size(11.5)
