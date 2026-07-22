@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -556,7 +556,8 @@ struct App {
     preview_tex: Option<egui::TextureHandle>,
     preview_error: Option<String>,
     thumbs: HashMap<PathBuf, Thumb>,
-    thumb_tx: Sender<ThumbMsg>,
+    /// 縮圖解碼佇列：常駐工作執行緒從這裡領工作（含喚醒用 Condvar）
+    thumb_jobs: Arc<(Mutex<VecDeque<PathBuf>>, Condvar)>,
     thumb_rx: Receiver<ThumbMsg>,
     wheel_accum: f32,
     scroll_to_selected: bool,
@@ -580,7 +581,39 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>, initial_files: Vec<PathBuf>) -> Self {
         setup_chinese_fonts(&cc.egui_ctx);
         apply_theme(&cc.egui_ctx);
-        let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
+        let (thumb_tx, thumb_rx) = std::sync::mpsc::channel::<ThumbMsg>();
+        // 常駐縮圖解碼工作池：閒置時停在 Condvar 上，有工作就喚醒，
+        // 不再每批照片都重新建立執行緒
+        let thumb_jobs: Arc<(Mutex<VecDeque<PathBuf>>, Condvar)> =
+            Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
+        let workers = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(8);
+        for _ in 0..workers {
+            let jobs = Arc::clone(&thumb_jobs);
+            let tx = thumb_tx.clone();
+            let ctx = cc.egui_ctx.clone();
+            thread::spawn(move || loop {
+                let job = {
+                    let (lock, cv) = &*jobs;
+                    let mut q = lock.lock().unwrap();
+                    loop {
+                        if let Some(p) = q.pop_front() {
+                            break p;
+                        }
+                        q = cv.wait(q).unwrap();
+                    }
+                };
+                let res = image::open(&job).ok().map(|img| {
+                    // RGB 即可（縮圖不需要透明通道），省 1/4 記憶體與上傳頻寬
+                    let t = img.thumbnail(320, 180).to_rgb8();
+                    (t.width(), t.height(), t.into_raw())
+                });
+                let _ = tx.send((job, res));
+                ctx.request_repaint();
+            });
+        }
         let mut app = Self {
             photos: Vec::new(),
             fps: load_saved_fps().unwrap_or(10),
@@ -600,7 +633,7 @@ impl App {
             preview_tex: None,
             preview_error: None,
             thumbs: HashMap::new(),
-            thumb_tx,
+            thumb_jobs,
             thumb_rx,
             wheel_accum: 0.0,
             scroll_to_selected: false,
@@ -630,7 +663,7 @@ impl App {
             }
         });
         if !initial_files.is_empty() {
-            app.add_photos(initial_files, &cc.egui_ctx);
+            app.add_photos(initial_files);
         }
         app
     }
@@ -749,7 +782,7 @@ impl App {
         matches!(self.state, ConvertState::Working { .. })
     }
 
-    fn add_photos(&mut self, mut files: Vec<PathBuf>, ctx: &egui::Context) {
+    fn add_photos(&mut self, mut files: Vec<PathBuf>) {
         files.retain(|p| is_image(p));
         // 用 HashSet 去重；逐一 contains 是 O(n²)，加入數千張照片要數百萬次路徑比對
         let mut seen: HashSet<PathBuf> = self.photos.iter().cloned().collect();
@@ -766,39 +799,48 @@ impl App {
             self.mark_preview_dirty();
         }
 
-        // 背景載入還沒有縮圖的照片
-        let batch: Vec<PathBuf> = self
-            .photos
+        // 縮圖不在這裡整批解碼：縮圖列會依可視範圍按需請求（見 manage_thumbs），
+        // 初始載入不再隨照片數變慢
+    }
+
+    /// 依縮圖列可視範圍按需載入縮圖，並淘汰遠離範圍的貼圖，
+    /// 記憶體用量不隨照片總數成長
+    fn manage_thumbs(&mut self, first: usize, last: usize) {
+        /// 可視範圍外先預先解碼的張數（單側）
+        const PREFETCH: usize = 64;
+        /// 可視範圍外保留貼圖的張數（單側），之外的淘汰
+        const KEEP: usize = 256;
+        /// 超出保留數多少才啟動淘汰掃描（避免每幀掃描）
+        const SLACK: usize = 192;
+
+        let n = self.photos.len();
+        // 請求可視範圍＋預取邊界內還沒有縮圖的
+        let lo = first.saturating_sub(PREFETCH);
+        let hi = (last + PREFETCH).min(n);
+        let need: Vec<PathBuf> = self.photos[lo..hi]
             .iter()
             .filter(|p| !self.thumbs.contains_key(*p))
             .cloned()
             .collect();
-        if !batch.is_empty() {
-            for p in &batch {
+        if !need.is_empty() {
+            for p in &need {
                 self.thumbs.insert(p.clone(), Thumb::Loading);
             }
-            // 多執行緒共用佇列解碼：照片依序被領走，前面的縮圖先出現
-            let workers = thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-                .min(8)
-                .min(batch.len());
-            let queue = Arc::new(Mutex::new(VecDeque::from(batch)));
-            for _ in 0..workers {
-                let queue = Arc::clone(&queue);
-                let tx = self.thumb_tx.clone();
-                let ctx = ctx.clone();
-                thread::spawn(move || loop {
-                    let job = queue.lock().unwrap().pop_front();
-                    let Some(p) = job else { break };
-                    let res = image::open(&p).ok().map(|img| {
-                        // RGB 即可（縮圖不需要透明通道），省 1/4 記憶體與上傳頻寬
-                        let t = img.thumbnail(320, 180).to_rgb8();
-                        (t.width(), t.height(), t.into_raw())
-                    });
-                    let _ = tx.send((p, res));
-                    ctx.request_repaint();
-                });
+            let (lock, cv) = &*self.thumb_jobs;
+            lock.lock().unwrap().extend(need);
+            cv.notify_all();
+        }
+
+        // 淘汰：貼圖數量明顯超過保留窗時才做一次 O(n) 掃描
+        let keep_lo = first.saturating_sub(KEEP);
+        let keep_hi = (last + KEEP).min(n);
+        if self.thumbs.len() > (keep_hi - keep_lo) + SLACK {
+            for (i, p) in self.photos.iter().enumerate() {
+                if (i < keep_lo || i >= keep_hi)
+                    && matches!(self.thumbs.get(p), Some(Thumb::Ready(_)))
+                {
+                    self.thumbs.remove(p);
+                }
             }
         }
     }
@@ -806,6 +848,8 @@ impl App {
     fn clear_photos(&mut self) {
         self.photos.clear();
         self.thumbs.clear();
+        // 清掉還在排隊的解碼工作，工作池不再為已移除的照片做白工
+        self.thumb_jobs.0.lock().unwrap().clear();
         self.preview_selected = None;
         self.preview_tex = None;
         self.preview_error = None;
@@ -830,23 +874,23 @@ impl App {
         }
     }
 
-    fn pick_folder(&mut self, ctx: &egui::Context) {
+    fn pick_folder(&mut self) {
         if let Some(dir) = rfd::FileDialog::new()
             .set_title("選擇照片資料夾")
             .pick_folder()
         {
             let files = collect_images_in_dir(&dir);
-            self.add_photos(files, ctx);
+            self.add_photos(files);
         }
     }
 
-    fn pick_files(&mut self, ctx: &egui::Context) {
+    fn pick_files(&mut self) {
         if let Some(files) = rfd::FileDialog::new()
             .set_title("選擇照片")
             .add_filter("圖片檔", IMAGE_EXTS)
             .pick_files()
         {
-            self.add_photos(files, ctx);
+            self.add_photos(files);
         }
     }
 
@@ -1566,14 +1610,14 @@ impl App {
             )
             .show(ctx, |ui| {
                 if self.photos.is_empty() {
-                    self.ui_empty_state(ui, ctx);
+                    self.ui_empty_state(ui);
                 } else {
                     self.ui_workspace(ui, ctx);
                 }
             });
     }
 
-    fn ui_empty_state(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn ui_empty_state(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
         let r = rect.shrink(4.0);
         ui.painter()
@@ -1617,14 +1661,14 @@ impl App {
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 if primary_button(ui, "📁  選擇資料夾", true).clicked() {
-                    self.pick_folder(ctx);
+                    self.pick_folder();
                 }
                 ui.add_space(4.0);
                 if ui
                     .add(egui::Button::new("🖼  選擇照片").min_size(egui::vec2(120.0, 38.0)))
                     .clicked()
                 {
-                    self.pick_files(ctx);
+                    self.pick_files();
                 }
             },
         );
@@ -1637,10 +1681,10 @@ impl App {
         ui.horizontal(|ui| {
             ui.add_enabled_ui(!working, |ui| {
                 if ui.button("📁  加入資料夾").clicked() {
-                    self.pick_folder(ctx);
+                    self.pick_folder();
                 }
                 if ui.button("🖼  加入照片").clicked() {
-                    self.pick_files(ctx);
+                    self.pick_files();
                 }
                 if ui.button("🗑  清空").clicked() {
                     self.clear_photos();
@@ -1806,6 +1850,7 @@ impl App {
         let mut click_idx: Option<usize> = None;
         let mut remove_idx: Option<usize> = None;
         let mut clear_all = false;
+        let mut vis_range: Option<(usize, usize)> = None;
         // 縮圖尺寸固定，可虛擬化：只渲染捲動範圍內的縮圖、前後以空白撐出總寬，
         // 照片數量再多每一幀的繪製成本也不變
         let thumb_size = egui::vec2(132.0, 84.0);
@@ -1829,6 +1874,7 @@ impl App {
                 let first = (((viewport.min.x / stride).floor() as isize) - 1).max(0) as usize;
                 let last = ((((viewport.max.x / stride).ceil() as isize) + 1).max(0) as usize).min(n);
                 let first = first.min(last);
+                vis_range = Some((first, last));
                 if first > 0 {
                     ui.add_space(first as f32 * stride);
                 }
@@ -1866,6 +1912,11 @@ impl App {
         });
 
         self.scroll_to_selected = false;
+
+        // 依這一幀的可視範圍按需載入／淘汰縮圖
+        if let Some((first, last)) = vis_range {
+            self.manage_thumbs(first, last);
+        }
 
         if let Some(i) = click_idx {
             self.select_photo(Some(i));
@@ -2097,7 +2148,7 @@ impl eframe::App for App {
                     files.push(p);
                 }
             }
-            self.add_photos(files, ctx);
+            self.add_photos(files);
         }
 
         // 左右方向鍵切換預覽（輸入框有焦點時不動作）
