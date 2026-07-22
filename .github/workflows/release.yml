@@ -32,6 +32,8 @@ jobs:
           $exe = Get-ChildItem ffmpeg_tmp -Recurse -Filter ffmpeg.exe | Select-Object -First 1
           Copy-Item $exe.FullName package/
           Compress-Archive -Path package/* -DestinationPath "photo2video-${{ github.ref_name }}-windows-x64.zip"
+          # 另附固定檔名的複本，讓 releases/latest/download/photo2video-windows-x64.zip 永遠指向最新版
+          Copy-Item "photo2video-${{ github.ref_name }}-windows-x64.zip" photo2video-windows-x64.zip
 
       - name: 發佈到 GitHub Releases
         uses: softprops/action-gh-release@v2
