@@ -576,8 +576,12 @@ struct App {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, initial_files: Vec<PathBuf>) -> Self {
-        setup_chinese_fonts(&cc.egui_ctx);
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        initial_files: Vec<PathBuf>,
+        cjk_font: Option<Vec<u8>>,
+    ) -> Self {
+        setup_chinese_fonts(&cc.egui_ctx, cjk_font);
         apply_theme(&cc.egui_ctx);
         let (thumb_tx, thumb_rx) = std::sync::mpsc::channel::<ThumbMsg>();
         // 常駐縮圖解碼工作池：閒置時停在 Condvar 上，有工作就喚醒，
@@ -2520,33 +2524,37 @@ fn flush_part(buf: &str, is_num: bool) -> NatPart {
     }
 }
 
-fn setup_chinese_fonts(ctx: &egui::Context) {
+/// 讀取系統中文字型檔（約 20MB+）；在 main 一開始的背景執行緒呼叫，
+/// 與視窗建立同時進行，啟動時不用再等這段磁碟讀取
+fn load_cjk_font_bytes() -> Option<Vec<u8>> {
     let candidates = [
         r"C:\Windows\Fonts\msjh.ttc",    // 微軟正黑體
         r"C:\Windows\Fonts\msjhbd.ttc",  // 微軟正黑體（粗體）
         r"C:\Windows\Fonts\mingliu.ttc", // 細明體
         r"C:\Windows\Fonts\msyh.ttc",    // 微軟雅黑（備援）
     ];
-    for path in candidates {
-        if let Ok(bytes) = std::fs::read(path) {
-            let mut fonts = egui::FontDefinitions::default();
-            fonts
-                .font_data
-                .insert("cjk".into(), egui::FontData::from_owned(bytes).into());
-            fonts
-                .families
-                .entry(egui::FontFamily::Proportional)
-                .or_default()
-                .push("cjk".into());
-            fonts
-                .families
-                .entry(egui::FontFamily::Monospace)
-                .or_default()
-                .push("cjk".into());
-            ctx.set_fonts(fonts);
-            return;
-        }
-    }
+    candidates
+        .iter()
+        .find_map(|path| std::fs::read(path).ok())
+}
+
+fn setup_chinese_fonts(ctx: &egui::Context, bytes: Option<Vec<u8>>) {
+    let Some(bytes) = bytes else { return };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts
+        .font_data
+        .insert("cjk".into(), egui::FontData::from_owned(bytes).into());
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .push("cjk".into());
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .push("cjk".into());
+    ctx.set_fonts(fonts);
 }
 
 fn concat_escape(p: &Path) -> String {
@@ -3123,6 +3131,9 @@ fn main() -> eframe::Result {
         let _ = std::fs::remove_file(exe.with_extension("exe.old"));
     }
 
+    // 提早在背景讀取中文字型檔（20MB+），與視窗建立同時進行，縮短啟動時間
+    let font_loader = thread::spawn(load_cjk_font_bytes);
+
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 && args[1] == "--cli" {
         if let Err(e) = run_cli(&args[2..]) {
@@ -3154,6 +3165,9 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Photo2Video — 照片轉影片",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, initial_files)))),
+        Box::new(move |cc| {
+            let cjk_font = font_loader.join().ok().flatten();
+            Ok(Box::new(App::new(cc, initial_files, cjk_font)))
+        }),
     )
 }
