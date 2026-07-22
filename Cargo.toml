@@ -1,0 +1,17 @@
+[package]
+name = "photo2video"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.31"
+egui = "0.31"
+rfd = "0.15"
+ffmpeg-sidecar = "2"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+
+# 隱藏 release 版執行時的黑色主控台視窗（在 main.rs 以 windows_subsystem 屬性處理）
