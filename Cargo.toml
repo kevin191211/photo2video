@@ -18,5 +18,9 @@ winresource = "0.1"
 [profile.release]
 opt-level = 3
 lto = true
+# 單一編譯單元讓 LTO 跨模組最佳化完整發揮（建置較慢、執行較快）
+codegen-units = 1
+# 去除符號表：執行檔更小，自動更新下載更快
+strip = "symbols"
 
 # 隱藏 release 版執行時的黑色主控台視窗（在 main.rs 以 windows_subsystem 屬性處理）
