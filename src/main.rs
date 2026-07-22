@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui;
 use ffmpeg_sidecar::command::FfmpegCommand;
@@ -2584,6 +2584,53 @@ fn ensure_ffmpeg(on_download: impl Fn()) -> Result<(), String> {
 }
 
 /// 用 ffmpeg 渲染單張照片的預覽（含調色與字幕，縮小並依輸出比例補邊），回傳 RGBA 像素
+/// 預覽底圖快取：拖動調色滑桿時會對同一張照片反覆重渲染，
+/// 把「縮放後的底圖」存成暫存 PNG 後改以小圖當輸入，
+/// 免去每次重新解碼原始大圖（大照片可省下大半渲染時間）
+struct PreviewBase {
+    /// (照片路徑, 檔案修改時間, 預覽高度)
+    key: (PathBuf, Option<SystemTime>, u32),
+    /// None 表示建置中或建置失敗（失敗就維持完整流程，不重試）
+    file: Option<PathBuf>,
+    /// 底圖檔名流水號：新舊底圖用不同檔名，替換時不互踩
+    serial: u64,
+}
+
+static PREVIEW_BASE: Mutex<Option<PreviewBase>> = Mutex::new(None);
+
+/// 背景建置預覽底圖：把原圖縮放存成 PNG，完成後掛回快取槽
+fn build_preview_base(key: (PathBuf, Option<SystemTime>, u32), pw: u32, ph: u32, serial: u64) {
+    let out = std::env::temp_dir().join(format!("photo2video_prev_base_{serial}.png"));
+    let vf = format!("scale={pw}:{ph}:force_original_aspect_ratio=decrease");
+    let ok = (|| {
+        let mut cmd = FfmpegCommand::new();
+        cmd.arg("-y")
+            .input(key.0.to_string_lossy())
+            .args(["-vf", &vf])
+            .args(["-frames:v", "1"])
+            .output(out.to_string_lossy());
+        let mut child = cmd.spawn().ok()?;
+        if let Ok(iter) = child.iter() {
+            for _ in iter {}
+        }
+        child.wait().ok().filter(|s| s.success())
+    })()
+    .is_some();
+    let mut stored = false;
+    if ok {
+        let mut g = PREVIEW_BASE.lock().unwrap();
+        if let Some(b) = g.as_mut() {
+            if b.key == key && b.serial == serial {
+                b.file = Some(out.clone());
+                stored = true;
+            }
+        }
+    }
+    if !stored {
+        let _ = std::fs::remove_file(&out);
+    }
+}
+
 fn render_preview(
     photo: &Path,
     adj: &Adjustments,
@@ -2598,14 +2645,46 @@ fn render_preview(
     let pw: u32 = 960;
     let ph: u32 = ((pw as f64 * res.h as f64 / res.w as f64 / 2.0).round() as u32) * 2;
 
+    // 查底圖快取：命中就以縮小後的底圖當輸入；未命中（第一次看這張照片）
+    // 就走完整流程，同時在背景建置底圖供後續重渲染使用
+    let key = (
+        photo.to_path_buf(),
+        std::fs::metadata(photo).and_then(|m| m.modified()).ok(),
+        ph,
+    );
+    let base_file = {
+        let mut g = PREVIEW_BASE.lock().unwrap();
+        match g.as_ref() {
+            Some(b) if b.key == key => b.file.clone(),
+            _ => {
+                let serial = g.as_ref().map(|b| b.serial + 1).unwrap_or(0);
+                if let Some(old) = g.as_ref().and_then(|b| b.file.clone()) {
+                    let _ = std::fs::remove_file(old);
+                }
+                *g = Some(PreviewBase {
+                    key: key.clone(),
+                    file: None,
+                    serial,
+                });
+                thread::spawn(move || build_preview_base(key, pw, ph, serial));
+                None
+            }
+        }
+    };
+
     // 與輸出相同順序：先縮放、再調色、後補邊，最後上字幕
     let adjust_mid = adj
         .filter_chain()
         .map(|c| format!("{c},"))
         .unwrap_or_default();
+    let scale_head = if base_file.is_some() {
+        // 底圖已是縮放後的尺寸，跳過縮放
+        String::new()
+    } else {
+        format!("scale={pw}:{ph}:force_original_aspect_ratio=decrease,")
+    };
     let mut vf = format!(
-        "scale={pw}:{ph}:force_original_aspect_ratio=decrease,{adjust_mid}\
-         pad={pw}:{ph}:(ow-iw)/2:(oh-ih)/2:color=black"
+        "{scale_head}{adjust_mid}pad={pw}:{ph}:(ow-iw)/2:(oh-ih)/2:color=black"
     );
     if let Some(font) = font {
         let fontsize = style.size as f64 * ph as f64 / 1080.0;
@@ -2619,8 +2698,9 @@ fn render_preview(
     }
 
     // 直接以 rawvideo 從 stdout 取回 RGB 像素，省去 PNG 編碼、寫檔與再解碼
+    let input = base_file.unwrap_or_else(|| photo.to_path_buf());
     let mut cmd = FfmpegCommand::new();
-    cmd.input(photo.to_string_lossy())
+    cmd.input(input.to_string_lossy())
         .args(["-vf", &vf])
         .args(["-frames:v", "1"])
         .rawvideo();
