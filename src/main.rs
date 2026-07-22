@@ -2457,27 +2457,33 @@ fn thumb_item(
 
 // ---------- 檔案與排序 ----------
 
-fn is_image(p: &Path) -> bool {
+/// 副檔名是否在清單內（不分大小寫、不配置字串）
+fn ext_in(p: &Path, exts: &[&str]) -> bool {
     p.extension()
         .and_then(|e| e.to_str())
-        .map(|e| IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+        .map(|e| exts.iter().any(|x| e.eq_ignore_ascii_case(x)))
         .unwrap_or(false)
 }
 
+fn is_image(p: &Path) -> bool {
+    ext_in(p, IMAGE_EXTS)
+}
+
 fn is_audio(p: &Path) -> bool {
-    p.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| AUDIO_EXTS.contains(&e.to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
+    ext_in(p, AUDIO_EXTS)
 }
 
 fn collect_images_in_dir(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for e in entries.flatten() {
-            let p = e.path();
-            if p.is_file() && is_image(&p) {
-                out.push(p);
+            // file_type 來自目錄列舉本身的資料，不像 path.is_file() 要對
+            // 每個檔案再查一次檔案屬性，大資料夾可省數千次系統呼叫
+            if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                let p = e.path();
+                if is_image(&p) {
+                    out.push(p);
+                }
             }
         }
     }
