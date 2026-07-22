@@ -689,16 +689,17 @@ impl App {
                 }
             }
         }
-        // 防抖：滑桿停止拖動 300ms 後才重新渲染；切換照片（urgent）則立即渲染
+        // 防抖：滑桿停止拖動 150ms 後才重新渲染；切換照片（urgent）則立即渲染。
+        // 有底圖快取後重渲染成本已大幅下降，防抖等待可以縮短，滑桿手感更即時
         if self.preview_dirty && self.preview_rx.is_none() {
             if self.preview_urgent {
                 self.spawn_preview(ctx);
             } else if let Some(t) = self.preview_last_change {
                 let elapsed = t.elapsed();
-                if elapsed >= Duration::from_millis(300) {
+                if elapsed >= Duration::from_millis(150) {
                     self.spawn_preview(ctx);
                 } else {
-                    ctx.request_repaint_after(Duration::from_millis(320) - elapsed);
+                    ctx.request_repaint_after(Duration::from_millis(170) - elapsed);
                 }
             }
         }
@@ -2616,6 +2617,17 @@ fn ensure_ffmpeg(on_download: impl Fn()) -> Result<(), String> {
 }
 
 /// 用 ffmpeg 渲染單張照片的預覽（含調色與字幕，縮小並依輸出比例補邊），回傳 RGBA 像素
+/// 內容相同就不重寫，避免每次預覽渲染都做磁碟寫入
+/// （拖動調色滑桿時字幕內容通常沒變）
+fn write_if_changed(path: &Path, content: &str) -> std::io::Result<()> {
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        if existing == content {
+            return Ok(());
+        }
+    }
+    std::fs::write(path, content)
+}
+
 /// 預覽底圖快取：拖動調色滑桿時會對同一張照片反覆重渲染，
 /// 把「縮放後的底圖」存成暫存 PNG 後改以小圖當輸入，
 /// 免去每次重新解碼原始大圖（大照片可省下大半渲染時間）
@@ -2722,7 +2734,7 @@ fn render_preview(
         let fontsize = style.size as f64 * ph as f64 / 1080.0;
         for (k, text) in captions.iter().enumerate() {
             let cap_path = std::env::temp_dir().join(format!("photo2video_cap_preview_{k}.txt"));
-            std::fs::write(&cap_path, text.trim_end())
+            write_if_changed(&cap_path, text.trim_end())
                 .map_err(|e| format!("無法寫入字幕暫存檔：{e}"))?;
             vf.push(',');
             vf.push_str(&drawtext_filter(font, &cap_path, style, fontsize, ph, None));
