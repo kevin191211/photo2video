@@ -550,8 +550,6 @@ struct App {
     fonts: Vec<(String, PathBuf)>,
     preview_selected: Option<usize>,
     preview_dirty: bool,
-    preview_urgent: bool,
-    preview_last_change: Option<Instant>,
     preview_rx: Option<Receiver<PreviewMsg>>,
     preview_tex: Option<egui::TextureHandle>,
     preview_error: Option<String>,
@@ -627,8 +625,6 @@ impl App {
             fonts: detect_fonts(),
             preview_selected: None,
             preview_dirty: false,
-            preview_urgent: false,
-            preview_last_change: None,
             preview_rx: None,
             preview_tex: None,
             preview_error: None,
@@ -670,8 +666,6 @@ impl App {
 
     fn mark_preview_dirty(&mut self) {
         self.preview_dirty = true;
-        self.preview_urgent = false;
-        self.preview_last_change = Some(Instant::now());
         self.preview_error = None;
     }
 
@@ -694,7 +688,6 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         self.preview_rx = Some(rx);
         self.preview_dirty = false;
-        self.preview_urgent = false;
         let ctx = ctx.clone();
         thread::spawn(move || {
             let _ = tx.send((idx, render_preview(&photo, &adj, res, &captions, &style, font.as_deref())));
@@ -722,19 +715,11 @@ impl App {
                 }
             }
         }
-        // 防抖：滑桿停止拖動 150ms 後才重新渲染；切換照片（urgent）則立即渲染。
-        // 有底圖快取後重渲染成本已大幅下降，防抖等待可以縮短，滑桿手感更即時
+        // 連續回饋：參數有變且沒有渲染在跑就立刻渲染。
+        // 同時間最多一個渲染、完成後才會再啟動下一個（以最新參數），
+        // 更新頻率被渲染時間自然限流；拖動滑桿的過程即時看到調色變化
         if self.preview_dirty && self.preview_rx.is_none() {
-            if self.preview_urgent {
-                self.spawn_preview(ctx);
-            } else if let Some(t) = self.preview_last_change {
-                let elapsed = t.elapsed();
-                if elapsed >= Duration::from_millis(150) {
-                    self.spawn_preview(ctx);
-                } else {
-                    ctx.request_repaint_after(Duration::from_millis(170) - elapsed);
-                }
-            }
+            self.spawn_preview(ctx);
         }
     }
 
@@ -772,8 +757,6 @@ impl App {
             self.preview_tex = None;
             if idx.is_some() {
                 self.mark_preview_dirty();
-                // 切換照片不是連續動作，跳過滑桿用的防抖直接渲染
-                self.preview_urgent = true;
             }
         }
     }
