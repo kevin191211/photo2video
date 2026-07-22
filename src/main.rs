@@ -2526,11 +2526,19 @@ fn filter_threads() -> String {
         .to_string()
 }
 
+/// ffmpeg 是否已確認可用；ffmpeg_is_installed 每次都會啟動外部程序檢查，
+/// 確認一次後快取，預覽渲染就不用每張都多付一次程序啟動的成本
+static FFMPEG_READY: AtomicBool = AtomicBool::new(false);
+
 fn ensure_ffmpeg(on_download: impl Fn()) -> Result<(), String> {
+    if FFMPEG_READY.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     if !ffmpeg_sidecar::command::ffmpeg_is_installed() {
         on_download();
         ffmpeg_sidecar::download::auto_download().map_err(|e| format!("FFmpeg 下載失敗：{e}"))?;
     }
+    FFMPEG_READY.store(true, Ordering::Relaxed);
     Ok(())
 }
 
