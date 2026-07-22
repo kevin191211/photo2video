@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
@@ -2687,7 +2687,12 @@ struct PreviewBase {
     serial: u64,
 }
 
-static PREVIEW_BASE: Mutex<Option<PreviewBase>> = Mutex::new(None);
+/// LRU 快取（尾端為最近使用）：保留多張，來回切換比較照片時不用重複解碼
+static PREVIEW_BASE: Mutex<Vec<PreviewBase>> = Mutex::new(Vec::new());
+/// 底圖快取張數上限（每張約 1.5MB 暫存檔）
+const PREVIEW_BASE_CAP: usize = 4;
+/// 底圖檔名全域流水號
+static PREVIEW_BASE_SERIAL: AtomicU64 = AtomicU64::new(0);
 
 /// 這次預覽渲染與底圖快取的關係
 enum BaseRole {
@@ -2723,25 +2728,31 @@ fn render_preview(
     );
     let base = {
         let mut g = PREVIEW_BASE.lock().unwrap();
-        match g.as_ref() {
-            Some(b) if b.key == key => match &b.file {
+        if let Some(pos) = g.iter().position(|b| b.key == key) {
+            // 命中：移到尾端（最近使用）
+            let b = g.remove(pos);
+            let role = match &b.file {
                 Some(f) => BaseRole::Cached(f.clone()),
                 None => BaseRole::Skip,
-            },
-            _ => {
-                let serial = g.as_ref().map(|b| b.serial + 1).unwrap_or(0);
-                if let Some(old) = g.as_ref().and_then(|b| b.file.clone()) {
-                    let _ = std::fs::remove_file(old);
+            };
+            g.push(b);
+            role
+        } else {
+            // 未命中：淘汰最舊的一筆後建立新槽
+            if g.len() >= PREVIEW_BASE_CAP {
+                let old = g.remove(0);
+                if let Some(f) = old.file {
+                    let _ = std::fs::remove_file(f);
                 }
-                *g = Some(PreviewBase {
-                    key: key.clone(),
-                    file: None,
-                    serial,
-                });
-                let out =
-                    std::env::temp_dir().join(format!("photo2video_prev_base_{serial}.bmp"));
-                BaseRole::Build { out, serial }
             }
+            let serial = PREVIEW_BASE_SERIAL.fetch_add(1, Ordering::Relaxed);
+            g.push(PreviewBase {
+                key: key.clone(),
+                file: None,
+                serial,
+            });
+            let out = std::env::temp_dir().join(format!("photo2video_prev_base_{serial}.bmp"));
+            BaseRole::Build { out, serial }
         }
     };
 
@@ -2814,16 +2825,17 @@ fn render_preview(
     let status = child.wait().map_err(|e| format!("FFmpeg 執行失敗：{e}"))?;
     let ok = status.success() && frame.is_some();
 
-    // 底圖登記：渲染成功且快取槽仍屬於這張照片才掛上，否則清掉孤兒檔
+    // 底圖登記：渲染成功且快取槽仍在（未被 LRU 淘汰）才掛上，否則清掉孤兒檔
     if let BaseRole::Build { out, serial } = &base {
         let mut stored = false;
         if ok {
             let mut g = PREVIEW_BASE.lock().unwrap();
-            if let Some(b) = g.as_mut() {
-                if b.key == key && b.serial == *serial {
-                    b.file = Some(out.clone());
-                    stored = true;
-                }
+            if let Some(b) = g
+                .iter_mut()
+                .find(|b| b.serial == *serial && b.key == key)
+            {
+                b.file = Some(out.clone());
+                stored = true;
             }
         }
         if !stored {
