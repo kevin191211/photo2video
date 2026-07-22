@@ -358,6 +358,8 @@ struct App {
     thumbs: HashMap<PathBuf, Thumb>,
     thumb_tx: Sender<ThumbMsg>,
     thumb_rx: Receiver<ThumbMsg>,
+    wheel_accum: f32,
+    scroll_to_selected: bool,
 }
 
 impl App {
@@ -385,6 +387,8 @@ impl App {
             thumbs: HashMap::new(),
             thumb_tx,
             thumb_rx,
+            wheel_accum: 0.0,
+            scroll_to_selected: false,
         };
         if !initial_files.is_empty() {
             app.add_photos(initial_files, &cc.egui_ctx);
@@ -1255,6 +1259,31 @@ impl App {
 
         ui.add_space(10.0);
 
+        // 滾輪在預覽區或縮圖列上：切換上一張／下一張
+        let strip_rect = ui.available_rect_before_wrap();
+        if ui.rect_contains_pointer(rect) || ui.rect_contains_pointer(strip_rect) {
+            self.wheel_accum += ctx.input(|i| i.raw_scroll_delta.y + i.raw_scroll_delta.x);
+            const STEP: f32 = 40.0;
+            while self.wheel_accum >= STEP {
+                self.wheel_accum -= STEP;
+                let cur = self.preview_selected.unwrap_or(0);
+                if cur > 0 {
+                    self.select_photo(Some(cur - 1));
+                    self.scroll_to_selected = true;
+                }
+            }
+            while self.wheel_accum <= -STEP {
+                self.wheel_accum += STEP;
+                let cur = self.preview_selected.unwrap_or(0);
+                if cur + 1 < self.photos.len() {
+                    self.select_photo(Some(cur + 1));
+                    self.scroll_to_selected = true;
+                }
+            }
+        } else {
+            self.wheel_accum = 0.0;
+        }
+
         // 縮圖膠卷
         let mut click_idx: Option<usize> = None;
         let mut remove_idx: Option<usize> = None;
@@ -1272,6 +1301,9 @@ impl App {
                         e.start <= i + 1 && i + 1 <= e.end && !e.text.trim().is_empty()
                     });
                     let resp = thumb_item(ui, tex.as_ref(), i, selected, has_caption);
+                    if selected && self.scroll_to_selected {
+                        resp.scroll_to_me(Some(egui::Align::Center));
+                    }
                     if resp.clicked() {
                         click_idx = Some(i);
                     }
@@ -1288,6 +1320,8 @@ impl App {
                 }
             });
         });
+
+        self.scroll_to_selected = false;
 
         if let Some(i) = click_idx {
             self.select_photo(Some(i));
@@ -1370,9 +1404,11 @@ impl eframe::App for App {
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) && cur + 1 < self.photos.len()
             {
                 self.select_photo(Some(cur + 1));
+                self.scroll_to_selected = true;
             }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) && cur > 0 {
                 self.select_photo(Some(cur - 1));
+                self.scroll_to_selected = true;
             }
         }
 
