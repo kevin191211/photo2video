@@ -1790,9 +1790,35 @@ impl App {
         let mut click_idx: Option<usize> = None;
         let mut remove_idx: Option<usize> = None;
         let mut clear_all = false;
-        egui::ScrollArea::horizontal().show(ui, |ui| {
+        // 縮圖尺寸固定，可虛擬化：只渲染捲動範圍內的縮圖、前後以空白撐出總寬，
+        // 照片數量再多每一幀的繪製成本也不變
+        let thumb_size = egui::vec2(132.0, 84.0);
+        let n = self.photos.len();
+        egui::ScrollArea::horizontal().show_viewport(ui, |ui, viewport| {
+            ui.set_min_height(thumb_size.y);
             ui.horizontal(|ui| {
-                for i in 0..self.photos.len() {
+                let spacing = ui.spacing().item_spacing.x;
+                let stride = thumb_size.x + spacing;
+                let origin = ui.next_widget_position();
+                // 對虛擬位置捲動，不需要選取的縮圖真的被渲染出來
+                if self.scroll_to_selected {
+                    if let Some(sel) = self.preview_selected {
+                        let r = egui::Rect::from_min_size(
+                            egui::pos2(origin.x + sel as f32 * stride, origin.y),
+                            thumb_size,
+                        );
+                        ui.scroll_to_rect(r, Some(egui::Align::Center));
+                    }
+                }
+                let first = (((viewport.min.x / stride).floor() as isize) - 1).max(0) as usize;
+                let last = ((((viewport.max.x / stride).ceil() as isize) + 1).max(0) as usize).min(n);
+                let first = first.min(last);
+                if first > 0 {
+                    ui.add_space(first as f32 * stride);
+                }
+                // 讓每張縮圖的自動 ID 與索引繫結，捲動時 hover／右鍵選單狀態才不會錯位
+                ui.skip_ahead_auto_ids(first);
+                for i in first..last {
                     let photo = &self.photos[i];
                     let tex = match self.thumbs.get(photo) {
                         Some(Thumb::Ready(t)) => Some(t.clone()),
@@ -1803,9 +1829,6 @@ impl App {
                         e.start <= i + 1 && i + 1 <= e.end && !e.text.trim().is_empty()
                     });
                     let resp = thumb_item(ui, tex.as_ref(), i, selected, has_caption);
-                    if selected && self.scroll_to_selected {
-                        resp.scroll_to_me(Some(egui::Align::Center));
-                    }
                     if resp.clicked() {
                         click_idx = Some(i);
                     }
@@ -1819,6 +1842,9 @@ impl App {
                             ui.close_menu();
                         }
                     });
+                }
+                if last < n {
+                    ui.add_space((n - last) as f32 * stride - spacing);
                 }
             });
         });
