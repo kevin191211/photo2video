@@ -2539,13 +2539,18 @@ fn test_encoder(name: &str) -> bool {
 fn detect_h264_encoder() -> H264Encoder {
     static DETECTED: OnceLock<H264Encoder> = OnceLock::new();
     *DETECTED.get_or_init(|| {
+        // 三種硬體編碼器平行測試；逐一測試時沒有對應硬體的機器
+        // 每個候選都要等它失敗才輪到下一個，最壞要白等三段測試時間
         let candidates = [
             ("h264_nvenc", H264Encoder::Nvenc),
             ("h264_qsv", H264Encoder::Qsv),
             ("h264_amf", H264Encoder::Amf),
         ];
-        for (name, enc) in candidates {
-            if test_encoder(name) {
+        let handles = candidates
+            .map(|(name, enc)| thread::spawn(move || test_encoder(name).then_some(enc)));
+        // 依候選順序取結果，優先序維持 NVENC > QSV > AMF
+        for h in handles {
+            if let Ok(Some(enc)) = h.join() {
                 return enc;
             }
         }
