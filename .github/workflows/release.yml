@@ -27,7 +27,25 @@ jobs:
           Copy-Item target/release/photo2video.exe package/
           Copy-Item 使用說明.md package/
           # 附上 FFmpeg，讓使用者解壓即用、不需第一次啟動時再下載
-          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
+          # 多來源＋重試：避免單一下載站暫時故障（例如 503）導致發版失敗
+          $urls = @(
+            "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
+            "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip"
+          )
+          $ok = $false
+          foreach ($u in $urls) {
+            for ($i = 1; $i -le 2; $i++) {
+              try {
+                Invoke-WebRequest -Uri $u -OutFile ffmpeg.zip -TimeoutSec 300
+                $ok = $true; break
+              } catch {
+                Write-Host "下載失敗（$u，第 $i 次）：$($_.Exception.Message)"
+                Start-Sleep -Seconds 20
+              }
+            }
+            if ($ok) { break }
+          }
+          if (-not $ok) { throw "所有 FFmpeg 下載來源都失敗" }
           Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp
           $exe = Get-ChildItem ffmpeg_tmp -Recurse -Filter ffmpeg.exe | Select-Object -First 1
           Copy-Item $exe.FullName package/
