@@ -1,9 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -414,6 +414,7 @@ enum UpdateStatus {
     Failed(String),
 }
 
+/// 預覽像素為 RGB24（ffmpeg rawvideo 直接輸出，不經 PNG 編解碼）
 type PreviewResult = Result<(u32, u32, Vec<u8>), String>;
 /// 預覽結果附帶「這是第幾張照片的渲染」，避免快速切換時舊結果蓋掉新照片
 type PreviewMsg = (usize, PreviewResult);
@@ -438,6 +439,7 @@ struct App {
     fonts: Vec<(String, PathBuf)>,
     preview_selected: Option<usize>,
     preview_dirty: bool,
+    preview_urgent: bool,
     preview_last_change: Option<Instant>,
     preview_rx: Option<Receiver<PreviewMsg>>,
     preview_tex: Option<egui::TextureHandle>,
@@ -479,6 +481,7 @@ impl App {
             fonts: detect_fonts(),
             preview_selected: None,
             preview_dirty: false,
+            preview_urgent: false,
             preview_last_change: None,
             preview_rx: None,
             preview_tex: None,
@@ -511,6 +514,7 @@ impl App {
 
     fn mark_preview_dirty(&mut self) {
         self.preview_dirty = true;
+        self.preview_urgent = false;
         self.preview_last_change = Some(Instant::now());
         self.preview_error = None;
     }
@@ -534,6 +538,7 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         self.preview_rx = Some(rx);
         self.preview_dirty = false;
+        self.preview_urgent = false;
         let ctx = ctx.clone();
         thread::spawn(move || {
             let _ = tx.send((idx, render_preview(&photo, &adj, res, &captions, &style, font.as_deref())));
@@ -548,10 +553,10 @@ impl App {
                 // 渲染期間使用者已切到別張照片 → 丟棄過期結果（dirty 仍在，會重新渲染）
                 if self.preview_selected == Some(for_idx) {
                     match res {
-                        Ok((w, h, rgba)) => {
-                            let img = egui::ColorImage::from_rgba_unmultiplied(
+                        Ok((w, h, rgb)) => {
+                            let img = egui::ColorImage::from_rgb(
                                 [w as usize, h as usize],
-                                &rgba,
+                                &rgb,
                             );
                             self.preview_tex =
                                 Some(ctx.load_texture("preview", img, Default::default()));
@@ -561,9 +566,11 @@ impl App {
                 }
             }
         }
-        // 防抖：滑桿停止拖動 300ms 後才重新渲染
+        // 防抖：滑桿停止拖動 300ms 後才重新渲染；切換照片（urgent）則立即渲染
         if self.preview_dirty && self.preview_rx.is_none() {
-            if let Some(t) = self.preview_last_change {
+            if self.preview_urgent {
+                self.spawn_preview(ctx);
+            } else if let Some(t) = self.preview_last_change {
                 let elapsed = t.elapsed();
                 if elapsed >= Duration::from_millis(300) {
                     self.spawn_preview(ctx);
@@ -601,6 +608,8 @@ impl App {
             self.preview_tex = None;
             if idx.is_some() {
                 self.mark_preview_dirty();
+                // 切換照片不是連續動作，跳過滑桿用的防抖直接渲染
+                self.preview_urgent = true;
             }
         }
     }
@@ -635,18 +644,28 @@ impl App {
             for p in &batch {
                 self.thumbs.insert(p.clone(), Thumb::Loading);
             }
-            let tx = self.thumb_tx.clone();
-            let ctx = ctx.clone();
-            thread::spawn(move || {
-                for p in batch {
+            // 多執行緒共用佇列解碼：照片依序被領走，前面的縮圖先出現
+            let workers = thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .min(8)
+                .min(batch.len());
+            let queue = Arc::new(Mutex::new(VecDeque::from(batch)));
+            for _ in 0..workers {
+                let queue = Arc::clone(&queue);
+                let tx = self.thumb_tx.clone();
+                let ctx = ctx.clone();
+                thread::spawn(move || loop {
+                    let job = queue.lock().unwrap().pop_front();
+                    let Some(p) = job else { break };
                     let res = image::open(&p).ok().map(|img| {
                         let t = img.thumbnail(320, 180).to_rgba8();
                         (t.width(), t.height(), t.into_raw())
                     });
                     let _ = tx.send((p, res));
                     ctx.request_repaint();
-                }
-            });
+                });
+            }
         }
     }
 
@@ -1452,7 +1471,15 @@ impl App {
             egui::StrokeKind::Inside,
         );
 
-        if let Some(tex) = &self.preview_tex {
+        // 渲染完成前先用縮圖放大當佔位，切換照片時畫面不留白
+        let placeholder = match (self.preview_tex.is_none(), self.preview_selected) {
+            (true, Some(i)) => self.photos.get(i).and_then(|p| match self.thumbs.get(p) {
+                Some(Thumb::Ready(t)) => Some(t.clone()),
+                _ => None,
+            }),
+            _ => None,
+        };
+        if let Some(tex) = self.preview_tex.as_ref().or(placeholder.as_ref()) {
             let img_rect = fit_rect(tex.size_vec2(), rect.shrink(14.0));
             p.image(
                 tex.id(),
@@ -1500,7 +1527,7 @@ impl App {
         // 右上角：預覽更新中的轉圈。
         // 注意：不能用 ui.put()——它會把版面游標拉回這個位置，
         // 造成後面的縮圖列被畫到視窗上方（跑版）
-        if self.preview_rx.is_some() && self.preview_tex.is_some() {
+        if self.preview_rx.is_some() && (self.preview_tex.is_some() || placeholder.is_some()) {
             let t = ui.input(|i| i.time) as f32;
             let center = rect.right_top() + egui::vec2(-22.0, 22.0);
             let radius = 8.0;
@@ -2300,42 +2327,40 @@ fn render_preview(
         }
     }
 
-    let out = std::env::temp_dir().join("photo2video_preview.png");
+    // 直接以 rawvideo 從 stdout 取回 RGB 像素，省去 PNG 編碼、寫檔與再解碼
     let mut cmd = FfmpegCommand::new();
-    cmd.arg("-y")
-        .input(photo.to_string_lossy())
+    cmd.input(photo.to_string_lossy())
         .args(["-vf", &vf])
         .args(["-frames:v", "1"])
-        .args(["-update", "1"])
-        .output(out.to_string_lossy());
+        .rawvideo();
 
     let mut error_log: Vec<String> = Vec::new();
+    let mut frame: Option<(u32, u32, Vec<u8>)> = None;
     let mut child = cmd.spawn().map_err(|e| format!("FFmpeg 啟動失敗：{e}"))?;
     let iter = child
         .iter()
         .map_err(|e| format!("FFmpeg 輸出讀取失敗：{e}"))?;
     for event in iter {
-        if let FfmpegEvent::Log(level, msg) = event {
-            use ffmpeg_sidecar::event::LogLevel;
-            if matches!(level, LogLevel::Error | LogLevel::Fatal) {
+        use ffmpeg_sidecar::event::LogLevel;
+        match event {
+            FfmpegEvent::OutputFrame(f) => frame = Some((f.width, f.height, f.data)),
+            FfmpegEvent::Log(level, msg)
+                if matches!(level, LogLevel::Error | LogLevel::Fatal) =>
+            {
                 error_log.push(msg);
             }
+            _ => {}
         }
     }
     let status = child.wait().map_err(|e| format!("FFmpeg 執行失敗：{e}"))?;
-    if !status.success() {
+    if !status.success() || frame.is_none() {
         return Err(if error_log.is_empty() {
             "預覽渲染失敗".into()
         } else {
             error_log.join("\n")
         });
     }
-
-    let img = image::open(&out)
-        .map_err(|e| format!("預覽圖讀取失敗：{e}"))?
-        .to_rgba8();
-    let (w, h) = img.dimensions();
-    Ok((w, h, img.into_raw()))
+    Ok(frame.unwrap())
 }
 
 /// 一次轉換的字幕資料：全域樣式 + 各段落（0-based 含端點的照片區間與文字）
