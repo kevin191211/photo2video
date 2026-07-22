@@ -528,6 +528,7 @@ enum UpdateMsg {
 type PreviewResult = Result<(u32, u32, Vec<u8>), String>;
 /// 預覽結果附帶「這是第幾張照片的渲染」，避免快速切換時舊結果蓋掉新照片
 type PreviewMsg = (usize, PreviewResult);
+/// 縮圖解碼結果：(寬, 高, RGB 像素)；None 表示解碼失敗
 type ThumbMsg = (PathBuf, Option<(u32, u32, Vec<u8>)>);
 
 enum Thumb {
@@ -703,15 +704,18 @@ impl App {
         }
     }
 
-    /// 接收背景執行緒解碼完成的縮圖並上傳為貼圖
+    /// 接收背景執行緒解碼完成的縮圖並上傳為貼圖。
+    /// 每幀最多上傳 8 張：批次載入時解碼常同時到貨，
+    /// 一次全部上傳會造成單幀突波卡頓，分幀攤平
     fn poll_thumbs(&mut self, ctx: &egui::Context) {
-        while let Ok((path, res)) = self.thumb_rx.try_recv() {
+        const MAX_UPLOADS_PER_FRAME: usize = 8;
+        let mut uploaded = 0;
+        while uploaded < MAX_UPLOADS_PER_FRAME {
+            let Ok((path, res)) = self.thumb_rx.try_recv() else { break };
             let state = match res {
-                Some((w, h, rgba)) => {
-                    let img = egui::ColorImage::from_rgba_unmultiplied(
-                        [w as usize, h as usize],
-                        &rgba,
-                    );
+                Some((w, h, rgb)) => {
+                    uploaded += 1;
+                    let img = egui::ColorImage::from_rgb([w as usize, h as usize], &rgb);
                     Thumb::Ready(ctx.load_texture(
                         format!("thumb:{}", path.display()),
                         img,
@@ -721,6 +725,10 @@ impl App {
                 None => Thumb::Failed,
             };
             self.thumbs.insert(path, state);
+        }
+        if uploaded == MAX_UPLOADS_PER_FRAME {
+            // 佇列可能還有縮圖，下一幀繼續上傳
+            ctx.request_repaint();
         }
     }
 
@@ -783,7 +791,8 @@ impl App {
                     let job = queue.lock().unwrap().pop_front();
                     let Some(p) = job else { break };
                     let res = image::open(&p).ok().map(|img| {
-                        let t = img.thumbnail(320, 180).to_rgba8();
+                        // RGB 即可（縮圖不需要透明通道），省 1/4 記憶體與上傳頻寬
+                        let t = img.thumbnail(320, 180).to_rgb8();
                         (t.width(), t.height(), t.into_raw())
                     });
                     let _ = tx.send((p, res));
