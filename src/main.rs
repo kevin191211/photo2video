@@ -1597,7 +1597,10 @@ fn adj_slider(ui: &mut egui::Ui, value: &mut i32, label: &str) {
         );
         ui.spacing_mut().slider_width = (ui.available_width() - 44.0).max(60.0);
         let resp = ui.add(egui::Slider::new(value, -100..=100).show_value(false));
-        if resp.double_clicked() {
+        // 滑桿是拖曳型元件，double_clicked() 不會觸發，須自行偵測雙擊
+        let double_clicked = resp.hovered()
+            && ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
+        if double_clicked {
             *value = 0;
         }
         let (txt, color) = if *value == 0 {
