@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -739,8 +739,10 @@ impl App {
 
     fn add_photos(&mut self, mut files: Vec<PathBuf>, ctx: &egui::Context) {
         files.retain(|p| is_image(p));
+        // 用 HashSet 去重；逐一 contains 是 O(n²)，加入數千張照片要數百萬次路徑比對
+        let mut seen: HashSet<PathBuf> = self.photos.iter().cloned().collect();
         for f in files {
-            if !self.photos.contains(&f) {
+            if seen.insert(f.clone()) {
                 self.photos.push(f);
             }
         }
