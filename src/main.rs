@@ -2093,6 +2093,19 @@ fn run_cli(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// 載入內嵌的視窗圖示（標題列與工作列用）
+fn load_app_icon() -> egui::IconData {
+    let img = image::load_from_memory(include_bytes!("../assets/icon_256.png"))
+        .expect("內建圖示載入失敗")
+        .to_rgba8();
+    let (width, height) = img.dimensions();
+    egui::IconData {
+        rgba: img.into_raw(),
+        width,
+        height,
+    }
+}
+
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 && args[1] == "--cli" {
@@ -2117,6 +2130,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Photo2Video — 照片轉影片")
+            .with_icon(load_app_icon())
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([1024.0, 640.0]),
         ..Default::default()
