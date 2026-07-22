@@ -3,6 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -615,6 +616,15 @@ impl App {
         };
         // 啟動時在背景檢查是否有新版本（失敗不影響使用）
         app.spawn_update_check(&cc.egui_ctx);
+        // 背景預熱：先確認 ffmpeg 可用並偵測硬體編碼器（最多要跑 3 個測試編碼、
+        // 費時 1~3 秒），第一次按「開始轉換」或看預覽時就不用等。
+        // 尚未安裝 ffmpeg 時不在這裡下載，留給轉換流程顯示下載進度
+        thread::spawn(|| {
+            if ffmpeg_sidecar::command::ffmpeg_is_installed() {
+                FFMPEG_READY.store(true, Ordering::Relaxed);
+                detect_h264_encoder();
+            }
+        });
         if !initial_files.is_empty() {
             app.add_photos(initial_files, &cc.egui_ctx);
         }
