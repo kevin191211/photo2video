@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -341,6 +342,78 @@ fn save_fps(fps: u32) {
     let _ = std::fs::write(&path, serde_json::json!({ "fps": fps }).to_string());
 }
 
+/// 下載指定版本的 photo2video.exe 並原地替換目前的執行檔
+fn download_update(tag: &str, progress: &dyn Fn(f32)) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("無法取得程式路徑：{e}"))?;
+    let url = format!("https://github.com/{GITHUB_REPO}/releases/download/{tag}/photo2video.exe");
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(30))
+        .build();
+    let resp = agent
+        .get(&url)
+        .set("User-Agent", concat!("photo2video/", env!("CARGO_PKG_VERSION")))
+        .call()
+        .map_err(|e| format!("下載失敗：{e}"))?;
+    let total: f64 = resp
+        .header("Content-Length")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+
+    // 下載到同資料夾的暫存檔（同一磁碟才能直接改名替換）
+    let tmp = exe.with_extension("exe.new");
+    let mut reader = resp.into_reader();
+    let mut file = std::fs::File::create(&tmp).map_err(|e| format!("無法建立暫存檔：{e}"))?;
+    let mut buf = [0u8; 64 * 1024];
+    let mut done: f64 = 0.0;
+    let mut last_pct: i32 = -1;
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| format!("下載中斷：{e}"))?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n])
+            .map_err(|e| format!("寫入暫存檔失敗：{e}"))?;
+        done += n as f64;
+        if total > 0.0 {
+            let pct = (done / total * 100.0) as i32;
+            if pct != last_pct {
+                last_pct = pct;
+                progress((done / total) as f32);
+            }
+        }
+    }
+    drop(file);
+
+    // 簡單驗證是 Windows 執行檔（MZ 開頭），避免把錯誤頁面存成 exe
+    let mut magic = [0u8; 2];
+    std::fs::File::open(&tmp)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .map_err(|e| format!("暫存檔讀取失敗：{e}"))?;
+    if &magic != b"MZ" {
+        let _ = std::fs::remove_file(&tmp);
+        return Err("下載的檔案不是有效的執行檔".into());
+    }
+
+    // 執行中的 exe 不能覆寫，但可以改名：舊檔改 .old、新檔補上原位
+    let old = exe.with_extension("exe.old");
+    let _ = std::fs::remove_file(&old);
+    std::fs::rename(&exe, &old).map_err(|e| format!("無法替換舊版程式：{e}"))?;
+    if let Err(e) = std::fs::rename(&tmp, &exe) {
+        let _ = std::fs::rename(&old, &exe); // 失敗時還原
+        return Err(format!("無法安裝新版程式：{e}"));
+    }
+    Ok(())
+}
+
+/// 重新啟動程式（新版 exe 已放在原本的路徑上）
+fn restart_app() {
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe).spawn();
+    }
+    std::process::exit(0);
+}
+
 /// 掃描 Windows 字型資料夾中常見且支援中文的字型
 fn detect_fonts() -> Vec<(String, PathBuf)> {
     let candidates: [(&str, &str); 12] = [
@@ -493,7 +566,7 @@ struct App {
     sec_adjust_open: bool,
     sec_sub_open: bool,
     sec_fx_open: bool,
-    update_rx: Option<Receiver<Result<Option<String>, String>>>,
+    update_rx: Option<Receiver<UpdateMsg>>,
     update_status: UpdateStatus,
     update_banner_dismissed: bool,
     about_open: bool,
@@ -818,7 +891,10 @@ impl App {
 
     /// 在背景執行緒檢查 GitHub 是否有新版本
     fn spawn_update_check(&mut self, ctx: &egui::Context) {
-        if matches!(self.update_status, UpdateStatus::Checking) {
+        if matches!(
+            self.update_status,
+            UpdateStatus::Checking | UpdateStatus::Downloading(_)
+        ) {
             return;
         }
         self.update_status = UpdateStatus::Checking;
@@ -826,20 +902,68 @@ impl App {
         self.update_rx = Some(rx);
         let ctx = ctx.clone();
         thread::spawn(move || {
-            let _ = tx.send(check_latest_release());
+            let _ = tx.send(UpdateMsg::CheckResult(check_latest_release()));
+            ctx.request_repaint();
+        });
+    }
+
+    /// 在背景下載新版並替換執行檔，完成後自動重新啟動
+    fn spawn_self_update(&mut self, ctx: &egui::Context, tag: String) {
+        if matches!(self.update_status, UpdateStatus::Downloading(_)) {
+            return;
+        }
+        self.update_status = UpdateStatus::Downloading(0.0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.update_rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let progress = |p: f32| {
+                let _ = tx.send(UpdateMsg::Progress(p));
+                ctx.request_repaint();
+            };
+            let msg = match download_update(&tag, &progress) {
+                Ok(()) => UpdateMsg::Ready,
+                Err(e) => UpdateMsg::Failed(e),
+            };
+            let _ = tx.send(msg);
             ctx.request_repaint();
         });
     }
 
     fn poll_update(&mut self) {
-        if let Some(rx) = &self.update_rx {
-            if let Ok(res) = rx.try_recv() {
-                self.update_rx = None;
-                self.update_status = match res {
-                    Ok(Some(tag)) => UpdateStatus::Available(tag),
-                    Ok(None) => UpdateStatus::UpToDate,
-                    Err(e) => UpdateStatus::Failed(e),
-                };
+        let Some(rx) = &self.update_rx else { return };
+        let mut finished = false;
+        let mut restart = false;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                UpdateMsg::CheckResult(res) => {
+                    finished = true;
+                    self.update_status = match res {
+                        Ok(Some(tag)) => UpdateStatus::Available(tag),
+                        Ok(None) => UpdateStatus::UpToDate,
+                        Err(e) => UpdateStatus::Failed(e),
+                    };
+                }
+                UpdateMsg::Progress(p) => self.update_status = UpdateStatus::Downloading(p),
+                UpdateMsg::Ready => {
+                    finished = true;
+                    restart = true;
+                }
+                UpdateMsg::Failed(e) => {
+                    finished = true;
+                    self.update_status = UpdateStatus::Failed(e);
+                }
+            }
+        }
+        if finished {
+            self.update_rx = None;
+        }
+        if restart {
+            if self.is_working() {
+                // 轉檔進行中不強制重啟，等使用者按「重新啟動完成更新」
+                self.update_status = UpdateStatus::ReadyToRestart;
+            } else {
+                restart_app();
             }
         }
     }
@@ -884,7 +1008,7 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(16, 12)),
             )
             .show(ctx, |ui| {
-                // 新版本通知
+                // 新版本通知：點「立即更新」直接下載並自動重啟完成更新
                 let new_tag = match &self.update_status {
                     UpdateStatus::Available(tag) if !self.update_banner_dismissed => {
                         Some(tag.clone())
@@ -899,13 +1023,8 @@ impl App {
                                 .strong()
                                 .color(theme::SUCCESS),
                         );
-                        if ui
-                            .link(egui::RichText::new("前往下載頁面").size(12.0).color(theme::ACCENT))
-                            .clicked()
-                        {
-                            ctx.open_url(egui::OpenUrl::new_tab(format!(
-                                "https://github.com/{GITHUB_REPO}/releases/latest"
-                            )));
+                        if ui.small_button("立即更新").clicked() {
+                            self.spawn_self_update(ctx, tag.clone());
                         }
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
@@ -915,6 +1034,43 @@ impl App {
                                 }
                             },
                         );
+                    });
+                    ui.add_space(8.0);
+                }
+                if let UpdateStatus::Downloading(p) = &self.update_status {
+                    let p = *p;
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(13.0).color(theme::ACCENT));
+                        ui.label(
+                            egui::RichText::new(format!("正在下載更新… {:.0}%", p * 100.0))
+                                .size(12.0)
+                                .color(theme::TEXT_WEAK),
+                        );
+                    });
+                    ui.add(
+                        egui::ProgressBar::new(p)
+                            .fill(theme::ACCENT)
+                            .desired_height(6.0),
+                    );
+                    ui.add_space(8.0);
+                }
+                if matches!(self.update_status, UpdateStatus::ReadyToRestart) {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("✔ 新版已下載完成")
+                                .size(12.0)
+                                .strong()
+                                .color(theme::SUCCESS),
+                        );
+                        let working = self.is_working();
+                        let mut btn =
+                            ui.add_enabled(!working, egui::Button::new("重新啟動完成更新").small());
+                        if working {
+                            btn = btn.on_disabled_hover_text("轉換完成後即可重新啟動");
+                        }
+                        if btn.clicked() {
+                            restart_app();
+                        }
                     });
                     ui.add_space(8.0);
                 }
@@ -1678,6 +1834,8 @@ impl App {
         }
         let mut open = self.about_open;
         let mut check_now = false;
+        let mut start_update: Option<String> = None;
+        let mut restart_now = false;
         egui::Window::new("關於")
             .open(&mut open)
             .collapsible(false)
@@ -1726,25 +1884,63 @@ impl App {
                                     .strong()
                                     .color(theme::SUCCESS),
                             );
-                            ui.hyperlink_to(
-                                egui::RichText::new("前往下載頁面").size(12.5),
-                                format!("https://github.com/{GITHUB_REPO}/releases/latest"),
+                            ui.add_space(2.0);
+                            if ui.button("⬇ 立即更新").clicked() {
+                                start_update = Some(tag.clone());
+                            }
+                        }
+                        UpdateStatus::Downloading(p) => {
+                            ui.label(
+                                egui::RichText::new(format!("正在下載更新… {:.0}%", p * 100.0))
+                                    .size(12.5)
+                                    .color(theme::TEXT_WEAK),
                             );
+                            ui.add(
+                                egui::ProgressBar::new(*p)
+                                    .fill(theme::ACCENT)
+                                    .desired_height(6.0),
+                            );
+                        }
+                        UpdateStatus::ReadyToRestart => {
+                            ui.label(
+                                egui::RichText::new("✔ 新版已下載完成")
+                                    .size(12.5)
+                                    .strong()
+                                    .color(theme::SUCCESS),
+                            );
+                            ui.add_space(2.0);
+                            if ui
+                                .add_enabled(
+                                    !self.is_working(),
+                                    egui::Button::new("重新啟動完成更新"),
+                                )
+                                .on_disabled_hover_text("轉換完成後即可重新啟動")
+                                .clicked()
+                            {
+                                restart_now = true;
+                            }
                         }
                         UpdateStatus::Failed(e) => {
                             ui.label(
-                                egui::RichText::new("✖ 檢查更新失敗")
+                                egui::RichText::new("✖ 更新失敗")
                                     .size(12.5)
                                     .color(theme::ERROR),
                             )
                             .on_hover_text(e);
+                            ui.hyperlink_to(
+                                egui::RichText::new("改用瀏覽器下載").size(12.0),
+                                format!("https://github.com/{GITHUB_REPO}/releases/latest"),
+                            );
                         }
                     }
                     ui.add_space(8.0);
 
-                    let checking = matches!(self.update_status, UpdateStatus::Checking);
+                    let busy = matches!(
+                        self.update_status,
+                        UpdateStatus::Checking | UpdateStatus::Downloading(_)
+                    );
                     if ui
-                        .add_enabled(!checking, egui::Button::new("🔄 檢查更新"))
+                        .add_enabled(!busy, egui::Button::new("🔄 檢查更新"))
                         .clicked()
                     {
                         check_now = true;
@@ -1757,6 +1953,12 @@ impl App {
             // 手動重新檢查時，讓新版通知條可以再次出現
             self.update_banner_dismissed = false;
             self.spawn_update_check(ctx);
+        }
+        if let Some(tag) = start_update {
+            self.spawn_self_update(ctx, tag);
+        }
+        if restart_now {
+            restart_app();
         }
     }
 
@@ -2694,6 +2896,11 @@ fn load_app_icon() -> egui::IconData {
 }
 
 fn main() -> eframe::Result {
+    // 清掉上次一鍵更新留下的舊版檔案
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::fs::remove_file(exe.with_extension("exe.old"));
+    }
+
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 && args[1] == "--cli" {
         if let Err(e) = run_cli(&args[2..]) {
