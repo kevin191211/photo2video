@@ -1379,8 +1379,17 @@ impl App {
                                         .on_hover_text("開啟回報頁面（已帶入錯誤與版本）")
                                         .clicked()
                                     {
+                                        // 錯誤太長會讓網址超過系統開啟網址的長度上限（約 2048），
+                                        // 截短帶入 URL（完整內容用「複製錯誤」取得）；以字元為界避免切壞中文
+                                        let short_e: String = if e.chars().count() > 400 {
+                                            let mut s: String = e.chars().take(400).collect();
+                                            s.push_str("…（訊息過長已截斷，請用「複製錯誤」取得完整內容）");
+                                            s
+                                        } else {
+                                            e.clone()
+                                        };
                                         let body = format!(
-                                            "版本：v{}\n作業系統：Windows\n\n錯誤訊息：\n{e}\n\n（發生了什麼、用了哪些設定，可補充於此）",
+                                            "版本：v{}\n作業系統：Windows\n\n錯誤訊息：\n{short_e}\n\n（發生了什麼、用了哪些設定，可補充於此）",
                                             env!("CARGO_PKG_VERSION")
                                         );
                                         let url = format!(
