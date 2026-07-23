@@ -898,6 +898,32 @@ impl App {
     fn remove_photo(&mut self, i: usize) {
         let removed = self.photos.remove(i);
         self.thumbs.remove(&removed);
+
+        // 文字段落以 1-based 照片編號綁定，移除照片後其後編號整體前移一位，
+        // 段落須跟著調整，否則文字會靜默套到錯誤的照片上。
+        // rn 為被移除照片的編號；只涵蓋被刪那張的段落（end' < start'）整段刪除
+        let rn = i + 1;
+        let mut removed_entries: Vec<usize> = Vec::new();
+        for (k, e) in self.sub_entries.iter_mut().enumerate() {
+            if e.start > rn {
+                e.start -= 1;
+            }
+            if e.end >= rn {
+                e.end -= 1;
+            }
+            if e.end < e.start {
+                removed_entries.push(k);
+            }
+        }
+        for k in removed_entries.into_iter().rev() {
+            self.sub_entries.remove(k);
+            self.sel_text = match self.sel_text {
+                Some(s) if s == k => None,
+                Some(s) if s > k => Some(s - 1),
+                other => other,
+            };
+        }
+
         match self.preview_selected {
             Some(s) if s == i => {
                 let next = if self.photos.is_empty() {
