@@ -991,9 +991,11 @@ impl App {
 
     /// 在背景執行緒檢查 GitHub 是否有新版本
     fn spawn_update_check(&mut self, ctx: &egui::Context) {
+        // ReadyToRestart 也要擋：新版 exe 已替換到磁碟上，重新檢查會把
+        // 「待重啟」狀態洗掉，又回報有新版，導致使用者重複下載整包更新
         if matches!(
             self.update_status,
-            UpdateStatus::Checking | UpdateStatus::Downloading(_)
+            UpdateStatus::Checking | UpdateStatus::Downloading(_) | UpdateStatus::ReadyToRestart
         ) {
             return;
         }
@@ -2315,7 +2317,9 @@ impl App {
 
                     let busy = matches!(
                         self.update_status,
-                        UpdateStatus::Checking | UpdateStatus::Downloading(_)
+                        UpdateStatus::Checking
+                            | UpdateStatus::Downloading(_)
+                            | UpdateStatus::ReadyToRestart
                     );
                     if ui
                         .add_enabled(!busy, egui::Button::new("🔄 檢查更新"))
