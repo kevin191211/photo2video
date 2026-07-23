@@ -3627,7 +3627,7 @@ fn run_cli(args: &[String]) -> Result<(), String> {
     if !(1..=60).contains(&fps) {
         return Err("fps 必須介於 1 到 60".into());
     }
-    let output = PathBuf::from(&args[2]);
+    let mut output = PathBuf::from(&args[2]);
 
     let mut photos = collect_images_in_dir(&dir);
     natural_sort(&mut photos);
@@ -3636,13 +3636,36 @@ fn run_cli(args: &[String]) -> Result<(), String> {
     }
     println!("共 {} 張照片，fps={fps}", photos.len());
 
-    let format = match output.extension().and_then(|e| e.to_str()) {
+    // 副檔名比對不分大小寫：out.WEBM 也要選 VP9，否則會落到預設 mp4(H264)、
+    // 被 ffmpeg 依 .WEBM 寫成 H264-in-WebM 這種不相容檔案
+    let known = ["mp4", "mkv", "mov", "avi", "webm"];
+    let ext_lc = output
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    let format = match ext_lc.as_deref() {
         Some("mkv") => OutputFormat::Mkv,
         Some("mov") => OutputFormat::Mov,
         Some("avi") => OutputFormat::Avi,
         Some("webm") => OutputFormat::Webm,
         _ => OutputFormat::Mp4,
     };
+    // 確保輸出有正確副檔名：無副檔名時 ffmpeg 無法判斷容器會失敗；非影片副檔名
+    // 則補上，保留使用者輸入的檔名（與 GUI 存檔行為一致）
+    let ext = format.ext();
+    match ext_lc.as_deref() {
+        Some(e) if e == ext => {}
+        Some(e) if known.contains(&e) => {
+            output.set_extension(ext);
+        }
+        _ => {
+            let name = output
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            output.set_file_name(format!("{name}.{ext}"));
+        }
+    }
 
     let send = |msg: WorkerMsg| match msg {
         WorkerMsg::Status(s) => println!("{s}"),
