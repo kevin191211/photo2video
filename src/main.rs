@@ -554,8 +554,9 @@ enum UpdateMsg {
 
 /// 預覽像素為 RGB24（ffmpeg rawvideo 直接輸出，不經 PNG 編解碼）
 type PreviewResult = Result<(u32, u32, Vec<u8>), String>;
-/// 預覽結果附帶「這是第幾張照片的渲染」，避免快速切換時舊結果蓋掉新照片
-type PreviewMsg = (usize, PreviewResult);
+/// 預覽結果附帶「這是哪一張照片的渲染」（以路徑辨識，非索引）：移除照片會讓
+/// 索引指向不同照片，用索引比對會把舊照片的渲染顯示到新照片上、或漏掉有效結果
+type PreviewMsg = (PathBuf, PreviewResult);
 /// 縮圖解碼結果：(寬, 高, RGB 像素)；None 表示解碼失敗
 type ThumbMsg = (PathBuf, Option<(u32, u32, Vec<u8>)>);
 
@@ -717,17 +718,24 @@ impl App {
         self.preview_dirty = false;
         let ctx = ctx.clone();
         thread::spawn(move || {
-            let _ = tx.send((idx, render_preview(&photo, &adj, res)));
+            let result = render_preview(&photo, &adj, res);
+            let _ = tx.send((photo, result));
             ctx.request_repaint();
         });
     }
 
     fn poll_preview(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.preview_rx {
-            if let Ok((for_idx, res)) = rx.try_recv() {
+            if let Ok((for_photo, res)) = rx.try_recv() {
                 self.preview_rx = None;
-                // 渲染期間使用者已切到別張照片 → 丟棄過期結果（dirty 仍在，會重新渲染）
-                if self.preview_selected == Some(for_idx) {
+                // 以路徑辨識：渲染期間使用者切到別張、或移除照片使索引重排時，
+                // 只有目前選取的正是這張照片才採用結果，否則丟棄（dirty 仍在會重render）
+                let is_current = self
+                    .preview_selected
+                    .and_then(|i| self.photos.get(i))
+                    .map(|p| p == &for_photo)
+                    .unwrap_or(false);
+                if is_current {
                     match res {
                         Ok((w, h, rgb)) => {
                             let img = egui::ColorImage::from_rgb(
