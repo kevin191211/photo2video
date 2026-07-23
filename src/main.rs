@@ -3337,8 +3337,18 @@ fn run_conversion(
         return Err("沒有照片可轉換".into());
     }
 
-    // 背景音樂放在隨身碟/網路磁碟且已移除時，先給明確訊息，
-    // 不要等 ffmpeg 編碼到一半才以難懂的錯誤中斷、白費前面的時間
+    // 轉檔前先確認所有輸入檔仍在（照片或音樂可能在加入後被移除、磁碟斷線）。
+    // 不先擋下的話，ffmpeg 會編碼到讀取該檔那一步才失敗，白費前面的時間；
+    // 加上硬體編碼失敗會再退回軟體重跑，缺檔更會浪費雙倍時間
+    if let Some(missing) = photos.iter().find(|p| !p.exists()) {
+        let name = missing
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| missing.display().to_string());
+        return Err(format!(
+            "找不到照片檔案「{name}」，可能已被移除或所在磁碟未連接"
+        ));
+    }
     if let Some(m) = &fx.music {
         if !m.path.exists() {
             let name = m
@@ -3472,7 +3482,11 @@ fn run_conversion(
             "eq=eval=frame:brightness='-{dip}':saturation='max(0,1-{dip})',"
         ));
     }
-    tail.push_str("setsar=1,format=yuv420p");
+    // 編碼前強制輸出為偶數尺寸：某些濾鏡組合（如 zoompan、rotate、overlay）
+    // 可能算出奇數高/寬（如 1920x1081），H.264（尤其 libx264）要求 yuv420p
+    // 的長寬必須為偶數，否則會以「height not divisible by 2」失敗。
+    // crop 至最接近的偶數（最多裁掉 1 像素，肉眼無感）
+    tail.push_str("crop=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1,format=yuv420p");
 
     // 先把視訊濾鏡定案：有旋轉文字走 filter_complex，否則走 -vf
     let filter_complex = if use_complex {
