@@ -618,6 +618,8 @@ struct App {
     about_open: bool,
     /// fps 最後一次變動的時間；拖動時不即時寫設定檔，停止變動後才寫
     fps_pending_save: Option<Instant>,
+    /// 按下「複製錯誤」的時間；短暫顯示「已複製」確認用
+    err_copied_at: Option<Instant>,
 }
 
 impl App {
@@ -693,6 +695,7 @@ impl App {
             update_banner_dismissed: false,
             about_open: false,
             fps_pending_save: None,
+            err_copied_at: None,
         };
         // 啟動時在背景檢查是否有新版本（失敗不影響使用）
         app.spawn_update_check(&cc.egui_ctx);
@@ -1377,8 +1380,18 @@ impl App {
                                         // 可能開不了或只帶到 & 之前
                                         ctx.open_url(egui::OpenUrl::new_tab(url));
                                     }
+                                    // 剛複製過（2 秒內）就顯示「已複製」確認，
+                                    // 讓使用者確定有按到（複製動作本身無畫面回饋）
+                                    let just_copied = self
+                                        .err_copied_at
+                                        .is_some_and(|t| t.elapsed().as_secs_f32() < 2.0);
+                                    let label = if just_copied {
+                                        "✓ 已複製"
+                                    } else {
+                                        "📋 複製錯誤"
+                                    };
                                     if ui
-                                        .small_button("📋 複製錯誤")
+                                        .small_button(label)
                                         .on_hover_text("複製錯誤訊息，方便貼給開發者")
                                         .clicked()
                                     {
@@ -1386,6 +1399,12 @@ impl App {
                                             "Photo2Video v{} 轉換失敗\n{e}",
                                             env!("CARGO_PKG_VERSION")
                                         ));
+                                        self.err_copied_at = Some(Instant::now());
+                                    }
+                                    if just_copied {
+                                        ui.ctx().request_repaint_after(
+                                            Duration::from_millis(300),
+                                        );
                                     }
                                 },
                             );
