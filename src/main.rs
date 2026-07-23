@@ -475,13 +475,10 @@ fn ff_path_escape(p: &Path) -> String {
 }
 
 fn ff_color(c: egui::Color32) -> String {
-    format!(
-        "0x{:02X}{:02X}{:02X}@{:.3}",
-        c.r(),
-        c.g(),
-        c.b(),
-        c.a() as f32 / 255.0
-    )
+    // egui Color32 內部為預乘 alpha，直接取 r/g/b 會把半透明色送成偏暗的預乘值；
+    // ffmpeg 要的是直通（straight）RGB，故取未預乘值，半透明文字/外框才不會變暗
+    let [r, g, b, a] = c.to_srgba_unmultiplied();
+    format!("0x{r:02X}{g:02X}{b:02X}@{:.3}", a as f32 / 255.0)
 }
 
 /// 產生一段 drawtext 濾鏡。fontsize 為實際像素；(x_frac, y_frac) 為文字中心點
