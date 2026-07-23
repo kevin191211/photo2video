@@ -1750,7 +1750,7 @@ impl App {
                             );
                         });
                         slider_row(ui, &mut self.music_volume, 0, 200, "音量");
-                        ui.checkbox(&mut self.music_fade, "結尾自動淡出（2 秒）");
+                        ui.checkbox(&mut self.music_fade, "結尾自動淡出（最多 2 秒）");
                         ui.label(
                             egui::RichText::new("音樂比影片短會自動循環，比影片長會自動裁切")
                                 .size(11.0)
