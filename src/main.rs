@@ -2955,7 +2955,16 @@ fn filter_threads() -> String {
 /// 確認一次後快取，預覽渲染就不用每張都多付一次程序啟動的成本
 static FFMPEG_READY: AtomicBool = AtomicBool::new(false);
 
+/// 序列化「檢查＋下載」：首次使用時預覽與轉檔可能同時走到這裡，
+/// 兩個 auto_download 並發會互踩同一個安裝目錄，留下損毀的 ffmpeg
+static FFMPEG_INIT: Mutex<()> = Mutex::new(());
+
 fn ensure_ffmpeg(on_download: impl Fn()) -> Result<(), String> {
+    if FFMPEG_READY.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let _guard = FFMPEG_INIT.lock().unwrap();
+    // 拿到鎖後再確認一次：先到的執行緒可能已完成下載
     if FFMPEG_READY.load(Ordering::Relaxed) {
         return Ok(());
     }
