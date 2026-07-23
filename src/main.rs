@@ -1824,8 +1824,16 @@ impl App {
         };
         let mut img_rect_opt: Option<egui::Rect> = None;
         if let Some(tex) = self.preview_tex.as_ref().or(placeholder.as_ref()) {
-            let img_rect = fit_rect(tex.size_vec2(), rect.shrink(14.0));
-            img_rect_opt = Some(img_rect);
+            // 文字座標與版面一律以「輸出畫布」（含補邊黑邊）為基準：
+            // 佔位縮圖是未補邊的原始比例，若直接 fit 進卡片，照片位置
+            // 和文字座標都會與渲染完成後不同，每切一張照片就閃跳一次。
+            // 先取畫布矩形，再把貼圖置中其內（正式預覽圖本身就是畫布
+            // 尺寸，fit 結果等於畫布矩形，行為不變）
+            let (cw, ch) = preview_canvas(self.resolution);
+            let canvas_rect =
+                fit_rect(egui::vec2(cw as f32, ch as f32), rect.shrink(14.0));
+            let img_rect = fit_rect(tex.size_vec2(), canvas_rect);
+            img_rect_opt = Some(canvas_rect);
             p.image(
                 tex.id(),
                 img_rect,
