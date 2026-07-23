@@ -2819,6 +2819,8 @@ fn apply_theme(ctx: &egui::Context) {
     v.selection.bg_fill = theme::ACCENT;
     v.selection.stroke = Stroke::new(1.0, Color32::WHITE);
     v.slider_trailing_fill = false;
+    // 滑桿把手改為細直線（寬高比 = 寬/高）
+    v.handle_shape = egui::style::HandleShape::Rect { aspect_ratio: 0.25 };
     v.hyperlink_color = theme::ACCENT;
 
     v.widgets.noninteractive.bg_fill = theme::PANEL;
