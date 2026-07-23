@@ -3042,9 +3042,7 @@ fn prefetch_preview_base(photo: PathBuf, pw: u32, ph: u32) {
 enum BaseRole {
     /// 命中：直接以底圖當輸入
     Cached(PathBuf),
-    /// 未命中：本次渲染用 split 順便輸出底圖（原圖只解碼一次）
-    Build { out: PathBuf, serial: u64 },
-    /// 同一張照片先前建置失敗：維持完整流程、不再嘗試建置
+    /// 未命中或建置中：本次以完整流程渲染
     Skip,
 }
 
@@ -3073,21 +3071,13 @@ fn render_preview(photo: &Path, adj: &Adjustments, res: Resolution) -> PreviewRe
             g.push(b);
             role
         } else {
-            // 未命中：淘汰最舊的一筆後建立新槽
-            if g.len() >= PREVIEW_BASE_CAP {
-                let old = g.remove(0);
-                if let Some(f) = old.file {
-                    let _ = std::fs::remove_file(f);
-                }
-            }
-            let serial = PREVIEW_BASE_SERIAL.fetch_add(1, Ordering::Relaxed);
-            g.push(PreviewBase {
-                key: key.clone(),
-                file: None,
-                serial,
-            });
-            let out = std::env::temp_dir().join(format!("photo2video_prev_base_{serial}.bmp"));
-            BaseRole::Build { out, serial }
+            // 未命中：本次以完整流程渲染，底圖交給背景執行緒另行建置。
+            // 不能在同一次 ffmpeg 用 split 雙輸出（rawvideo 管線＋BMP 檔案）：
+            // sidecar 讀取 stdout 影格時遇到第二個輸出會失敗，
+            // ffmpeg 寫入被關閉的管線便回報 Invalid argument
+            let photo2 = photo.to_path_buf();
+            thread::spawn(move || prefetch_preview_base(photo2, pw, ph));
+            BaseRole::Skip
         }
     };
 
@@ -3109,17 +3099,6 @@ fn render_preview(photo: &Path, adj: &Adjustments, res: Resolution) -> PreviewRe
                 .args(["-vf", &chain])
                 .args(["-frames:v", "1"])
                 .rawvideo();
-        }
-        // split 一路出預覽、一路存底圖，下次重渲染就有快取可用
-        BaseRole::Build { out, .. } => {
-            let fc = format!("[0:v]{scale},split[pv][bs];[pv]{chain}[out]");
-            cmd.arg("-y")
-                .input(photo.to_string_lossy())
-                .args(["-filter_complex", &fc])
-                .args(["-map", "[out]", "-frames:v", "1"])
-                .rawvideo()
-                .args(["-map", "[bs]", "-frames:v", "1"])
-                .output(out.to_string_lossy());
         }
         BaseRole::Skip => {
             cmd.input(photo.to_string_lossy())
@@ -3147,24 +3126,6 @@ fn render_preview(photo: &Path, adj: &Adjustments, res: Resolution) -> PreviewRe
     }
     let status = child.wait().map_err(|e| format!("FFmpeg 執行失敗：{e}"))?;
     let ok = status.success() && frame.is_some();
-
-    // 底圖登記：渲染成功且快取槽仍在（未被 LRU 淘汰）才掛上，否則清掉孤兒檔
-    if let BaseRole::Build { out, serial } = &base {
-        let mut stored = false;
-        if ok {
-            let mut g = PREVIEW_BASE.lock().unwrap();
-            if let Some(b) = g
-                .iter_mut()
-                .find(|b| b.serial == *serial && b.key == key)
-            {
-                b.file = Some(out.clone());
-                stored = true;
-            }
-        }
-        if !stored {
-            let _ = std::fs::remove_file(out);
-        }
-    }
 
     if !ok {
         return Err(if error_log.is_empty() {
