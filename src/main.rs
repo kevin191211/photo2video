@@ -1045,6 +1045,8 @@ impl App {
             progress: 0.0,
             status: "準備中…".into(),
         };
+        // 清掉上次的「已複製」確認，避免新一輪失敗時殘留顯示
+        self.err_copied_at = None;
 
         let photos = self.photos.clone();
         let fps = self.fps;
