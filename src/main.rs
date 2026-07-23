@@ -538,6 +538,31 @@ fn decode_thumbnail(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
     Some((t.width(), t.height(), t.into_raw()))
 }
 
+/// 讀取照片的顯示尺寸（已套用 EXIF 方向，只讀檔頭不解碼像素）。
+/// image_dimensions 回傳的是未旋轉的原始像素，手機直拍照片會拿到寬高顛倒的值；
+/// 輸出走的 ffmpeg 會自動旋轉，這裡須以旋轉後的寬高計算，
+/// 「原始像素」解析度才會與實際輸出一致，直拍照片不會被塞進橫向畫布
+fn oriented_dimensions(path: &Path) -> Option<(u32, u32)> {
+    use image::metadata::Orientation;
+    use image::ImageDecoder;
+    let mut decoder = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .into_decoder()
+        .ok()?;
+    let orientation = decoder.orientation().ok()?;
+    let (w, h) = decoder.dimensions();
+    let swapped = matches!(
+        orientation,
+        Orientation::Rotate90
+            | Orientation::Rotate270
+            | Orientation::Rotate90FlipH
+            | Orientation::Rotate270FlipH
+    );
+    Some(if swapped { (h, w) } else { (w, h) })
+}
+
 /// 把 Windows 路徑轉成 filtergraph 內安全的形式（/ 分隔、跳脫冒號）
 fn ff_path_escape(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/").replace(':', r"\:")
@@ -916,7 +941,7 @@ impl App {
         }
         let (mut w, mut h) = (0u32, 0u32);
         for p in &self.photos {
-            if let Ok((pw, ph)) = image::image_dimensions(p) {
+            if let Some((pw, ph)) = oriented_dimensions(p) {
                 w = w.max(pw);
                 h = h.max(ph);
             }
