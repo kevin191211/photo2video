@@ -444,6 +444,26 @@ fn detect_fonts() -> Vec<(String, PathBuf)> {
         .collect()
 }
 
+/// 解碼縮圖並套用 EXIF 方向。手機照片常以「未旋轉的原始像素＋方向標記」儲存，
+/// image::open 不會自動套用方向，但輸出／預覽走的 ffmpeg 會自動旋轉——兩者不一致
+/// 會讓縮圖列與預覽佔位圖側躺，實際影片卻是正的。這裡讀取方向並套用後再縮圖
+fn decode_thumbnail(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
+    use image::ImageDecoder;
+    let mut decoder = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .into_decoder()
+        .ok()?;
+    // 方向須在 from_decoder 消耗掉 decoder 之前先取出
+    let orientation = decoder.orientation().ok()?;
+    let mut img = image::DynamicImage::from_decoder(decoder).ok()?;
+    img.apply_orientation(orientation);
+    // RGB 即可（縮圖不需要透明通道），省 1/4 記憶體與上傳頻寬
+    let t = img.thumbnail(320, 180).to_rgb8();
+    Some((t.width(), t.height(), t.into_raw()))
+}
+
 /// 把 Windows 路徑轉成 filtergraph 內安全的形式（/ 分隔、跳脫冒號）
 fn ff_path_escape(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/").replace(':', r"\:")
@@ -614,11 +634,7 @@ impl App {
                         q = cv.wait(q).unwrap();
                     }
                 };
-                let res = image::open(&job).ok().map(|img| {
-                    // RGB 即可（縮圖不需要透明通道），省 1/4 記憶體與上傳頻寬
-                    let t = img.thumbnail(320, 180).to_rgb8();
-                    (t.width(), t.height(), t.into_raw())
-                });
+                let res = decode_thumbnail(&job);
                 let _ = tx.send((job, res));
                 ctx.request_repaint();
             });
