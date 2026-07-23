@@ -3314,7 +3314,9 @@ fn run_conversion(
     // 首尾也各有一次淡入/淡出；不用串接大量 fade 濾鏡（fade 的 st 前後會整段變黑）
     let mut tail = String::new();
     if fx.transition == Transition::FadeBlack {
-        let f = (eff_dur * 0.4).clamp(0.05, 0.5);
+        // 淡出時間不能超過半張照片時長，否則畫面中點也回不到全亮：
+        // fps 高於 10 時 0.05 秒的下限會超過 d/2，整支影片會恆定變暗
+        let f = (eff_dur * 0.4).clamp(0.05, 0.5).min(eff_dur * 0.5);
         let dip = format!(
             "max(0,1-min(mod(t,{d:.6}),{d:.6}-mod(t,{d:.6}))/{f:.6})",
             d = eff_dur,
