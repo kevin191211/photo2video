@@ -449,6 +449,21 @@ fn detect_fonts() -> Vec<(String, PathBuf)> {
         .collect()
 }
 
+/// 百分比編碼（供組 GitHub 回報網址用）：非「未保留字元」的位元組一律以 %XX 表示，
+/// 中文等 UTF-8 多位元組也逐位元組編碼，瀏覽器與 GitHub 都能正確還原
+fn urlencode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// 解碼縮圖並套用 EXIF 方向。手機照片常以「未旋轉的原始像素＋方向標記」儲存，
 /// image::open 不會自動套用方向，但輸出／預覽走的 ffmpeg 會自動旋轉——兩者不一致
 /// 會讓縮圖列與預覽佔位圖側躺，實際影片卻是正的。這裡讀取方向並套用後再縮圖
@@ -1331,13 +1346,48 @@ impl App {
                     }
                     ConvertState::Error(e) => {
                         let e = e.clone();
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(format!("✖ 轉換失敗：{e}"))
-                                    .color(theme::ERROR),
-                            )
-                            .truncate(),
-                        );
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("✖ 轉換失敗：{e}"))
+                                        .color(theme::ERROR),
+                                )
+                                .truncate(),
+                            );
+                            // 快速回報：複製錯誤（貼給開發者最直接）＋開 GitHub 回報頁
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .small_button("🔗 回報問題")
+                                        .on_hover_text("開啟回報頁面（已帶入錯誤與版本）")
+                                        .clicked()
+                                    {
+                                        let body = format!(
+                                            "版本：v{}\n作業系統：Windows\n\n錯誤訊息：\n{e}\n\n（發生了什麼、用了哪些設定，可補充於此）",
+                                            env!("CARGO_PKG_VERSION")
+                                        );
+                                        let url = format!(
+                                            "https://github.com/{GITHUB_REPO}/issues/new?title={}&body={}",
+                                            urlencode("轉換失敗回報"),
+                                            urlencode(&body)
+                                        );
+                                        let _ =
+                                            std::process::Command::new("explorer").arg(url).spawn();
+                                    }
+                                    if ui
+                                        .small_button("📋 複製錯誤")
+                                        .on_hover_text("複製錯誤訊息，方便貼給開發者")
+                                        .clicked()
+                                    {
+                                        ctx.copy_text(format!(
+                                            "Photo2Video v{} 轉換失敗\n{e}",
+                                            env!("CARGO_PKG_VERSION")
+                                        ));
+                                    }
+                                },
+                            );
+                        });
                         ui.add_space(8.0);
                     }
                 }
