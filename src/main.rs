@@ -2937,7 +2937,10 @@ fn setup_chinese_fonts(ctx: &egui::Context, bytes: Option<Vec<u8>>) {
 }
 
 fn concat_escape(p: &Path) -> String {
-    p.to_string_lossy().replace('\\', "/").replace('\'', r"'\''")
+    // concat demuxer 會把相對路徑解析成「相對於清單檔所在目錄」（暫存資料夾），
+    // 以相對路徑啟動程式或走 CLI 模式時就會找不到照片。先轉成絕對路徑再寫入清單
+    let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    abs.to_string_lossy().replace('\\', "/").replace('\'', r"'\''")
 }
 
 #[derive(Clone, Copy, PartialEq)]
