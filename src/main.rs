@@ -78,6 +78,11 @@ impl OutputFormat {
         OutputFormat::Avi,
         OutputFormat::Webm,
     ];
+
+    /// 由副檔名找回格式（專案檔用）；不認得時回傳 None
+    fn from_ext(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|f| f.ext() == s)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -114,7 +119,8 @@ impl Resolution {
 }
 
 /// 調色參數，全部以 -100 ~ +100 表示，0 為不調整
-#[derive(Clone, Copy, PartialEq, Default)]
+#[derive(Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 struct Adjustments {
     temp: i32,       // 色溫（+ 偏暖 / − 偏冷）
     tint: i32,       // 色調（+ 偏洋紅 / − 偏綠）
@@ -132,6 +138,27 @@ struct Adjustments {
 impl Adjustments {
     fn is_neutral(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// 把所有參數夾回合法範圍；專案檔可能被手改出超界值，
+    /// 直接餵給 filter_chain 會產生不合法的 ffmpeg 濾鏡參數
+    fn clamped(mut self) -> Self {
+        for v in [
+            &mut self.temp,
+            &mut self.tint,
+            &mut self.exposure,
+            &mut self.contrast,
+            &mut self.brightness,
+            &mut self.shadows,
+            &mut self.whites,
+            &mut self.blacks,
+            &mut self.clarity,
+            &mut self.vibrance,
+            &mut self.saturation,
+        ] {
+            *v = (*v).clamp(-100, 100);
+        }
+        self
     }
 
     /// 轉成 ffmpeg 濾鏡串；全部為 0 時回傳 None
@@ -233,7 +260,7 @@ impl Default for SubtitleStyle {
 
 /// 一段文字：從第 start 張到第 end 張（1-based、含端點）顯示；
 /// 位置為文字中心點在畫面上的比例（0~1），大小以 1080p 高度為基準，旋轉單位為度（順時針）
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct SubtitleEntry {
     start: usize,
     end: usize,
@@ -273,6 +300,18 @@ impl Transition {
         }
     }
     const ALL: [Transition; 2] = [Transition::None, Transition::FadeBlack];
+
+    /// 專案檔內的穩定識別字串（label 是給人看的中文，不適合存檔）
+    fn id(&self) -> &'static str {
+        match self {
+            Transition::None => "none",
+            Transition::FadeBlack => "fade_black",
+        }
+    }
+
+    fn from_id(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|t| t.id() == s)
+    }
 }
 
 /// 背景音樂設定
@@ -289,6 +328,71 @@ struct OutputFx {
     transition: Transition,
     ken_burns: bool,
     music: Option<MusicJob>,
+}
+
+/// 專案檔副檔名（內容為 JSON）
+const PROJECT_EXT: &str = "p2v";
+
+/// 專案檔內容：照片清單與所有編輯設定。
+/// 與 App 狀態分離的獨立結構，欄位盡量用穩定的表示法
+/// （字型存名稱而非索引、格式/轉場存字串），並全部給預設值，
+/// 舊版程式開新版專案檔（或反之）時缺欄位不會整個開不起來
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct ProjectFile {
+    /// 專案檔格式版本，目前為 1
+    version: u32,
+    /// 存檔當下的程式版本（僅供除錯參考）
+    app_version: String,
+    photos: Vec<PathBuf>,
+    fps: u32,
+    /// 輸出格式副檔名（mp4/mkv/mov/avi/webm）
+    format: String,
+    /// 輸出解析度；(0, 0) 為「原始像素」
+    resolution: (u32, u32),
+    adj: Adjustments,
+    /// 個別照片的調色覆寫（HashMap 的 PathBuf 鍵存 JSON 不穩定，改用陣列）
+    adj_overrides: Vec<(PathBuf, Adjustments)>,
+    sub_entries: Vec<SubtitleEntry>,
+    /// 字型名稱；開檔時依名稱找回索引，找不到就用第一個字型
+    sub_font: String,
+    sub_color: [u8; 4],
+    sub_outline_w: i32,
+    sub_outline_color: [u8; 4],
+    sub_boxed: bool,
+    /// 轉場（none/fade_black）
+    transition: String,
+    ken_burns: bool,
+    music_path: Option<PathBuf>,
+    music_volume: i32,
+    music_fade: bool,
+}
+
+impl Default for ProjectFile {
+    fn default() -> Self {
+        let style = SubtitleStyle::default();
+        Self {
+            version: 1,
+            app_version: String::new(),
+            photos: Vec::new(),
+            fps: 10,
+            format: "mp4".into(),
+            resolution: (1920, 1080),
+            adj: Adjustments::default(),
+            adj_overrides: Vec::new(),
+            sub_entries: Vec::new(),
+            sub_font: String::new(),
+            sub_color: style.color.to_array(),
+            sub_outline_w: style.outline_w,
+            sub_outline_color: style.outline_color.to_array(),
+            sub_boxed: style.boxed,
+            transition: "none".into(),
+            ken_burns: false,
+            music_path: None,
+            music_volume: 100,
+            music_fade: true,
+        }
+    }
 }
 
 /// 解析 "v1.2.3" 或 "1.2.3" 為可比較的版本號
@@ -396,13 +500,47 @@ fn load_saved_fps() -> Option<u32> {
     (1..=60).contains(&fps).then_some(fps)
 }
 
-/// 儲存每秒張數設定（失敗不影響使用，靜默忽略）
-fn save_fps(fps: u32) {
+/// 讀取整份設定檔 JSON；不存在或壞掉時回傳空物件
+fn load_config() -> serde_json::Value {
+    std::fs::read_to_string(config_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+/// 更新設定檔中的單一欄位並保留其他欄位（失敗不影響使用，靜默忽略）
+fn update_config(key: &str, value: serde_json::Value) {
+    let mut cfg = load_config();
+    cfg[key] = value;
     let path = config_path();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(&path, serde_json::json!({ "fps": fps }).to_string());
+    let _ = std::fs::write(&path, cfg.to_string());
+}
+
+/// 儲存每秒張數設定
+fn save_fps(fps: u32) {
+    update_config("fps", serde_json::json!(fps));
+}
+
+/// 最近開啟/儲存的專案檔路徑（新的在前）
+fn load_recent_projects() -> Vec<PathBuf> {
+    load_config()
+        .get("recent_projects")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(PathBuf::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn save_recent_projects(list: &[PathBuf]) {
+    let arr: Vec<String> = list.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    update_config("recent_projects", serde_json::json!(arr));
 }
 
 /// 下載指定版本的 photo2video.exe 並原地替換目前的執行檔
@@ -709,6 +847,8 @@ struct App {
     crash_report: Option<String>,
     /// 剛選的資料夾/檔案沒有找到任何照片；在空狀態顯示提示，避免使用者以為沒反應
     import_found_nothing: bool,
+    /// 最近開啟/儲存的專案檔（新的在前），顯示在空狀態畫面供一鍵開啟
+    recent_projects: Vec<PathBuf>,
 }
 
 impl App {
@@ -790,6 +930,7 @@ impl App {
             fps_pending_save: None,
             crash_report: take_crash_report(),
             import_found_nothing: false,
+            recent_projects: load_recent_projects(),
         };
         // 啟動時在背景檢查是否有新版本（失敗不影響使用）
         app.spawn_update_check(&cc.egui_ctx);
@@ -1176,6 +1317,239 @@ impl App {
             .pick_files()
         {
             self.add_photos(files);
+        }
+    }
+
+    /// 把目前的編輯狀態打包成專案檔內容
+    fn project_data(&self) -> ProjectFile {
+        // 覆寫依照片順序輸出，同一份專案每次存檔的內容才穩定
+        let adj_overrides: Vec<(PathBuf, Adjustments)> = self
+            .photos
+            .iter()
+            .filter_map(|p| self.adj_overrides.get(p).map(|a| (p.clone(), *a)))
+            .collect();
+        ProjectFile {
+            version: 1,
+            app_version: env!("CARGO_PKG_VERSION").into(),
+            photos: self.photos.clone(),
+            fps: self.fps,
+            format: self.format.ext().into(),
+            resolution: (self.resolution.w, self.resolution.h),
+            adj: self.adj,
+            adj_overrides,
+            sub_entries: self.sub_entries.clone(),
+            sub_font: self
+                .fonts
+                .get(self.sub_style.font_idx)
+                .map(|(n, _)| n.clone())
+                .unwrap_or_default(),
+            sub_color: self.sub_style.color.to_array(),
+            sub_outline_w: self.sub_style.outline_w,
+            sub_outline_color: self.sub_style.outline_color.to_array(),
+            sub_boxed: self.sub_style.boxed,
+            transition: self.transition.id().into(),
+            ken_burns: self.ken_burns,
+            music_path: self.music_path.clone(),
+            music_volume: self.music_volume,
+            music_fade: self.music_fade,
+        }
+    }
+
+    fn save_project_dialog(&mut self) {
+        let Some(mut path) = rfd::FileDialog::new()
+            .set_title("儲存專案")
+            .add_filter("Photo2Video 專案", &[PROJECT_EXT])
+            .set_file_name(format!("我的專案.{PROJECT_EXT}"))
+            .save_file()
+        else {
+            return;
+        };
+        // 使用者改掉或拿掉副檔名時補回來，之後開啟對話框的過濾器才找得到
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_none_or(|e| !e.eq_ignore_ascii_case(PROJECT_EXT))
+        {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            path.set_file_name(format!("{name}.{PROJECT_EXT}"));
+        }
+        let json = match serde_json::to_string_pretty(&self.project_data()) {
+            Ok(j) => j,
+            Err(e) => {
+                rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("儲存專案失敗")
+                    .set_description(format!("無法產生專案內容：\n{e}"))
+                    .show();
+                return;
+            }
+        };
+        match std::fs::write(&path, json) {
+            Ok(()) => self.remember_recent_project(&path),
+            Err(e) => {
+                rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("儲存專案失敗")
+                    .set_description(format!("無法寫入檔案：\n{e}"))
+                    .show();
+            }
+        }
+    }
+
+    /// 開新專案：回到空狀態，所有編輯設定回復預設
+    /// （fps 保留使用者慣用值，與程式啟動時一致）
+    fn new_project(&mut self) {
+        self.clear_photos();
+        self.adj = Adjustments::default();
+        self.sel_adj = Adjustments::default();
+        self.sub_entries.clear();
+        self.sub_style = SubtitleStyle::default();
+        self.sel_text = None;
+        self.transition = Transition::None;
+        self.ken_burns = false;
+        self.music_path = None;
+        self.music_volume = 100;
+        self.music_fade = true;
+        self.format = OutputFormat::Mp4;
+        self.resolution = Resolution { w: 1920, h: 1080 };
+    }
+
+    /// 記到最近專案清單最前面（去重、最多保留 8 筆）並寫入設定檔
+    fn remember_recent_project(&mut self, path: &Path) {
+        self.recent_projects.retain(|p| p != path);
+        self.recent_projects.insert(0, path.to_path_buf());
+        self.recent_projects.truncate(8);
+        save_recent_projects(&self.recent_projects);
+    }
+
+    fn open_project_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("開啟專案")
+            .add_filter("Photo2Video 專案", &[PROJECT_EXT])
+            .pick_file()
+        {
+            self.load_project(&path);
+        }
+    }
+
+    /// 讀入專案檔並還原所有編輯狀態。照片檔已不在原路徑時略過該張並提醒；
+    /// 文字段落的照片編號跟著平移，維持綁在同一張照片上
+    fn load_project(&mut self, path: &Path) {
+        let pf: ProjectFile = match std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|txt| serde_json::from_str(&txt).map_err(|e| e.to_string()))
+        {
+            Ok(p) => p,
+            Err(e) => {
+                // 開不起來的檔案從最近清單移除，之後不再顯示
+                self.recent_projects.retain(|p| p != path);
+                save_recent_projects(&self.recent_projects);
+                rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("開啟專案失敗")
+                    .set_description(format!("無法讀取專案檔：\n{e}"))
+                    .show();
+                return;
+            }
+        };
+        self.remember_recent_project(path);
+
+        // kept_before[i] = 原始清單前 i 張中仍存在的張數；
+        // 文字段落編號用它平移，結果與逐張執行 remove_photo 一致
+        let orig_n = pf.photos.len();
+        let exists: Vec<bool> = pf.photos.iter().map(|p| p.is_file()).collect();
+        let missing = exists.iter().filter(|e| !**e).count();
+        let mut kept_before = vec![0usize; orig_n + 1];
+        for (i, e) in exists.iter().enumerate() {
+            kept_before[i + 1] = kept_before[i] + usize::from(*e);
+        }
+
+        self.clear_photos();
+        self.photos = pf
+            .photos
+            .iter()
+            .zip(&exists)
+            .filter(|(_, e)| **e)
+            .map(|(p, _)| p.clone())
+            .collect();
+        self.fps = pf.fps.clamp(1, 60);
+        self.format = OutputFormat::from_ext(&pf.format).unwrap_or(OutputFormat::Mp4);
+        // 只接受選單裡有的解析度，避免手改出怪尺寸讓下拉選單對不上
+        self.resolution = Resolution::ALL
+            .iter()
+            .copied()
+            .find(|r| (r.w, r.h) == pf.resolution)
+            .unwrap_or(Resolution { w: 1920, h: 1080 });
+        self.adj = pf.adj.clamped();
+        let photo_set: HashSet<&PathBuf> = self.photos.iter().collect();
+        self.adj_overrides = pf
+            .adj_overrides
+            .into_iter()
+            .filter(|(p, _)| photo_set.contains(p))
+            .map(|(p, a)| (p, a.clamped()))
+            .collect();
+        self.sub_entries = pf
+            .sub_entries
+            .into_iter()
+            .filter_map(|mut e| {
+                if orig_n == 0 {
+                    return None;
+                }
+                let start = e.start.clamp(1, orig_n);
+                let end = e.end.clamp(start, orig_n);
+                e.start = kept_before[start - 1] + 1;
+                e.end = kept_before[end];
+                if e.end < e.start {
+                    return None; // 整段綁定的照片都遺失了
+                }
+                e.x = e.x.clamp(0.0, 1.0);
+                e.y = e.y.clamp(0.0, 1.0);
+                e.size = e.size.clamp(8, 300);
+                Some(e)
+            })
+            .collect();
+        let from_rgba =
+            |c: [u8; 4]| egui::Color32::from_rgba_premultiplied(c[0], c[1], c[2], c[3]);
+        self.sub_style = SubtitleStyle {
+            font_idx: self
+                .fonts
+                .iter()
+                .position(|(n, _)| *n == pf.sub_font)
+                .unwrap_or(0),
+            color: from_rgba(pf.sub_color),
+            outline_w: pf.sub_outline_w.clamp(0, 8),
+            outline_color: from_rgba(pf.sub_outline_color),
+            boxed: pf.sub_boxed,
+        };
+        self.sel_text = None;
+        self.transition = Transition::from_id(&pf.transition).unwrap_or(Transition::None);
+        self.ken_burns = pf.ken_burns;
+        // 音樂檔遺失就整組略過（照片少幾張還能用，音樂缺檔設定就沒意義）
+        let music_missing = matches!(&pf.music_path, Some(p) if !p.is_file());
+        self.music_path = pf.music_path.filter(|p| p.is_file());
+        self.music_volume = pf.music_volume.clamp(0, 200);
+        self.music_fade = pf.music_fade;
+
+        if !self.photos.is_empty() {
+            self.preview_selected = Some(0);
+            self.mark_preview_dirty();
+        }
+        if missing > 0 || music_missing {
+            let mut lines = Vec::new();
+            if missing > 0 {
+                lines.push(format!("有 {missing} 張照片已不在原路徑，已從清單移除。"));
+            }
+            if music_missing {
+                lines.push("背景音樂檔已不在原路徑，已清除音樂設定。".into());
+            }
+            rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Warning)
+                .set_title("專案已開啟，但部分檔案遺失")
+                .set_description(lines.join("\n"))
+                .show();
         }
     }
 
@@ -2169,6 +2543,50 @@ impl App {
                 }
             },
         );
+        child.add_space(10.0);
+        if child
+            .add(egui::Button::new(
+                egui::RichText::new("📂  開啟之前存的專案…")
+                    .size(12.5)
+                    .color(theme::TEXT_WEAK),
+            ))
+            .clicked()
+        {
+            self.open_project_dialog();
+        }
+        // 最近的專案：點檔名直接開啟，不用再走檔案對話框。
+        // 不在這裡檢查檔案是否存在（每幀摸磁碟太浪費），
+        // 開啟失敗時 load_project 會提示並將它從清單移除
+        if !self.recent_projects.is_empty() {
+            child.add_space(18.0);
+            child.label(
+                egui::RichText::new("最近的專案")
+                    .size(12.0)
+                    .strong()
+                    .color(theme::TEXT_WEAK),
+            );
+            child.add_space(2.0);
+            let recent: Vec<PathBuf> = self.recent_projects.iter().take(5).cloned().collect();
+            for p in recent {
+                let name = p
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.to_string_lossy().into_owned());
+                let btn = egui::Button::new(
+                    egui::RichText::new(format!("🕘  {name}"))
+                        .size(13.5)
+                        .color(theme::ACCENT),
+                )
+                .frame(false);
+                if child
+                    .add(btn)
+                    .on_hover_text(p.to_string_lossy())
+                    .clicked()
+                {
+                    self.load_project(&p);
+                }
+            }
+        }
         // 剛選的資料夾掃不到照片時明講原因，避免使用者以為程式沒反應
         if self.import_found_nothing {
             child.add_space(14.0);
@@ -2200,6 +2618,25 @@ impl App {
                 }
                 if ui.button("🗑  清空").clicked() {
                     self.clear_photos();
+                }
+                ui.separator();
+                if ui.button("🆕  新專案").clicked() {
+                    // 誤點會失去所有未存檔的編輯，先確認
+                    let r = rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Warning)
+                        .set_title("開新專案")
+                        .set_description("將清空目前的照片與所有設定，尚未儲存的變更會遺失。")
+                        .set_buttons(rfd::MessageButtons::OkCancel)
+                        .show();
+                    if r == rfd::MessageDialogResult::Ok {
+                        self.new_project();
+                    }
+                }
+                if ui.button("📂  開啟專案").clicked() {
+                    self.open_project_dialog();
+                }
+                if ui.button("💾  儲存專案").clicked() {
+                    self.save_project_dialog();
                 }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2949,6 +3386,13 @@ impl eframe::App for App {
                 if p.is_dir() {
                     any_dir = true;
                     files.extend(collect_images_in_dir(&p));
+                } else if p
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXT))
+                {
+                    // 拖入專案檔＝開啟專案
+                    self.load_project(&p);
                 } else if is_audio(&p) {
                     // 拖入音訊檔＝設定為背景音樂
                     self.music_path = Some(p);
@@ -2961,6 +3405,18 @@ impl eframe::App for App {
                 self.import_found_nothing = true;
             }
             self.add_photos(files);
+        }
+
+        // Ctrl+S 儲存專案、Ctrl+O 開啟專案（轉換中不動作）
+        if !self.is_working() {
+            if !self.photos.is_empty()
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S))
+            {
+                self.save_project_dialog();
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
+                self.open_project_dialog();
+            }
         }
 
         // 左右方向鍵切換預覽（輸入框有焦點時不動作）
