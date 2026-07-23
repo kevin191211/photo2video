@@ -1372,8 +1372,10 @@ impl App {
                                             urlencode("轉換失敗回報"),
                                             urlencode(&body)
                                         );
-                                        let _ =
-                                            std::process::Command::new("explorer").arg(url).spawn();
+                                        // 用 egui 的 open_url（走系統預設瀏覽器）而非 explorer：
+                                        // explorer 對帶 query string（含 &）的網址解析不可靠，
+                                        // 可能開不了或只帶到 & 之前
+                                        ctx.open_url(egui::OpenUrl::new_tab(url));
                                     }
                                     if ui
                                         .small_button("📋 複製錯誤")
