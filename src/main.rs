@@ -3036,10 +3036,15 @@ fn run_conversion(
     }
 
     // 字幕：每個段落產生一段 drawtext，用時間區間涵蓋該段照片
+    let out_fps = if animated { OUT_FPS } else { fps };
     let mut caption_files: Vec<PathBuf> = Vec::new();
     if let Some(font) = &subs.font {
         let fontsize = subs.style.size as f64 * h as f64 / 1080.0;
         let d = eff_dur;
+        // 以半個「輸出影格」為緩衝，準確涵蓋第 s ~ e 張照片的所有格；
+        // 動態模式輸出為 30fps，若以照片時長的比例當緩衝，
+        // fps 低時字幕會提早出現/消失（如每張 1 秒會早 0.25 秒）
+        let buf = 0.5 / out_fps as f64;
         for (k, (s, e, text)) in subs.entries.iter().enumerate() {
             let text = text.trim_end();
             if text.is_empty() {
@@ -3047,8 +3052,7 @@ fn run_conversion(
             }
             let cap_path = std::env::temp_dir().join(format!("photo2video_cap_{k}.txt"));
             std::fs::write(&cap_path, text).map_err(|e| format!("無法寫入字幕暫存檔：{e}"))?;
-            // 以半格時間為緩衝，準確涵蓋第 s ~ e 張照片的所有格
-            let enable = (*s as f64 * d - d * 0.25, (*e as f64 + 1.0) * d - d * 0.25);
+            let enable = (*s as f64 * d - buf, (*e as f64 + 1.0) * d - buf);
             vf.push(',');
             vf.push_str(&drawtext_filter(
                 font,
@@ -3077,7 +3081,6 @@ fn run_conversion(
     }
     vf.push_str(",setsar=1,format=yuv420p");
 
-    let out_fps = if animated { OUT_FPS } else { fps };
     let mut cmd = FfmpegCommand::new();
     cmd.arg("-y")
         .args(["-filter_threads", &filter_threads()])
