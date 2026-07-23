@@ -2087,7 +2087,11 @@ impl App {
         let cur = cur_idx + 1;
         let style = self.sub_style.clone();
         let res_h = self.resolution.h as f32;
-        let p = ui.painter().with_clip_rect(card);
+        // 文字內容裁切到畫布（與輸出一致：輸出只到畫面邊界，溢出補邊黑邊的部分
+        // 會被切掉，預覽若畫到黑邊區就會所見非所得）；選取框與把手則裁切到整張
+        // 卡片，文字靠邊時把手才不會一起被切掉、仍可操作
+        let p = ui.painter().with_clip_rect(img);
+        let chrome = ui.painter().with_clip_rect(card);
         let scale = img.height() / 1080.0;
         let ow_screen = style.outline_w as f32 * img.height() / res_h;
 
@@ -2193,7 +2197,7 @@ impl App {
                     .map(|v| center + rot_vec(*v, angle))
                     .collect();
                 for i in 0..4 {
-                    p.line_segment(
+                    chrome.line_segment(
                         [corners[i], corners[(i + 1) % 4]],
                         egui::Stroke::new(1.5, theme::ACCENT),
                     );
@@ -2202,8 +2206,8 @@ impl App {
                 // 角落縮放把手
                 for (ci, c) in corners.iter().enumerate() {
                     let vis = egui::Rect::from_center_size(*c, egui::vec2(9.0, 9.0));
-                    p.rect_filled(vis, 2, egui::Color32::WHITE);
-                    p.rect_stroke(
+                    chrome.rect_filled(vis, 2, egui::Color32::WHITE);
+                    chrome.rect_stroke(
                         vis,
                         2,
                         egui::Stroke::new(1.5, theme::ACCENT),
@@ -2236,9 +2240,9 @@ impl App {
                 // 旋轉把手（頂邊中點向外延伸的圓形）
                 let top_mid = center + rot_vec(egui::vec2(0.0, -ext.y), angle);
                 let handle = center + rot_vec(egui::vec2(0.0, -ext.y - 22.0), angle);
-                p.line_segment([top_mid, handle], egui::Stroke::new(1.5, theme::ACCENT));
-                p.circle_filled(handle, 5.5, theme::ACCENT);
-                p.circle_stroke(handle, 5.5, egui::Stroke::new(1.5, egui::Color32::WHITE));
+                chrome.line_segment([top_mid, handle], egui::Stroke::new(1.5, theme::ACCENT));
+                chrome.circle_filled(handle, 5.5, theme::ACCENT);
+                chrome.circle_stroke(handle, 5.5, egui::Stroke::new(1.5, egui::Color32::WHITE));
                 let rresp = ui.interact(
                     egui::Rect::from_center_size(handle, egui::vec2(16.0, 16.0)),
                     id.with("rotate"),
