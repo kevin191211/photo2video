@@ -3527,6 +3527,11 @@ fn run_cli(args: &[String]) -> Result<(), String> {
     }
     let dir = PathBuf::from(&args[0]);
     let fps: u32 = args[1].parse().map_err(|_| "fps 必須是正整數".to_string())?;
+    // fps=0 會讓每張顯示秒數變成 1/0=inf，寫進 concat 清單使 ffmpeg 直接失敗；
+    // 與 GUI 一致限制在 1~60
+    if !(1..=60).contains(&fps) {
+        return Err("fps 必須介於 1 到 60".into());
+    }
     let output = PathBuf::from(&args[2]);
 
     let mut photos = collect_images_in_dir(&dir);
