@@ -1732,10 +1732,7 @@ impl App {
                         );
                         ui.spacing_mut().slider_width =
                             (ui.available_width() - 44.0).max(60.0);
-                        let resp = ui.add(
-                            egui::Slider::new(&mut entry.rot, -180.0..=180.0)
-                                .show_value(false),
-                        );
+                        let resp = drop_slider(ui, &mut entry.rot, -180.0, 180.0);
                         if resp.hovered()
                             && ui.input(|i| {
                                 i.pointer
@@ -2819,8 +2816,6 @@ fn apply_theme(ctx: &egui::Context) {
     v.selection.bg_fill = theme::ACCENT;
     v.selection.stroke = Stroke::new(1.0, Color32::WHITE);
     v.slider_trailing_fill = false;
-    // 滑桿把手改為細直線（寬高比 = 寬/高）
-    v.handle_shape = egui::style::HandleShape::Rect { aspect_ratio: 0.25 };
     v.hyperlink_color = theme::ACCENT;
 
     v.widgets.noninteractive.bg_fill = theme::PANEL;
@@ -2933,6 +2928,53 @@ fn primary_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Respons
     .inner
 }
 
+/// 自訂滑桿：細軌道 + 水滴形把手（尖端朝上、圓弧在下），點擊或拖曳皆可調整
+fn drop_slider(ui: &mut egui::Ui, value: &mut f32, min: f32, max: f32) -> egui::Response {
+    let width = ui.spacing().slider_width;
+    let (rect, mut resp) =
+        ui.allocate_exact_size(egui::vec2(width, 18.0), egui::Sense::click_and_drag());
+    if resp.dragged() || resp.clicked() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let t = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            let new = min + t * (max - min);
+            if new != *value {
+                *value = new;
+                resp.mark_changed();
+            }
+        }
+    }
+    let t = ((*value - min) / (max - min)).clamp(0.0, 1.0);
+    let cx = rect.left() + t * rect.width();
+    let cy = rect.center().y;
+    let p = ui.painter();
+    p.hline(rect.x_range(), cy, egui::Stroke::new(2.0, theme::CARD_HOVER));
+    let fill = if resp.dragged() {
+        theme::ACCENT
+    } else if resp.hovered() {
+        egui::Color32::WHITE
+    } else {
+        egui::Color32::from_rgb(0xC8, 0xCA, 0xD2)
+    };
+    let r = 4.0;
+    let bulb = egui::pos2(cx, cy + 2.5);
+    let apex = egui::pos2(cx, cy - 6.5);
+    p.circle_filled(bulb, r, fill);
+    p.add(egui::Shape::convex_polygon(
+        vec![apex, egui::pos2(cx - r, bulb.y), egui::pos2(cx + r, bulb.y)],
+        fill,
+        egui::Stroke::NONE,
+    ));
+    resp
+}
+
+/// drop_slider 的整數版本
+fn drop_slider_i32(ui: &mut egui::Ui, value: &mut i32, min: i32, max: i32) -> egui::Response {
+    let mut f = *value as f32;
+    let resp = drop_slider(ui, &mut f, min as f32, max as f32);
+    *value = f.round() as i32;
+    resp
+}
+
 /// 調色滑桿：左標籤、右數值，連點兩下歸零
 fn adj_slider(ui: &mut egui::Ui, value: &mut i32, label: &str) {
     ui.horizontal(|ui| {
@@ -2945,7 +2987,7 @@ fn adj_slider(ui: &mut egui::Ui, value: &mut i32, label: &str) {
             theme::TEXT_WEAK,
         );
         ui.spacing_mut().slider_width = (ui.available_width() - 44.0).max(60.0);
-        let resp = ui.add(egui::Slider::new(value, -100..=100).show_value(false));
+        let resp = drop_slider_i32(ui, value, -100, 100);
         // 滑桿是拖曳型元件，double_clicked() 不會觸發，須自行偵測雙擊
         let double_clicked = resp.hovered()
             && ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
@@ -2976,7 +3018,7 @@ fn slider_row(ui: &mut egui::Ui, value: &mut i32, min: i32, max: i32, label: &st
             theme::TEXT_WEAK,
         );
         ui.spacing_mut().slider_width = (ui.available_width() - 40.0).max(60.0);
-        ui.add(egui::Slider::new(value, min..=max).show_value(false));
+        drop_slider_i32(ui, value, min, max);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(8.0);
             ui.label(
