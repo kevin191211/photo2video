@@ -2455,6 +2455,22 @@ impl Drop for App {
         if self.fps_pending_save.is_some() {
             save_fps(self.fps);
         }
+        clean_own_temp_files();
+    }
+}
+
+/// 清掉本行程建立的暫存檔（預覽底圖 BMP 等）。執行期間預覽底圖由 4 槽 LRU
+/// 汰換刪除，但關閉時當下留著的最多 4 個不會清；加上檔名帶行程 ID 做多實例
+/// 隔離，每次啟動都是新 pid，舊檔會永遠成為孤兒累積在暫存資料夾。
+/// 只刪「本行程 pid 前綴」的檔案，不會動到其他正在執行的實例
+fn clean_own_temp_files() {
+    let prefix = format!("photo2video_{}_", std::process::id());
+    if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
     }
 }
 
