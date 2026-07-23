@@ -2661,8 +2661,10 @@ impl eframe::App for App {
         });
         if !dropped.is_empty() && !self.is_working() {
             let mut files = Vec::new();
+            let mut any_dir = false;
             for p in dropped {
                 if p.is_dir() {
+                    any_dir = true;
                     files.extend(collect_images_in_dir(&p));
                 } else if is_audio(&p) {
                     // 拖入音訊檔＝設定為背景音樂
@@ -2670,6 +2672,10 @@ impl eframe::App for App {
                 } else {
                     files.push(p);
                 }
+            }
+            // 拖入的是資料夾卻掃不到任何照片：與用按鈕選資料夾一致地提示
+            if any_dir && files.is_empty() {
+                self.import_found_nothing = true;
             }
             self.add_photos(files);
         }
