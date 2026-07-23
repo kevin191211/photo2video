@@ -470,8 +470,11 @@ fn drawtext_filter(
     y_frac: f32,
     enable: Option<(f64, f64)>,
 ) -> String {
+    // expansion=none：文字完全照字面輸出。預設的 normal 展開會把內容裡的
+    // %{...} 當內建變數、% 觸發 strftime，使用者打「特價 50% off」「{重點}」
+    // 之類的文字會掉字甚至讓整個轉檔失敗；檔案中的真實換行仍正常斷行
     let mut f = format!(
-        "drawtext=fontfile='{}':textfile='{}':fontsize={:.0}:fontcolor={}:borderw={}:bordercolor={}:x=(w*{:.4}-text_w/2):y=(h*{:.4}-text_h/2)",
+        "drawtext=expansion=none:fontfile='{}':textfile='{}':fontsize={:.0}:fontcolor={}:borderw={}:bordercolor={}:x=(w*{:.4}-text_w/2):y=(h*{:.4}-text_h/2)",
         ff_path_escape(fontfile),
         ff_path_escape(textfile),
         fontsize.max(1.0),
