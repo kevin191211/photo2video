@@ -3458,8 +3458,11 @@ fn run_conversion(
             cmd.args(["-map", "0:v", "-map", "1:a"]);
         }
         let mut af = format!("volume={:.3}", m.volume.max(0) as f64 / 100.0);
-        if m.fade_out && total_secs > 3.0 {
-            af.push_str(&format!(",afade=t=out:st={:.3}:d=2", total_secs - 2.0));
+        // 結尾淡出：最多 2 秒；短片按總長一半縮短，才不會比影片還長。
+        // 原本只在 >3 秒才淡出，短片勾了淡出卻毫無效果（設定被忽略）
+        if m.fade_out && total_secs > 1.0 {
+            let fd = (total_secs * 0.5).min(2.0);
+            af.push_str(&format!(",afade=t=out:st={:.3}:d={fd:.3}", total_secs - fd));
         }
         cmd.args(["-af", &af]);
         if matches!(format, OutputFormat::Webm) {
