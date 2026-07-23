@@ -3337,6 +3337,21 @@ fn run_conversion(
         return Err("沒有照片可轉換".into());
     }
 
+    // 背景音樂放在隨身碟/網路磁碟且已移除時，先給明確訊息，
+    // 不要等 ffmpeg 編碼到一半才以難懂的錯誤中斷、白費前面的時間
+    if let Some(m) = &fx.music {
+        if !m.path.exists() {
+            let name = m
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| m.path.display().to_string());
+            return Err(format!(
+                "找不到背景音樂檔案「{name}」，可能已被移除或所在磁碟未連接"
+            ));
+        }
+    }
+
     // 第一次執行時自動下載 ffmpeg
     ensure_ffmpeg(|| {
         send(WorkerMsg::Status(
