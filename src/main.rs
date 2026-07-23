@@ -3702,6 +3702,23 @@ fn run_cli(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// release 版是 windows 子系統（無主控台），CLI 模式在終端機互動執行、且輸出
+/// 未被重導向時，println! 會無處可去，使用者看不到進度與結果。附加到父行程
+/// （cmd/powershell）的主控台讓輸出可見；若沒有父主控台（如雙擊執行），
+/// AttachConsole 會失敗、屬無害
+#[cfg(windows)]
+fn attach_parent_console() {
+    extern "system" {
+        fn AttachConsole(dw_process_id: u32) -> i32;
+    }
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+#[cfg(not(windows))]
+fn attach_parent_console() {}
+
 /// 載入內嵌的視窗圖示（標題列與工作列用）
 fn load_app_icon() -> egui::IconData {
     let img = image::load_from_memory(include_bytes!("../assets/icon_256.png"))
@@ -3726,6 +3743,8 @@ fn main() -> eframe::Result {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 && args[1] == "--cli" {
+        // 需在任何 println! 之前附加主控台，否則 release 版的 CLI 輸出會看不到
+        attach_parent_console();
         if let Err(e) = run_cli(&args[2..]) {
             eprintln!("錯誤：{e}");
             std::process::exit(1);
