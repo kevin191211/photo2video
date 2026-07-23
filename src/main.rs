@@ -3346,7 +3346,11 @@ fn run_conversion(
 
     send(WorkerMsg::Status("建立照片清單…".into()));
 
-    let animated = fx.ken_burns || fx.transition != Transition::None;
+    // AVI 容器在低幀率＋音訊下，muxer 會把最後一格多撐一兩個影格週期，使影片時長
+    // 比預期長（fps 越低越明顯，2fps 可差近 1 秒）。升頻到 30fps 讓誤差縮到一個影格
+    // 以內；重複的靜態影格在 H264 幾乎不增加檔案大小
+    let avi_with_audio = matches!(format, OutputFormat::Avi) && fx.music.is_some();
+    let animated = fx.ken_burns || fx.transition != Transition::None || avi_with_audio;
 
     // 每張照片的顯示秒數。Ken Burns 用 zoompan 以「每張輸出 kb_frames 格」計時，
     // 需把實際秒數對齊到 30fps 的格數，字幕與轉場時間點才不會累積漂移
