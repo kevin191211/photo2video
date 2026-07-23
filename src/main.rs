@@ -3474,18 +3474,8 @@ fn run_conversion(
     }
     tail.push_str("setsar=1,format=yuv420p");
 
-    let mut cmd = FfmpegCommand::new();
-    cmd.arg("-y")
-        .args(["-filter_threads", &filter_threads()])
-        .args(["-f", "concat", "-safe", "0"])
-        .input(list_path.to_string_lossy());
-    // 背景音樂：無限循環讀取，總長由 -t 截止（音樂短會循環、長會被裁切）
-    if let Some(m) = &fx.music {
-        cmd.args(["-stream_loop", "-1"]);
-        cmd.input(m.path.to_string_lossy());
-    }
-
-    if use_complex {
+    // 先把視訊濾鏡定案：有旋轉文字走 filter_complex，否則走 -vf
+    let filter_complex = if use_complex {
         // 依清單順序逐段套用：無旋轉直接在鏈上 drawtext；旋轉則畫在全幅透明畫布
         // 中央 → 以畫布中心旋轉 → overlay 到目標位置。順序與預覽一致，重疊時
         // 後加入的文字才會正確蓋在先加入的之上（不再一律讓旋轉文字浮在最上層）
@@ -3513,46 +3503,106 @@ fn run_conversion(
             cur = next;
         }
         fc.push_str(&format!("[{cur}]{tail}[vout]"));
-        cmd.args(["-filter_complex", &fc]);
-        cmd.args(["-map", "[vout]"]);
+        Some(fc)
     } else {
         vf.push(',');
         vf.push_str(&tail);
-        cmd.args(["-vf", &vf]);
-    }
+        None
+    };
 
-    cmd.args(["-r", &out_fps.to_string()])
-        // 精確限制總長度，避免 concat 清單重複最後一張造成多出一格
-        .args(["-t", &format!("{total_secs}")]);
-
-    if let Some(m) = &fx.music {
-        if use_complex {
-            cmd.args(["-map", "1:a"]);
-        } else {
-            cmd.args(["-map", "0:v", "-map", "1:a"]);
-        }
+    // 音訊濾鏡（有背景音樂時）
+    let audio_filter = fx.music.as_ref().map(|m| {
         let mut af = format!("volume={:.3}", m.volume.max(0) as f64 / 100.0);
-        // 結尾淡出：最多 2 秒；短片按總長一半縮短，才不會比影片還長。
-        // 原本只在 >3 秒才淡出，短片勾了淡出卻毫無效果（設定被忽略）
+        // 結尾淡出：最多 2 秒；短片按總長一半縮短，才不會比影片還長
         if m.fade_out && total_secs > 1.0 {
             let fd = (total_secs * 0.5).min(2.0);
             af.push_str(&format!(",afade=t=out:st={:.3}:d={fd:.3}", total_secs - fd));
         }
-        cmd.args(["-af", &af]);
-        if matches!(format, OutputFormat::Webm) {
-            cmd.args(["-c:a", "libopus", "-b:a", "128k"]);
-        } else {
-            cmd.args(["-c:a", "aac", "-b:a", "192k"]);
-        }
-    }
+        af
+    });
 
-    match format {
+    let total_frames = if animated {
+        (total_secs * OUT_FPS as f64) as f32
+    } else {
+        photos.len() as f32
+    };
+    let out_fps_str = out_fps.to_string();
+    let total_secs_str = format!("{total_secs}");
+    let ft = filter_threads();
+
+    // 以指定的視訊編碼器參數組裝並執行一次 ffmpeg。抽成閉包，硬體編碼器失敗時
+    // 可用軟體編碼器重跑同一組濾鏡設定
+    let run_once = |video_codec: &[&str]| -> Result<(), String> {
+        let mut cmd = FfmpegCommand::new();
+        cmd.arg("-y")
+            .args(["-filter_threads", &ft])
+            .args(["-f", "concat", "-safe", "0"])
+            .input(list_path.to_string_lossy());
+        // 背景音樂：無限循環讀取，總長由 -t 截止（音樂短會循環、長會被裁切）
+        if let Some(m) = &fx.music {
+            cmd.args(["-stream_loop", "-1"]);
+            cmd.input(m.path.to_string_lossy());
+        }
+        if let Some(fc) = &filter_complex {
+            cmd.args(["-filter_complex", fc]).args(["-map", "[vout]"]);
+        } else {
+            cmd.args(["-vf", &vf]);
+        }
+        cmd.args(["-r", &out_fps_str]).args(["-t", &total_secs_str]);
+        if let Some(af) = &audio_filter {
+            if filter_complex.is_some() {
+                cmd.args(["-map", "1:a"]);
+            } else {
+                cmd.args(["-map", "0:v", "-map", "1:a"]);
+            }
+            cmd.args(["-af", af]);
+            if matches!(format, OutputFormat::Webm) {
+                cmd.args(["-c:a", "libopus", "-b:a", "128k"]);
+            } else {
+                cmd.args(["-c:a", "aac", "-b:a", "192k"]);
+            }
+        }
+        cmd.args(video_codec);
+        cmd.output(output.to_string_lossy());
+
+        let mut error_log: Vec<String> = Vec::new();
+        let mut child = cmd.spawn().map_err(|e| format!("FFmpeg 啟動失敗：{e}"))?;
+        let iter = child
+            .iter()
+            .map_err(|e| format!("FFmpeg 輸出讀取失敗：{e}"))?;
+        for event in iter {
+            match event {
+                FfmpegEvent::Progress(p) => {
+                    let frac = (p.frame as f32 / total_frames).clamp(0.0, 1.0);
+                    send(WorkerMsg::Progress(frac));
+                }
+                FfmpegEvent::Log(level, msg) => {
+                    use ffmpeg_sidecar::event::LogLevel;
+                    if matches!(level, LogLevel::Error | LogLevel::Fatal) {
+                        error_log.push(msg);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let status = child.wait().map_err(|e| format!("FFmpeg 執行失敗：{e}"))?;
+        if !status.success() {
+            let detail = error_log.join("\n");
+            return Err(if detail.is_empty() {
+                "FFmpeg 轉換失敗".into()
+            } else {
+                format!("FFmpeg 轉換失敗：{detail}")
+            });
+        }
+        Ok(())
+    };
+
+    let result = match format {
         OutputFormat::Webm => {
             send(WorkerMsg::Status("轉換中…（編碼器：VP9）".into()));
-            cmd.args([
-                "-c:v", "libvpx-vp9", "-b:v", "0", "-crf", "30", "-cpu-used", "5", "-row-mt",
-                "1",
-            ]);
+            run_once(&[
+                "-c:v", "libvpx-vp9", "-b:v", "0", "-crf", "30", "-cpu-used", "5", "-row-mt", "1",
+            ])
         }
         _ => {
             send(WorkerMsg::Status("偵測硬體編碼器…".into()));
@@ -3561,54 +3611,26 @@ fn run_conversion(
                 "轉換中…（編碼器：{}）",
                 enc.display_name()
             )));
-            cmd.args(enc.codec_args());
+            let first = run_once(&enc.codec_args());
+            // 硬體編碼器可能因驅動/負載不穩而中途失敗（如 AMD AMF 的
+            // SubmitInput 錯誤）；此時自動退回軟體 libx264 重跑，確保能轉出
+            if first.is_err() && enc != H264Encoder::Software {
+                send(WorkerMsg::Status(
+                    "硬體編碼器失敗，改用軟體編碼重試…".into(),
+                ));
+                send(WorkerMsg::Progress(0.0));
+                run_once(&H264Encoder::Software.codec_args())
+            } else {
+                first
+            }
         }
-    }
-
-    cmd.output(output.to_string_lossy());
-
-    let total_frames = if animated {
-        (total_secs * OUT_FPS as f64) as f32
-    } else {
-        photos.len() as f32
     };
-    let mut error_log: Vec<String> = Vec::new();
 
-    let mut child = cmd.spawn().map_err(|e| format!("FFmpeg 啟動失敗：{e}"))?;
-    let iter = child
-        .iter()
-        .map_err(|e| format!("FFmpeg 輸出讀取失敗：{e}"))?;
-
-    for event in iter {
-        match event {
-            FfmpegEvent::Progress(p) => {
-                let frac = (p.frame as f32 / total_frames).clamp(0.0, 1.0);
-                send(WorkerMsg::Progress(frac));
-            }
-            FfmpegEvent::Log(level, msg) => {
-                use ffmpeg_sidecar::event::LogLevel;
-                if matches!(level, LogLevel::Error | LogLevel::Fatal) {
-                    error_log.push(msg);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let status = child.wait().map_err(|e| format!("FFmpeg 執行失敗：{e}"))?;
     let _ = std::fs::remove_file(&list_path);
     for f in &caption_files {
         let _ = std::fs::remove_file(f);
     }
-
-    if !status.success() {
-        let detail = error_log.join("\n");
-        return Err(if detail.is_empty() {
-            "FFmpeg 轉換失敗".into()
-        } else {
-            format!("FFmpeg 轉換失敗：{detail}")
-        });
-    }
+    result?;
 
     send(WorkerMsg::Progress(1.0));
     Ok(())
