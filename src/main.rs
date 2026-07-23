@@ -3629,6 +3629,11 @@ fn run_cli(args: &[String]) -> Result<(), String> {
     }
     let mut output = PathBuf::from(&args[2]);
 
+    // 先分辨「找不到資料夾」與「資料夾內沒有圖片」：collect_images_in_dir 對
+    // 不存在或非資料夾的路徑會靜默回傳空，直接沿用會誤報成「沒有圖片」
+    if !dir.is_dir() {
+        return Err(format!("找不到資料夾（或指定的不是資料夾）：{}", dir.display()));
+    }
     let mut photos = collect_images_in_dir(&dir);
     natural_sort(&mut photos);
     if photos.is_empty() {
