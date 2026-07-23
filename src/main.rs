@@ -984,7 +984,7 @@ impl App {
 
     fn start_convert(&mut self, ctx: &egui::Context) {
         let ext = self.format.ext();
-        let Some(output) = rfd::FileDialog::new()
+        let Some(mut output) = rfd::FileDialog::new()
             .set_title("選擇影片儲存位置")
             .add_filter(format!("{} 影片", ext.to_uppercase()), &[ext])
             .set_file_name(format!("output.{ext}"))
@@ -992,6 +992,29 @@ impl App {
         else {
             return;
         };
+
+        // 確保輸出副檔名與所選格式一致：對話框允許使用者改掉或拿掉副檔名，
+        // 但無副檔名時 ffmpeg 無法判斷容器會直接失敗，副檔名與格式不符則會
+        // 產生不相容檔案（如 VP9 塞進 mp4）。已正確則不動；是其他影片副檔名
+        // 就替換；無副檔名或非影片副檔名則附加，保留使用者輸入的檔名
+        let known = ["mp4", "mkv", "mov", "avi", "webm"];
+        match output
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+        {
+            Some(e) if e == ext => {}
+            Some(e) if known.contains(&e.as_str()) => {
+                output.set_extension(ext);
+            }
+            _ => {
+                let name = output
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                output.set_file_name(format!("{name}.{ext}"));
+            }
+        }
 
         let (tx, rx) = std::sync::mpsc::channel();
         self.rx = Some(rx);
