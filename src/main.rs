@@ -1612,8 +1612,25 @@ impl App {
         ui.add_space(10.0);
 
         group_label(ui, "白平衡");
-        adj_slider(ui, &mut self.adj.temp, "色溫");
-        adj_slider(ui, &mut self.adj.tint, "色調");
+        // 滑桿方向與濾鏡一致：色溫 + 偏暖（黃）、色調 + 偏洋紅
+        adj_slider_rail(
+            ui,
+            &mut self.adj.temp,
+            "色溫",
+            Some((
+                egui::Color32::from_rgb(0x50, 0x78, 0xE0),
+                egui::Color32::from_rgb(0xE0, 0xC8, 0x46),
+            )),
+        );
+        adj_slider_rail(
+            ui,
+            &mut self.adj.tint,
+            "色調",
+            Some((
+                egui::Color32::from_rgb(0x55, 0xC0, 0x50),
+                egui::Color32::from_rgb(0xD8, 0x5C, 0xC8),
+            )),
+        );
         ui.add_space(10.0);
 
         group_label(ui, "光線");
@@ -2930,6 +2947,17 @@ fn primary_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Respons
 
 /// 自訂滑桿：細軌道 + 水滴形把手（尖端朝上、圓弧在下），點擊或拖曳皆可調整
 fn drop_slider(ui: &mut egui::Ui, value: &mut f32, min: f32, max: f32) -> egui::Response {
+    drop_slider_rail(ui, value, min, max, None)
+}
+
+/// rail 給 Some((左色, 右色)) 時，軌道畫成水平漸層（如白平衡的藍→黃）
+fn drop_slider_rail(
+    ui: &mut egui::Ui,
+    value: &mut f32,
+    min: f32,
+    max: f32,
+    rail: Option<(egui::Color32, egui::Color32)>,
+) -> egui::Response {
     let width = ui.spacing().slider_width;
     let (rect, mut resp) =
         ui.allocate_exact_size(egui::vec2(width, 18.0), egui::Sense::click_and_drag());
@@ -2947,7 +2975,25 @@ fn drop_slider(ui: &mut egui::Ui, value: &mut f32, min: f32, max: f32) -> egui::
     let cx = rect.left() + t * rect.width();
     let cy = rect.center().y;
     let p = ui.painter();
-    p.hline(rect.x_range(), cy, egui::Stroke::new(2.0, theme::CARD_HOVER));
+    match rail {
+        Some((c0, c1)) => {
+            let r = egui::Rect::from_min_max(
+                egui::pos2(rect.left(), cy - 2.0),
+                egui::pos2(rect.right(), cy + 2.0),
+            );
+            let mut mesh = egui::Mesh::default();
+            mesh.colored_vertex(r.left_top(), c0);
+            mesh.colored_vertex(r.right_top(), c1);
+            mesh.colored_vertex(r.right_bottom(), c1);
+            mesh.colored_vertex(r.left_bottom(), c0);
+            mesh.add_triangle(0, 1, 2);
+            mesh.add_triangle(0, 2, 3);
+            p.add(egui::Shape::mesh(mesh));
+        }
+        None => {
+            p.hline(rect.x_range(), cy, egui::Stroke::new(2.0, theme::CARD_HOVER));
+        }
+    }
     let fill = if resp.dragged() {
         theme::ACCENT
     } else if resp.hovered() {
@@ -2977,6 +3023,16 @@ fn drop_slider_i32(ui: &mut egui::Ui, value: &mut i32, min: i32, max: i32) -> eg
 
 /// 調色滑桿：左標籤、右數值，連點兩下歸零
 fn adj_slider(ui: &mut egui::Ui, value: &mut i32, label: &str) {
+    adj_slider_rail(ui, value, label, None)
+}
+
+/// 帶漸層軌道的調色滑桿（白平衡用：色溫 藍→黃、色調 綠→洋紅）
+fn adj_slider_rail(
+    ui: &mut egui::Ui,
+    value: &mut i32,
+    label: &str,
+    rail: Option<(egui::Color32, egui::Color32)>,
+) {
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(52.0, 18.0), egui::Sense::hover());
         ui.painter().text(
@@ -2987,7 +3043,12 @@ fn adj_slider(ui: &mut egui::Ui, value: &mut i32, label: &str) {
             theme::TEXT_WEAK,
         );
         ui.spacing_mut().slider_width = (ui.available_width() - 44.0).max(60.0);
-        let resp = drop_slider_i32(ui, value, -100, 100);
+        let resp = {
+            let mut f = *value as f32;
+            let r = drop_slider_rail(ui, &mut f, -100.0, 100.0, rail);
+            *value = f.round() as i32;
+            r
+        };
         // 滑桿是拖曳型元件，double_clicked() 不會觸發，須自行偵測雙擊
         let double_clicked = resp.hovered()
             && ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
