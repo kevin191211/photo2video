@@ -314,6 +314,12 @@ fn check_latest_release() -> Result<Option<String>, String> {
     Ok((latest > current).then_some(tag))
 }
 
+/// 暫存檔路徑加上行程 ID：同時開兩個程式實例（各轉各的照片）時，
+/// 不會互踩對方的照片清單、字幕檔與預覽底圖
+fn temp_path(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("photo2video_{}_{name}", std::process::id()))
+}
+
 /// 設定檔路徑：%APPDATA%\photo2video\config.json
 fn config_path() -> PathBuf {
     std::env::var_os("APPDATA")
@@ -3007,10 +3013,7 @@ fn prefetch_preview_base(photo: PathBuf, pw: u32, ph: u32) {
             file: None,
             serial,
         });
-        (
-            std::env::temp_dir().join(format!("photo2video_prev_base_{serial}.bmp")),
-            serial,
-        )
+        (temp_path(&format!("prev_base_{serial}.bmp")), serial)
     };
     let ok = (|| {
         let mut cmd = FfmpegCommand::new();
@@ -3208,7 +3211,7 @@ fn run_conversion(
         list.push_str(&format!("file '{}'\n", concat_escape(last)));
     }
 
-    let list_path = std::env::temp_dir().join("photo2video_list.txt");
+    let list_path = temp_path("list.txt");
     std::fs::write(&list_path, &list).map_err(|e| format!("無法寫入暫存清單：{e}"))?;
 
     let (w, h) = (res.w, res.h);
@@ -3253,7 +3256,7 @@ fn run_conversion(
             if text.is_empty() {
                 continue;
             }
-            let cap_path = std::env::temp_dir().join(format!("photo2video_cap_{k}.txt"));
+            let cap_path = temp_path(&format!("cap_{k}.txt"));
             std::fs::write(&cap_path, text).map_err(|e| format!("無法寫入字幕暫存檔：{e}"))?;
             let enable = (en.s as f64 * d - buf, (en.e as f64 + 1.0) * d - buf);
             let fontsize = en.size as f64 * h as f64 / 1080.0;
