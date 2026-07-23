@@ -1954,6 +1954,21 @@ impl App {
             );
         }
 
+        // 首次使用下載 ffmpeg（約 80MB）沒有進度條，這裡覆蓋一條說明橫幅
+        // （即使佔位縮圖已顯示也蓋在上面），慢速網路下才不會被誤認為當機
+        if FFMPEG_DOWNLOADING.load(Ordering::Relaxed) {
+            let band = egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width(), 34.0));
+            p.rect_filled(band, 0, egui::Color32::from_black_alpha(180));
+            p.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "首次使用，正在下載影片處理元件（約 80MB），請稍候…",
+                egui::FontId::proportional(13.0),
+                theme::TEXT,
+            );
+            ui.ctx().request_repaint_after(Duration::from_millis(300));
+        }
+
         // 左上角：檔名資訊
         if let Some(i) = self.preview_selected {
             if let Some(photo) = self.photos.get(i) {
@@ -3078,6 +3093,10 @@ static FFMPEG_READY: AtomicBool = AtomicBool::new(false);
 /// 兩個 auto_download 並發會互踩同一個安裝目錄，留下損毀的 ffmpeg
 static FFMPEG_INIT: Mutex<()> = Mutex::new(());
 
+/// 正在下載 ffmpeg。預覽走的下載沒有進度提示，UI 靠這個旗標在預覽區
+/// 顯示「首次使用，正在下載…」而非只有一個轉圈，避免使用者以為當機
+static FFMPEG_DOWNLOADING: AtomicBool = AtomicBool::new(false);
+
 fn ensure_ffmpeg(on_download: impl Fn()) -> Result<(), String> {
     if FFMPEG_READY.load(Ordering::Relaxed) {
         return Ok(());
@@ -3089,7 +3108,10 @@ fn ensure_ffmpeg(on_download: impl Fn()) -> Result<(), String> {
     }
     if !ffmpeg_sidecar::command::ffmpeg_is_installed() {
         on_download();
-        ffmpeg_sidecar::download::auto_download().map_err(|e| format!("FFmpeg 下載失敗：{e}"))?;
+        FFMPEG_DOWNLOADING.store(true, Ordering::Relaxed);
+        let result = ffmpeg_sidecar::download::auto_download();
+        FFMPEG_DOWNLOADING.store(false, Ordering::Relaxed);
+        result.map_err(|e| format!("FFmpeg 下載失敗：{e}"))?;
     }
     FFMPEG_READY.store(true, Ordering::Relaxed);
     Ok(())
