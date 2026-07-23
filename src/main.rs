@@ -1821,7 +1821,16 @@ impl App {
                 }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let secs = self.photos.len() as f32 / self.fps as f32;
+                // 與實際輸出時長一致：Ken Burns 會把每張時長對齊到 30fps 的整數格
+                // （見 run_conversion 的 eff_dur），fps 無法整除 30 時直接用 張數/fps
+                // 會與成品有落差
+                let eff_dur = if self.ken_burns {
+                    let d = ((OUT_FPS as f64 / self.fps as f64).round() as i64).max(1);
+                    d as f64 / OUT_FPS as f64
+                } else {
+                    1.0 / self.fps as f64
+                };
+                let secs = self.photos.len() as f64 * eff_dur;
                 egui::Frame::default()
                     .fill(theme::CARD)
                     .corner_radius(12)
