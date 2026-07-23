@@ -87,8 +87,15 @@ struct Resolution {
 }
 
 impl Resolution {
+    /// w=h=0 為「原始像素」哨兵值：實際輸出尺寸依照片中最大寬高決定
+    /// （見 App::resolved_resolution），使用前必須先解析成具體尺寸
+    fn is_native(&self) -> bool {
+        self.w == 0
+    }
+
     fn label(&self) -> String {
         match (self.w, self.h) {
+            (0, 0) => "原始像素（依最大照片）".into(),
             (1280, 720) => "HD 1280 × 720".into(),
             (1920, 1080) => "Full HD 1920 × 1080".into(),
             (2560, 1440) => "2K 2560 × 1440".into(),
@@ -97,11 +104,12 @@ impl Resolution {
         }
     }
 
-    const ALL: [Resolution; 4] = [
+    const ALL: [Resolution; 5] = [
         Resolution { w: 1280, h: 720 },
         Resolution { w: 1920, h: 1080 },
         Resolution { w: 2560, h: 1440 },
         Resolution { w: 3840, h: 2160 },
+        Resolution { w: 0, h: 0 },
     ];
 }
 
@@ -632,6 +640,14 @@ struct App {
     state: ConvertState,
     rx: Option<Receiver<WorkerMsg>>,
     adj: Adjustments,
+    /// 個別照片的調色覆寫；沒有覆寫的照片沿用全域 adj
+    adj_overrides: HashMap<PathBuf, Adjustments>,
+    /// 縮圖列 Ctrl/Shift+點選 的多選照片（個別調色的目標）
+    multi_sel: HashSet<PathBuf>,
+    /// 多選調色時滑桿顯示的工作值；改動時寫入所有選取照片的覆寫
+    sel_adj: Adjustments,
+    /// 「原始像素」解析度的快取（照片中最大寬高）；照片增減時清除重算
+    native_res_cache: Option<Resolution>,
     sub_entries: Vec<SubtitleEntry>,
     sub_style: SubtitleStyle,
     /// 預覽區目前選取的文字（sub_entries 索引），用於顯示縮放/旋轉控制框
@@ -715,6 +731,10 @@ impl App {
             state: ConvertState::Idle,
             rx: None,
             adj: Adjustments::default(),
+            adj_overrides: HashMap::new(),
+            multi_sel: HashSet::new(),
+            sel_adj: Adjustments::default(),
+            native_res_cache: None,
             sub_entries: Vec::new(),
             sub_style: SubtitleStyle::default(),
             sel_text: None,
@@ -775,8 +795,8 @@ impl App {
     fn spawn_preview(&mut self, ctx: &egui::Context) {
         let Some(idx) = self.preview_selected else { return };
         let Some(photo) = self.photos.get(idx).cloned() else { return };
-        let adj = self.adj;
-        let res = self.resolution;
+        let adj = self.effective_adj(&photo);
+        let res = self.resolved_resolution();
         let (tx, rx) = std::sync::mpsc::channel();
         self.preview_rx = Some(rx);
         self.preview_dirty = false;
@@ -827,7 +847,7 @@ impl App {
             if let Some(i) = self.preview_selected {
                 if self.prefetch_for != Some(i) {
                     self.prefetch_for = Some(i);
-                    let (pw, ph) = preview_canvas(self.resolution);
+                    let (pw, ph) = preview_canvas(self.resolved_resolution());
                     for j in [i.checked_sub(1), Some(i + 1)].into_iter().flatten() {
                         if let Some(p) = self.photos.get(j) {
                             let p = p.clone();
@@ -873,6 +893,47 @@ impl App {
         }
     }
 
+    /// 這張照片實際生效的調色：有個別覆寫用覆寫，否則用全域
+    fn effective_adj(&self, photo: &Path) -> Adjustments {
+        self.adj_overrides.get(photo).copied().unwrap_or(self.adj)
+    }
+
+    /// 多選集合變動後，讓調色滑桿顯示第一張選取照片目前生效的調色
+    fn sync_sel_adj(&mut self) {
+        if let Some(p) = self.photos.iter().find(|p| self.multi_sel.contains(*p)) {
+            self.sel_adj = self.effective_adj(p);
+        }
+    }
+
+    /// 解析度選「原始像素」時，以照片中最大的寬與高為輸出解析度；
+    /// 讀取所有照片檔頭有成本，結果快取到照片增減時再重算
+    fn resolved_resolution(&mut self) -> Resolution {
+        if !self.resolution.is_native() {
+            return self.resolution;
+        }
+        if let Some(r) = self.native_res_cache {
+            return r;
+        }
+        let (mut w, mut h) = (0u32, 0u32);
+        for p in &self.photos {
+            if let Ok((pw, ph)) = image::image_dimensions(p) {
+                w = w.max(pw);
+                h = h.max(ph);
+            }
+        }
+        // 沒照片或全讀不到就退回 Full HD；編碼要求偶數尺寸
+        let r = if w == 0 || h == 0 {
+            Resolution { w: 1920, h: 1080 }
+        } else {
+            Resolution {
+                w: w.max(2) & !1,
+                h: h.max(2) & !1,
+            }
+        };
+        self.native_res_cache = Some(r);
+        r
+    }
+
     fn select_photo(&mut self, idx: Option<usize>) {
         if self.preview_selected != idx {
             self.preview_selected = idx;
@@ -893,6 +954,7 @@ impl App {
         if !files.is_empty() {
             self.import_found_nothing = false;
         }
+        self.native_res_cache = None;
         // 用 HashSet 去重；逐一 contains 是 O(n²)，加入數千張照片要數百萬次路徑比對
         let mut seen: HashSet<PathBuf> = self.photos.iter().cloned().collect();
         for f in files {
@@ -985,6 +1047,9 @@ impl App {
     fn clear_photos(&mut self) {
         self.photos.clear();
         self.thumbs.clear();
+        self.adj_overrides.clear();
+        self.multi_sel.clear();
+        self.native_res_cache = None;
         // 清掉還在排隊的解碼工作，工作池不再為已移除的照片做白工
         self.thumb_jobs.0.lock().unwrap().clear();
         self.preview_selected = None;
@@ -997,6 +1062,9 @@ impl App {
     fn remove_photo(&mut self, i: usize) {
         let removed = self.photos.remove(i);
         self.thumbs.remove(&removed);
+        self.adj_overrides.remove(&removed);
+        self.multi_sel.remove(&removed);
+        self.native_res_cache = None;
 
         // 文字段落以 1-based 照片編號綁定，移除照片後其後編號整體前移一位，
         // 段落須跟著調整，否則文字會靜默套到錯誤的照片上。
@@ -1105,8 +1173,9 @@ impl App {
         let photos = self.photos.clone();
         let fps = self.fps;
         let format = self.format;
-        let res = self.resolution;
+        let res = self.resolved_resolution();
         let adj = self.adj;
+        let adj_overrides = self.adj_overrides.clone();
         let total = self.photos.len();
         let subs = SubtitleJob {
             style: self.sub_style.clone(),
@@ -1149,7 +1218,18 @@ impl App {
                 let _ = tx.send(msg);
                 ctx.request_repaint();
             };
-            match run_conversion(&photos, fps, format, res, &adj, &subs, &fx, &output, &send) {
+            match run_conversion(
+                &photos,
+                fps,
+                format,
+                res,
+                &adj,
+                &adj_overrides,
+                &subs,
+                &fx,
+                &output,
+                &send,
+            ) {
                 Ok(()) => send(WorkerMsg::Done(output.clone())),
                 Err(e) => send(WorkerMsg::Error(e)),
             }
@@ -1590,64 +1670,101 @@ impl App {
     }
 
     fn ui_adjust_section(&mut self, ui: &mut egui::Ui) {
+        // 多選模式：滑桿改編輯 sel_adj，寫入所有選取照片的覆寫；否則編輯全域 adj
+        let scoped = !self.multi_sel.is_empty();
+        let mut work = if scoped { self.sel_adj } else { self.adj };
+        let mut changed = false;
+        let mut unpin = false;
+
+        let title = if scoped {
+            format!("調色（選取 {} 張）", self.multi_sel.len())
+        } else {
+            "調色".to_string()
+        };
         ui.horizontal(|ui| {
-            section_toggle(ui, "調色", &mut self.sec_adjust_open);
+            section_toggle(ui, &title, &mut self.sec_adjust_open);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if !self.adj.is_neutral() && ui.small_button("↺ 重設").clicked() {
-                    self.adj = Adjustments::default();
-                    self.mark_preview_dirty();
+                if !work.is_neutral() && ui.small_button("↺ 重設").clicked() {
+                    work = Adjustments::default();
+                    changed = true;
+                }
+                if scoped && ui.small_button("取消個別調色").clicked() {
+                    unpin = true;
                 }
             });
         });
-        if !self.sec_adjust_open {
-            return;
+
+        if self.sec_adjust_open {
+            let hint = if scoped {
+                "只套用到選取的照片；Ctrl+點縮圖增減選取，直接點縮圖離開多選"
+            } else {
+                "套用到每一張照片，滑桿連點兩下可歸零；Ctrl+點縮圖可只調特定照片"
+            };
+            ui.label(
+                egui::RichText::new(hint)
+                    .size(11.0)
+                    .color(theme::TEXT_WEAK),
+            );
+            ui.add_space(10.0);
+
+            let before = work;
+            group_label(ui, "白平衡");
+            // 滑桿方向與濾鏡一致：色溫 + 偏暖（黃）、色調 + 偏洋紅
+            adj_slider_rail(
+                ui,
+                &mut work.temp,
+                "色溫",
+                Some((
+                    egui::Color32::from_rgb(0x50, 0x78, 0xE0),
+                    egui::Color32::from_rgb(0xE0, 0xC8, 0x46),
+                )),
+            );
+            adj_slider_rail(
+                ui,
+                &mut work.tint,
+                "色調",
+                Some((
+                    egui::Color32::from_rgb(0x55, 0xC0, 0x50),
+                    egui::Color32::from_rgb(0xD8, 0x5C, 0xC8),
+                )),
+            );
+            ui.add_space(10.0);
+
+            group_label(ui, "光線");
+            adj_slider(ui, &mut work.exposure, "曝光度");
+            adj_slider(ui, &mut work.contrast, "對比");
+            adj_slider(ui, &mut work.brightness, "亮度");
+            adj_slider(ui, &mut work.shadows, "陰影");
+            adj_slider(ui, &mut work.whites, "白色");
+            adj_slider(ui, &mut work.blacks, "黑色");
+            ui.add_space(10.0);
+
+            group_label(ui, "質感與色彩");
+            adj_slider(ui, &mut work.clarity, "清晰度");
+            adj_slider(ui, &mut work.vibrance, "鮮豔度");
+            adj_slider(ui, &mut work.saturation, "飽和度");
+
+            if work != before {
+                changed = true;
+            }
         }
-        let before = self.adj;
 
-        ui.label(
-            egui::RichText::new("套用到影片中的每一張照片，滑桿連點兩下可歸零")
-                .size(11.0)
-                .color(theme::TEXT_WEAK),
-        );
-        ui.add_space(10.0);
-
-        group_label(ui, "白平衡");
-        // 滑桿方向與濾鏡一致：色溫 + 偏暖（黃）、色調 + 偏洋紅
-        adj_slider_rail(
-            ui,
-            &mut self.adj.temp,
-            "色溫",
-            Some((
-                egui::Color32::from_rgb(0x50, 0x78, 0xE0),
-                egui::Color32::from_rgb(0xE0, 0xC8, 0x46),
-            )),
-        );
-        adj_slider_rail(
-            ui,
-            &mut self.adj.tint,
-            "色調",
-            Some((
-                egui::Color32::from_rgb(0x55, 0xC0, 0x50),
-                egui::Color32::from_rgb(0xD8, 0x5C, 0xC8),
-            )),
-        );
-        ui.add_space(10.0);
-
-        group_label(ui, "光線");
-        adj_slider(ui, &mut self.adj.exposure, "曝光度");
-        adj_slider(ui, &mut self.adj.contrast, "對比");
-        adj_slider(ui, &mut self.adj.brightness, "亮度");
-        adj_slider(ui, &mut self.adj.shadows, "陰影");
-        adj_slider(ui, &mut self.adj.whites, "白色");
-        adj_slider(ui, &mut self.adj.blacks, "黑色");
-        ui.add_space(10.0);
-
-        group_label(ui, "質感與色彩");
-        adj_slider(ui, &mut self.adj.clarity, "清晰度");
-        adj_slider(ui, &mut self.adj.vibrance, "鮮豔度");
-        adj_slider(ui, &mut self.adj.saturation, "飽和度");
-
-        if self.adj != before {
+        if unpin {
+            // 移除選取照片的覆寫，回到跟隨全域調色
+            for p in &self.multi_sel {
+                self.adj_overrides.remove(p);
+            }
+            self.sync_sel_adj();
+            self.mark_preview_dirty();
+        } else if changed {
+            if scoped {
+                self.sel_adj = work;
+                for p in &self.multi_sel {
+                    self.adj_overrides.insert(p.clone(), work);
+                }
+            } else {
+                self.adj = work;
+            }
             self.mark_preview_dirty();
         }
     }
@@ -2093,6 +2210,9 @@ impl App {
             egui::StrokeKind::Inside,
         );
 
+        // 先解析輸出解析度（resolved_resolution 需要 &mut self 更新快取），
+        // 再借用預覽貼圖
+        let out_res = self.resolved_resolution();
         // 渲染完成前先用縮圖放大當佔位，切換照片時畫面不留白
         let placeholder = match (self.preview_tex.is_none(), self.preview_selected) {
             (true, Some(i)) => self.photos.get(i).and_then(|p| match self.thumbs.get(p) {
@@ -2108,7 +2228,7 @@ impl App {
             // 和文字座標都會與渲染完成後不同，每切一張照片就閃跳一次。
             // 先取畫布矩形，再把貼圖置中其內（正式預覽圖本身就是畫布
             // 尺寸，fit 結果等於畫布矩形，行為不變）
-            let (cw, ch) = preview_canvas(self.resolution);
+            let (cw, ch) = preview_canvas(out_res);
             let canvas_rect =
                 fit_rect(egui::vec2(cw as f32, ch as f32), rect.shrink(14.0));
             let img_rect = fit_rect(tex.size_vec2(), canvas_rect);
@@ -2237,6 +2357,8 @@ impl App {
 
         // 縮圖膠卷
         let mut click_idx: Option<usize> = None;
+        let mut toggle_idx: Option<usize> = None; // Ctrl+點：加入/移出多選
+        let mut range_idx: Option<usize> = None; // Shift+點：從目前選取連選到這張
         let mut remove_idx: Option<usize> = None;
         let mut clear_all = false;
         let mut vis_range: Option<(usize, usize)> = None;
@@ -2279,9 +2401,19 @@ impl App {
                     let has_caption = self.sub_entries.iter().any(|e| {
                         (e.start..=e.end).contains(&(i + 1)) && !e.text.trim().is_empty()
                     });
-                    let resp = thumb_item(ui, tex.as_ref(), i, selected, has_caption);
+                    let multi = self.multi_sel.contains(photo);
+                    let has_adj = self.adj_overrides.contains_key(photo);
+                    let resp =
+                        thumb_item(ui, tex.as_ref(), i, selected, has_caption, multi, has_adj);
                     if resp.clicked() {
-                        click_idx = Some(i);
+                        let mods = ui.input(|inp| inp.modifiers);
+                        if mods.ctrl {
+                            toggle_idx = Some(i);
+                        } else if mods.shift {
+                            range_idx = Some(i);
+                        } else {
+                            click_idx = Some(i);
+                        }
                     }
                     resp.context_menu(|ui| {
                         if ui.button("移除這張照片").clicked() {
@@ -2308,7 +2440,25 @@ impl App {
         }
 
         if let Some(i) = click_idx {
+            // 一般點選：離開多選模式，回到單張預覽
+            self.multi_sel.clear();
             self.select_photo(Some(i));
+        }
+        if let Some(i) = toggle_idx {
+            let p = self.photos[i].clone();
+            if !self.multi_sel.remove(&p) {
+                self.multi_sel.insert(p);
+            }
+            self.select_photo(Some(i));
+            self.sync_sel_adj();
+        }
+        if let Some(i) = range_idx {
+            let anchor = self.preview_selected.unwrap_or(i);
+            for k in anchor.min(i)..=anchor.max(i) {
+                self.multi_sel.insert(self.photos[k].clone());
+            }
+            self.select_photo(Some(i));
+            self.sync_sel_adj();
         }
         if !working {
             if clear_all {
@@ -2326,7 +2476,7 @@ impl App {
         let Some(cur_idx) = self.preview_selected else { return };
         let cur = cur_idx + 1;
         let style = self.sub_style.clone();
-        let res_h = self.resolution.h as f32;
+        let res_h = self.resolved_resolution().h as f32;
         // 文字內容裁切到畫布（與輸出一致：輸出只到畫面邊界，溢出補邊黑邊的部分
         // 會被切掉，預覽若畫到黑邊區就會所見非所得）；選取框與把手則裁切到整張
         // 卡片，文字靠邊時把手才不會一起被切掉、仍可操作
@@ -3103,13 +3253,15 @@ fn rot_vec(v: egui::Vec2, a: f32) -> egui::Vec2 {
     egui::vec2(v.x * c - v.y * s, v.x * s + v.y * c)
 }
 
-/// 膠卷縮圖項目
+/// 膠卷縮圖項目。multi＝在個別調色的多選集合中；has_adj＝這張照片有個別調色
 fn thumb_item(
     ui: &mut egui::Ui,
     tex: Option<&egui::TextureHandle>,
     idx: usize,
     selected: bool,
     has_caption: bool,
+    multi: bool,
+    has_adj: bool,
 ) -> egui::Response {
     let size = egui::vec2(132.0, 84.0);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -3157,8 +3309,33 @@ fn thumb_item(
         );
     }
 
+    // 左上角多選勾選徽章（個別調色的目標）
+    if multi {
+        let c = egui::pos2(rect.min.x + 12.0, rect.min.y + 12.0);
+        p.circle_filled(c, 8.0, theme::ACCENT);
+        p.text(
+            c,
+            egui::Align2::CENTER_CENTER,
+            "✓",
+            egui::FontId::proportional(11.0),
+            egui::Color32::WHITE,
+        );
+    }
+    // 右下角標記：這張照片有自己的調色設定
+    if has_adj {
+        p.text(
+            egui::pos2(rect.max.x - 12.0, rect.max.y - 12.0),
+            egui::Align2::CENTER_CENTER,
+            "🎨",
+            egui::FontId::proportional(11.0),
+            theme::TEXT,
+        );
+    }
+
     let stroke = if selected {
         egui::Stroke::new(2.0, theme::ACCENT)
+    } else if multi {
+        egui::Stroke::new(2.0, egui::Color32::from_rgb(0x8F, 0xAF, 0xFF))
     } else if hovered {
         egui::Stroke::new(1.0, egui::Color32::from_rgb(0x4A, 0x4D, 0x58))
     } else {
@@ -3582,6 +3759,53 @@ fn render_preview(photo: &Path, adj: &Adjustments, res: Resolution) -> PreviewRe
     Ok(frame.unwrap())
 }
 
+/// 把單張照片套用調色後輸出成暫存 PNG（已縮放至目標解析度內），
+/// 供個別照片調色的輸出流程使用；主管線對這些暫存圖不再調色
+fn pre_adjust_photo(
+    photo: &Path,
+    adj: &Adjustments,
+    res: Resolution,
+    out: &Path,
+) -> Result<(), String> {
+    let scale = format!(
+        "scale={}:{}:force_original_aspect_ratio=decrease",
+        res.w, res.h
+    );
+    let vf = match adj.filter_chain(1.0) {
+        Some(c) => format!("{scale},{c}"),
+        None => scale,
+    };
+    let mut cmd = FfmpegCommand::new();
+    cmd.arg("-y")
+        .input(photo.to_string_lossy())
+        .args(["-vf", &vf])
+        .args(["-frames:v", "1"])
+        .output(out.to_string_lossy());
+    let mut child = cmd.spawn().map_err(|e| format!("FFmpeg 啟動失敗：{e}"))?;
+    let mut errs: Vec<String> = Vec::new();
+    if let Ok(iter) = child.iter() {
+        use ffmpeg_sidecar::event::LogLevel;
+        for ev in iter {
+            if let FfmpegEvent::Log(LogLevel::Error | LogLevel::Fatal, m) = ev {
+                errs.push(m);
+            }
+        }
+    }
+    let st = child.wait().map_err(|e| format!("FFmpeg 執行失敗：{e}"))?;
+    if !st.success() || !out.exists() {
+        let name = photo
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| photo.display().to_string());
+        return Err(if errs.is_empty() {
+            format!("照片「{name}」調色失敗")
+        } else {
+            format!("照片「{name}」調色失敗：{}", errs.join("\n"))
+        });
+    }
+    Ok(())
+}
+
 /// 輸出用的一段文字（照片區間為 0-based 含端點）
 struct TextJob {
     s: usize,
@@ -3608,6 +3832,7 @@ fn run_conversion(
     format: OutputFormat,
     res: Resolution,
     adj: &Adjustments,
+    adj_overrides: &HashMap<PathBuf, Adjustments>,
     subs: &SubtitleJob,
     fx: &OutputFx,
     output: &Path,
@@ -3649,6 +3874,43 @@ fn run_conversion(
         ));
     })?;
 
+    // 個別照片調色：任一張的生效調色與全域不同時，先把「生效調色非中性」的照片
+    // 各自套用調色輸出成暫存圖（已縮放至目標解析度內），主管線的濾鏡鏈就不再帶
+    // 全域調色，避免對已調色的照片疊套兩次
+    let has_per_photo = photos
+        .iter()
+        .any(|p| adj_overrides.get(p).is_some_and(|o| o != adj));
+    let mut adj_temp: Vec<PathBuf> = Vec::new();
+    let mut src_photos: Vec<PathBuf> = photos.to_vec();
+    if has_per_photo {
+        let need: Vec<usize> = (0..photos.len())
+            .filter(|&i| {
+                !adj_overrides
+                    .get(&photos[i])
+                    .copied()
+                    .unwrap_or(*adj)
+                    .is_neutral()
+            })
+            .collect();
+        for (k, &i) in need.iter().enumerate() {
+            send(WorkerMsg::Status(format!(
+                "套用照片調色…（{}/{}）",
+                k + 1,
+                need.len()
+            )));
+            let eff = adj_overrides.get(&photos[i]).copied().unwrap_or(*adj);
+            let out = temp_path(&format!("adj_{i}.png"));
+            if let Err(e) = pre_adjust_photo(&photos[i], &eff, res, &out) {
+                for f in &adj_temp {
+                    let _ = std::fs::remove_file(f);
+                }
+                return Err(e);
+            }
+            src_photos[i] = out.clone();
+            adj_temp.push(out);
+        }
+    }
+
     send(WorkerMsg::Status("建立照片清單…".into()));
 
     // AVI 容器在低幀率＋音訊下，muxer 會把最後一格多撐一兩個影格週期，使影片時長
@@ -3668,13 +3930,13 @@ fn run_conversion(
     };
     let total_secs = photos.len() as f64 * eff_dur;
 
-    // 用 concat demuxer 列出每張照片與顯示時間
+    // 用 concat demuxer 列出每張照片與顯示時間（個別調色的照片指向暫存圖）
     let mut list = String::new();
-    for p in photos {
+    for p in &src_photos {
         list.push_str(&format!("file '{}'\nduration {duration}\n", concat_escape(p)));
     }
     // concat demuxer 的慣例：最後一張要再列一次，最後一段 duration 才會生效
-    if let Some(last) = photos.last() {
+    if let Some(last) = src_photos.last() {
         list.push_str(&format!("file '{}'\n", concat_escape(last)));
     }
 
@@ -3684,10 +3946,14 @@ fn run_conversion(
     let (w, h) = (res.w, res.h);
     // 先縮放到目標解析度再調色（大照片可省下數倍運算），最後補邊，
     // 黑邊仍不受亮度、曝光等調整影響。輸出即目標解析度，清晰度半徑用原始 13px
-    let adjust_mid = adj
-        .filter_chain(1.0)
-        .map(|c| format!("{c},"))
-        .unwrap_or_default();
+    let adjust_mid = if has_per_photo {
+        // 個別調色模式：每張照片的調色已烙進暫存圖，主鏈不再調色
+        String::new()
+    } else {
+        adj.filter_chain(1.0)
+            .map(|c| format!("{c},"))
+            .unwrap_or_default()
+    };
     let mut vf = format!(
         "scale={w}:{h}:force_original_aspect_ratio=decrease,{adjust_mid}\
          pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black"
@@ -3924,6 +4190,9 @@ fn run_conversion(
     for f in &caption_files {
         let _ = std::fs::remove_file(f);
     }
+    for f in &adj_temp {
+        let _ = std::fs::remove_file(f);
+    }
     // 轉檔失敗時清掉半成品輸出檔：ffmpeg 失敗常留下不完整的檔案，硬體編碼
     // 嘗試失敗更會先寫入一部分，留著會讓使用者誤以為成功、播到損毀的影片
     if result.is_err() {
@@ -4014,6 +4283,7 @@ fn run_cli(args: &[String]) -> Result<(), String> {
         format,
         Resolution { w: 1920, h: 1080 },
         &Adjustments::default(),
+        &HashMap::new(),
         &no_subs,
         &no_fx,
         &output,
