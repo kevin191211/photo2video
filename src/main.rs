@@ -127,7 +127,10 @@ impl Adjustments {
     }
 
     /// 轉成 ffmpeg 濾鏡串；全部為 0 時回傳 None
-    fn filter_chain(&self) -> Option<String> {
+    /// unsharp_scale：清晰度的 unsharp 是以「像素」為半徑，需依實際輸出寬度縮放，
+    /// 預覽（960px）與輸出（完整解析度）才會呈現相同強度的局部對比。
+    /// 輸出傳 1.0（維持 13px），預覽傳 預覽寬/輸出寬
+    fn filter_chain(&self, unsharp_scale: f64) -> Option<String> {
         if self.is_neutral() {
             return None;
         }
@@ -186,10 +189,12 @@ impl Adjustments {
             filters.push(format!("vibrance=intensity={v:.4}"));
         }
         if self.clarity != 0 {
-            // 大半徑低強度的 unsharp ≈ 局部對比（清晰度）；負值則柔化
+            // 大半徑低強度的 unsharp ≈ 局部對比（清晰度）；負值則柔化。
+            // 核心尺寸須為 3~23 的奇數，依輸出寬度縮放後仍取最近的合法奇數
             let amount = self.clarity as f64 * 0.015;
+            let msize = ((13.0 * unsharp_scale).round() as i32).clamp(3, 23) | 1;
             filters.push(format!(
-                "unsharp=luma_msize_x=13:luma_msize_y=13:luma_amount={amount:.4}"
+                "unsharp=luma_msize_x={msize}:luma_msize_y={msize}:luma_amount={amount:.4}"
             ));
         }
         Some(filters.join(","))
@@ -3192,9 +3197,9 @@ fn render_preview(photo: &Path, adj: &Adjustments, res: Resolution) -> PreviewRe
     };
 
     // 與輸出相同順序：先縮放、再調色、後補邊。
-    // chain 為縮放之後的濾鏡（調色、補邊）
+    // chain 為縮放之後的濾鏡（調色、補邊）；清晰度半徑依預覽寬與輸出寬的比例縮放
     let adjust_mid = adj
-        .filter_chain()
+        .filter_chain(pw as f64 / res.w as f64)
         .map(|c| format!("{c},"))
         .unwrap_or_default();
     let chain = format!("{adjust_mid}pad={pw}:{ph}:(ow-iw)/2:(oh-ih)/2:color=black");
@@ -3319,9 +3324,9 @@ fn run_conversion(
 
     let (w, h) = (res.w, res.h);
     // 先縮放到目標解析度再調色（大照片可省下數倍運算），最後補邊，
-    // 黑邊仍不受亮度、曝光等調整影響
+    // 黑邊仍不受亮度、曝光等調整影響。輸出即目標解析度，清晰度半徑用原始 13px
     let adjust_mid = adj
-        .filter_chain()
+        .filter_chain(1.0)
         .map(|c| format!("{c},"))
         .unwrap_or_default();
     let mut vf = format!(
