@@ -664,12 +664,8 @@ struct App {
     about_open: bool,
     /// fps 最後一次變動的時間；拖動時不即時寫設定檔，停止變動後才寫
     fps_pending_save: Option<Instant>,
-    /// 按下「複製錯誤」的時間；短暫顯示「已複製」確認用
-    err_copied_at: Option<Instant>,
     /// 上次執行留下的閃退紀錄（crash.log 內容）；有值時在底欄顯示回報橫幅
     crash_report: Option<String>,
-    /// 按下閃退橫幅「複製錯誤」的時間；短暫顯示「已複製」確認用
-    crash_copied_at: Option<Instant>,
     /// 剛選的資料夾/檔案沒有找到任何照片；在空狀態顯示提示，避免使用者以為沒反應
     import_found_nothing: bool,
 }
@@ -747,9 +743,7 @@ impl App {
             update_banner_dismissed: false,
             about_open: false,
             fps_pending_save: None,
-            err_copied_at: None,
             crash_report: take_crash_report(),
-            crash_copied_at: None,
             import_found_nothing: false,
         };
         // 啟動時在背景檢查是否有新版本（失敗不影響使用）
@@ -1108,9 +1102,6 @@ impl App {
             progress: 0.0,
             status: "準備中…".into(),
         };
-        // 清掉上次的「已複製」確認，避免新一輪失敗時殘留顯示
-        self.err_copied_at = None;
-
         let photos = self.photos.clone();
         let fps = self.fps;
         let format = self.format;
@@ -1286,7 +1277,7 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(16, 12)),
             )
             .show(ctx, |ui| {
-                // 上次執行閃退：顯示回報橫幅（複製錯誤／開 GitHub 回報頁／關閉）
+                // 上次執行閃退：顯示回報橫幅（開 GitHub 回報頁／關閉）
                 if let Some(report) = self.crash_report.clone() {
                     ui.horizontal(|ui| {
                         ui.label(
@@ -1301,12 +1292,11 @@ impl App {
                             .clicked()
                         {
                             // GitHub issue 網址有長度上限，中文經百分比編碼後長度
-                            // 會膨脹三倍，內文只帶前段；完整內容請使用者用「複製錯誤」貼上
+                            // 會膨脹三倍，內文只帶前段；panic 訊息與位置在最前面，
+                            // 截掉的只有 backtrace 尾段（strip 後僅剩位址，價值不高）
                             let mut excerpt: String = report.chars().take(1200).collect();
                             if excerpt.len() < report.len() {
-                                excerpt.push_str(
-                                    "\n…（內容過長已截斷，完整訊息可按「複製錯誤」後貼上）",
-                                );
+                                excerpt.push_str("\n…（內容過長已截斷）");
                             }
                             let body = format!(
                                 "版本：v{}\n作業系統：Windows\n\n閃退紀錄：\n{excerpt}\n\n（發生了什麼、當時在做哪個操作，可補充於此）",
@@ -1318,25 +1308,6 @@ impl App {
                                 urlencode(&body)
                             );
                             ctx.open_url(egui::OpenUrl::new_tab(url));
-                        }
-                        let just_copied = self
-                            .crash_copied_at
-                            .is_some_and(|t| t.elapsed().as_secs_f32() < 2.0);
-                        let label = if just_copied {
-                            "✓ 已複製"
-                        } else {
-                            "📋 複製錯誤"
-                        };
-                        if ui
-                            .small_button(label)
-                            .on_hover_text("複製閃退紀錄，方便貼給開發者")
-                            .clicked()
-                        {
-                            ctx.copy_text(report.clone());
-                            self.crash_copied_at = Some(Instant::now());
-                        }
-                        if just_copied {
-                            ui.ctx().request_repaint_after(Duration::from_millis(300));
                         }
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
@@ -1486,7 +1457,7 @@ impl App {
                                 )
                                 .truncate(),
                             );
-                            // 快速回報：複製錯誤（貼給開發者最直接）＋開 GitHub 回報頁
+                            // 快速回報：開 GitHub 回報頁（已帶入錯誤與版本）
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
@@ -1496,10 +1467,10 @@ impl App {
                                         .clicked()
                                     {
                                         // 錯誤太長會讓網址超過系統開啟網址的長度上限（約 2048），
-                                        // 截短帶入 URL（完整內容用「複製錯誤」取得）；以字元為界避免切壞中文
+                                        // 截短帶入 URL；以字元為界避免切壞中文
                                         let short_e: String = if e.chars().count() > 400 {
                                             let mut s: String = e.chars().take(400).collect();
-                                            s.push_str("…（訊息過長已截斷，請用「複製錯誤」取得完整內容）");
+                                            s.push_str("…（訊息過長已截斷）");
                                             s
                                         } else {
                                             e.clone()
@@ -1517,32 +1488,6 @@ impl App {
                                         // explorer 對帶 query string（含 &）的網址解析不可靠，
                                         // 可能開不了或只帶到 & 之前
                                         ctx.open_url(egui::OpenUrl::new_tab(url));
-                                    }
-                                    // 剛複製過（2 秒內）就顯示「已複製」確認，
-                                    // 讓使用者確定有按到（複製動作本身無畫面回饋）
-                                    let just_copied = self
-                                        .err_copied_at
-                                        .is_some_and(|t| t.elapsed().as_secs_f32() < 2.0);
-                                    let label = if just_copied {
-                                        "✓ 已複製"
-                                    } else {
-                                        "📋 複製錯誤"
-                                    };
-                                    if ui
-                                        .small_button(label)
-                                        .on_hover_text("複製錯誤訊息，方便貼給開發者")
-                                        .clicked()
-                                    {
-                                        ctx.copy_text(format!(
-                                            "Photo2Video v{} 轉換失敗\n{e}",
-                                            env!("CARGO_PKG_VERSION")
-                                        ));
-                                        self.err_copied_at = Some(Instant::now());
-                                    }
-                                    if just_copied {
-                                        ui.ctx().request_repaint_after(
-                                            Duration::from_millis(300),
-                                        );
                                     }
                                 },
                             );
