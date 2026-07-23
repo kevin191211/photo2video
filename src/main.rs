@@ -803,7 +803,16 @@ impl App {
                 self.photos.push(f);
             }
         }
+        // 排序會重新編號，選取的照片索引會失效：新加入的照片若排在
+        // 選取照片之前，同一個索引就指向別張了。記住選取照片的路徑，
+        // 排序後找回它的新索引，讓選取跟著照片走而非固定在數字上
+        let selected_path = self
+            .preview_selected
+            .and_then(|i| self.photos.get(i).cloned());
         natural_sort(&mut self.photos);
+        if let Some(p) = selected_path {
+            self.preview_selected = self.photos.iter().position(|q| *q == p);
+        }
         if self.preview_selected.is_none() && !self.photos.is_empty() {
             self.preview_selected = Some(0);
         }
