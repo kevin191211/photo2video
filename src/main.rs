@@ -757,6 +757,12 @@ impl App {
         let mut uploaded = 0;
         while uploaded < MAX_UPLOADS_PER_FRAME {
             let Ok((path, res)) = self.thumb_rx.try_recv() else { break };
+            // 只收還在等待中（Loading）的結果：照片已被清空/移除時，
+            // 解碼中的工作仍會遲到送回，若照收會留下淘汰掃描
+            // （只走訪目前照片清單）永遠釋放不到的貼圖
+            if !matches!(self.thumbs.get(&path), Some(Thumb::Loading)) {
+                continue;
+            }
             let state = match res {
                 Some((w, h, rgb)) => {
                     uploaded += 1;
@@ -884,7 +890,8 @@ impl App {
     }
 
     fn remove_photo(&mut self, i: usize) {
-        self.photos.remove(i);
+        let removed = self.photos.remove(i);
+        self.thumbs.remove(&removed);
         match self.preview_selected {
             Some(s) if s == i => {
                 let next = if self.photos.is_empty() {
