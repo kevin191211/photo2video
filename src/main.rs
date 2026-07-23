@@ -3329,13 +3329,13 @@ fn run_conversion(
         vf.push_str(&format!(",fps={OUT_FPS}"));
     }
 
-    // 文字：無旋轉的直接串 drawtext；有旋轉的先記下來，
-    // 之後走「透明畫布 drawtext → rotate → overlay」的 filter_complex 分支
+    // 文字：先全部依清單順序收集（不分旋轉與否）。輸出的圖層順序必須與預覽
+    // 一致——預覽以清單順序繪製，故此處也依清單順序套用（見下方 use_complex）
     let out_fps = if animated { OUT_FPS } else { fps };
     let mut caption_files: Vec<PathBuf> = Vec::new();
-    // (段文字, 字幕檔, 顯示區間)
-    let mut rotated: Vec<(&TextJob, PathBuf, (f64, f64))> = Vec::new();
-    if let Some(font) = &subs.font {
+    // (該段文字, 字幕檔, 顯示區間, 字級像素)
+    let mut ops: Vec<(&TextJob, PathBuf, (f64, f64), f64)> = Vec::new();
+    if subs.font.is_some() {
         let d = eff_dur;
         // 以半個「輸出影格」為緩衝，準確涵蓋第 s ~ e 張照片的所有格；
         // 動態模式輸出為 30fps，若以照片時長的比例當緩衝，
@@ -3350,21 +3350,22 @@ fn run_conversion(
             std::fs::write(&cap_path, text).map_err(|e| format!("無法寫入字幕暫存檔：{e}"))?;
             let enable = (en.s as f64 * d - buf, (en.e as f64 + 1.0) * d - buf);
             let fontsize = en.size as f64 * h as f64 / 1080.0;
-            if en.rot.abs() < 0.5 {
+            ops.push((en, cap_path.clone(), enable, fontsize));
+            caption_files.push(cap_path);
+        }
+    }
+
+    // 有任何旋轉文字才需要 filter_complex（旋轉要走「透明畫布→rotate→overlay」）；
+    // 全部無旋轉時維持單純的 -vf 路徑。無旋轉文字在此直接依序串進 vf
+    let use_complex = ops.iter().any(|(en, ..)| en.rot.abs() >= 0.5);
+    if !use_complex {
+        if let Some(font) = &subs.font {
+            for (en, cap, enable, fontsize) in &ops {
                 vf.push(',');
                 vf.push_str(&drawtext_filter(
-                    font,
-                    &cap_path,
-                    &subs.style,
-                    fontsize,
-                    en.x,
-                    en.y,
-                    Some(enable),
+                    font, cap, &subs.style, *fontsize, en.x, en.y, Some(*enable),
                 ));
-            } else {
-                rotated.push((en, cap_path.clone(), enable));
             }
-            caption_files.push(cap_path);
         }
     }
 
@@ -3386,8 +3387,6 @@ fn run_conversion(
     }
     tail.push_str("setsar=1,format=yuv420p");
 
-    let use_complex = !rotated.is_empty();
-
     let mut cmd = FfmpegCommand::new();
     cmd.arg("-y")
         .args(["-filter_threads", &filter_threads()])
@@ -3400,24 +3399,30 @@ fn run_conversion(
     }
 
     if use_complex {
-        // 每段旋轉文字：畫在全幅透明畫布中央 → 以畫布中心旋轉 → overlay 到
-        // 目標位置（畫布中心對齊文字中心點），顯示區間由 overlay 的 enable 控制
+        // 依清單順序逐段套用：無旋轉直接在鏈上 drawtext；旋轉則畫在全幅透明畫布
+        // 中央 → 以畫布中心旋轉 → overlay 到目標位置。順序與預覽一致，重疊時
+        // 後加入的文字才會正確蓋在先加入的之上（不再一律讓旋轉文字浮在最上層）
+        let font = subs.font.as_ref().unwrap();
         let mut fc = format!("[0:v]{vf}[v0];");
         let mut cur = "v0".to_string();
-        for (i, (en, cap, (ea, eb))) in rotated.iter().enumerate() {
-            let font = subs.font.as_ref().unwrap();
-            let fontsize = en.size as f64 * h as f64 / 1080.0;
-            let dt = drawtext_filter(font, cap, &subs.style, fontsize, 0.5, 0.5, None);
-            let rad = (en.rot as f64).to_radians();
-            fc.push_str(&format!(
-                "color=c=black@0.0:s={w}x{h}:r={out_fps}:d={total_secs:.3},format=rgba,{dt},rotate={rad:.6}:ow=iw:oh=ih:c=none[t{i}];"
-            ));
-            let ox = ((en.x - 0.5) * w as f32).round();
-            let oy = ((en.y - 0.5) * h as f32).round();
+        for (i, (en, cap, (ea, eb), fontsize)) in ops.iter().enumerate() {
             let next = format!("v{}", i + 1);
-            fc.push_str(&format!(
-                "[{cur}][t{i}]overlay=x={ox:.0}:y={oy:.0}:enable='between(t,{ea:.3},{eb:.3})'[{next}];"
-            ));
+            if en.rot.abs() < 0.5 {
+                let dt =
+                    drawtext_filter(font, cap, &subs.style, *fontsize, en.x, en.y, Some((*ea, *eb)));
+                fc.push_str(&format!("[{cur}]{dt}[{next}];"));
+            } else {
+                let dt = drawtext_filter(font, cap, &subs.style, *fontsize, 0.5, 0.5, None);
+                let rad = (en.rot as f64).to_radians();
+                fc.push_str(&format!(
+                    "color=c=black@0.0:s={w}x{h}:r={out_fps}:d={total_secs:.3},format=rgba,{dt},rotate={rad:.6}:ow=iw:oh=ih:c=none[t{i}];"
+                ));
+                let ox = ((en.x - 0.5) * w as f32).round();
+                let oy = ((en.y - 0.5) * h as f32).round();
+                fc.push_str(&format!(
+                    "[{cur}][t{i}]overlay=x={ox:.0}:y={oy:.0}:enable='between(t,{ea:.3},{eb:.3})'[{next}];"
+                ));
+            }
             cur = next;
         }
         fc.push_str(&format!("[{cur}]{tail}[vout]"));
