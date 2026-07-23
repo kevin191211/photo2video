@@ -620,6 +620,8 @@ struct App {
     fps_pending_save: Option<Instant>,
     /// 按下「複製錯誤」的時間；短暫顯示「已複製」確認用
     err_copied_at: Option<Instant>,
+    /// 剛選的資料夾/檔案沒有找到任何照片；在空狀態顯示提示，避免使用者以為沒反應
+    import_found_nothing: bool,
 }
 
 impl App {
@@ -696,6 +698,7 @@ impl App {
             about_open: false,
             fps_pending_save: None,
             err_copied_at: None,
+            import_found_nothing: false,
         };
         // 啟動時在背景檢查是否有新版本（失敗不影響使用）
         app.spawn_update_check(&cc.egui_ctx);
@@ -840,6 +843,10 @@ impl App {
 
     fn add_photos(&mut self, mut files: Vec<PathBuf>) {
         files.retain(|p| is_image(p));
+        // 這批有真的加入照片就清掉「找不到照片」提示
+        if !files.is_empty() {
+            self.import_found_nothing = false;
+        }
         // 用 HashSet 去重；逐一 contains 是 O(n²)，加入數千張照片要數百萬次路徑比對
         let mut seen: HashSet<PathBuf> = self.photos.iter().cloned().collect();
         for f in files {
@@ -937,6 +944,8 @@ impl App {
         self.preview_selected = None;
         self.preview_tex = None;
         self.preview_error = None;
+        // 主動清空不是「找不到照片」，別讓上次的提示殘留到空狀態
+        self.import_found_nothing = false;
     }
 
     fn remove_photo(&mut self, i: usize) {
@@ -991,6 +1000,8 @@ impl App {
             .pick_folder()
         {
             let files = collect_images_in_dir(&dir);
+            // 掃不到照片（空資料夾，或照片都在子資料夾）就標記，於空狀態提示
+            self.import_found_nothing = files.is_empty();
             self.add_photos(files);
         }
     }
@@ -1908,6 +1919,21 @@ impl App {
                 }
             },
         );
+        // 剛選的資料夾掃不到照片時明講原因，避免使用者以為程式沒反應
+        if self.import_found_nothing {
+            child.add_space(14.0);
+            child.label(
+                egui::RichText::new("⚠ 這個資料夾裡沒有找到照片")
+                    .size(12.5)
+                    .strong()
+                    .color(theme::ERROR),
+            );
+            child.label(
+                egui::RichText::new("請確認資料夾內有 JPG／PNG 等圖片；子資料夾裡的照片不會被掃描")
+                    .size(11.5)
+                    .color(theme::TEXT_WEAK),
+            );
+        }
     }
 
     fn ui_workspace(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
