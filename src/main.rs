@@ -980,6 +980,8 @@ impl App {
             self.import_found_nothing = false;
         }
         self.native_res_cache = None;
+        // 加入前的照片順序：供下方把文字段落的編號對回排序後的新位置
+        let old_photos: Vec<PathBuf> = self.photos.clone();
         // 用 HashSet 去重；逐一 contains 是 O(n²)，加入數千張照片要數百萬次路徑比對
         let mut seen: HashSet<PathBuf> = self.photos.iter().cloned().collect();
         for f in files {
@@ -993,9 +995,31 @@ impl App {
         let selected_path = self
             .preview_selected
             .and_then(|i| self.photos.get(i).cloned());
+        // 文字段落同理：以 1-based 照片編號綁定，排序前先記下起訖照片的路徑，
+        // 排序後找回新編號，段落才會跟著照片走、不會靜默套到別張照片上
+        let entry_paths: Vec<(Option<PathBuf>, Option<PathBuf>)> = self
+            .sub_entries
+            .iter()
+            .map(|e| {
+                let at = |n: usize| n.checked_sub(1).and_then(|i| old_photos.get(i).cloned());
+                (at(e.start), at(e.end))
+            })
+            .collect();
         natural_sort(&mut self.photos);
         if let Some(p) = selected_path {
             self.preview_selected = self.photos.iter().position(|q| *q == p);
+        }
+        if !entry_paths.is_empty() {
+            let new_pos: HashMap<&PathBuf, usize> =
+                self.photos.iter().enumerate().map(|(i, p)| (p, i)).collect();
+            for (e, (sp, ep)) in self.sub_entries.iter_mut().zip(entry_paths) {
+                if let Some(i) = sp.as_ref().and_then(|p| new_pos.get(p)) {
+                    e.start = i + 1;
+                }
+                if let Some(i) = ep.as_ref().and_then(|p| new_pos.get(p)) {
+                    e.end = i + 1;
+                }
+            }
         }
         if self.preview_selected.is_none() && !self.photos.is_empty() {
             self.preview_selected = Some(0);
