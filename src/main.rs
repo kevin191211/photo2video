@@ -3717,6 +3717,11 @@ fn run_conversion(
     for f in &caption_files {
         let _ = std::fs::remove_file(f);
     }
+    // 轉檔失敗時清掉半成品輸出檔：ffmpeg 失敗常留下不完整的檔案，硬體編碼
+    // 嘗試失敗更會先寫入一部分，留著會讓使用者誤以為成功、播到損毀的影片
+    if result.is_err() {
+        let _ = std::fs::remove_file(output);
+    }
     result?;
 
     send(WorkerMsg::Progress(1.0));
