@@ -196,56 +196,53 @@ impl Adjustments {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum SubPos {
-    Top,
-    Middle,
-    Bottom,
-}
-
-impl SubPos {
-    fn label(&self) -> &'static str {
-        match self {
-            SubPos::Top => "上方",
-            SubPos::Middle => "置中",
-            SubPos::Bottom => "下方",
-        }
-    }
-    const ALL: [SubPos; 3] = [SubPos::Top, SubPos::Middle, SubPos::Bottom];
-}
-
-/// 字幕樣式（全域套用；大小以 1080p 高度為基準的像素值）
+/// 文字樣式（字型與顏色全域共用；大小與位置為每段文字獨立設定）
 #[derive(Clone, PartialEq)]
 struct SubtitleStyle {
     font_idx: usize,
-    size: i32,
     color: egui::Color32,
     outline_w: i32,
     outline_color: egui::Color32,
     boxed: bool,
-    pos: SubPos,
 }
 
 impl Default for SubtitleStyle {
     fn default() -> Self {
         Self {
             font_idx: 0,
-            size: 48,
             color: egui::Color32::WHITE,
             outline_w: 2,
             outline_color: egui::Color32::BLACK,
             boxed: false,
-            pos: SubPos::Bottom,
         }
     }
 }
 
-/// 一個字幕段落：從第 start 張到第 end 張（1-based、含端點）顯示同一段文字
+/// 一段文字：從第 start 張到第 end 張（1-based、含端點）顯示；
+/// 位置為文字中心點在畫面上的比例（0~1），大小以 1080p 高度為基準，旋轉單位為度（順時針）
 #[derive(Clone, PartialEq)]
 struct SubtitleEntry {
     start: usize,
     end: usize,
     text: String,
+    x: f32,
+    y: f32,
+    size: i32,
+    rot: f32,
+}
+
+impl SubtitleEntry {
+    fn new(start: usize, end: usize) -> Self {
+        Self {
+            start,
+            end,
+            text: String::new(),
+            x: 0.5,
+            y: 0.85,
+            size: 48,
+            rot: 0.0,
+        }
+    }
 }
 
 /// 照片之間的轉場效果
@@ -456,30 +453,27 @@ fn ff_color(c: egui::Color32) -> String {
     )
 }
 
-/// 產生一段 drawtext 濾鏡。fontsize 為實際像素；enable 為顯示時間區間
+/// 產生一段 drawtext 濾鏡。fontsize 為實際像素；(x_frac, y_frac) 為文字中心點
+/// 在畫面上的比例位置；enable 為顯示時間區間
 fn drawtext_filter(
     fontfile: &Path,
     textfile: &Path,
     style: &SubtitleStyle,
     fontsize: f64,
-    frame_h: u32,
+    x_frac: f32,
+    y_frac: f32,
     enable: Option<(f64, f64)>,
 ) -> String {
-    let margin = (frame_h as f64 * 0.04).round();
-    let y = match style.pos {
-        SubPos::Top => format!("{margin:.0}"),
-        SubPos::Middle => "(h-text_h)/2".into(),
-        SubPos::Bottom => format!("h-text_h-{margin:.0}"),
-    };
     let mut f = format!(
-        "drawtext=fontfile='{}':textfile='{}':fontsize={:.0}:fontcolor={}:borderw={}:bordercolor={}:x=(w-text_w)/2:y={}",
+        "drawtext=fontfile='{}':textfile='{}':fontsize={:.0}:fontcolor={}:borderw={}:bordercolor={}:x=(w*{:.4}-text_w/2):y=(h*{:.4}-text_h/2)",
         ff_path_escape(fontfile),
         ff_path_escape(textfile),
         fontsize.max(1.0),
         ff_color(style.color),
         style.outline_w,
         ff_color(style.outline_color),
-        y,
+        x_frac,
+        y_frac,
     );
     if style.boxed {
         let pad = (fontsize * 0.25).round().max(4.0);
@@ -547,6 +541,8 @@ struct App {
     adj: Adjustments,
     sub_entries: Vec<SubtitleEntry>,
     sub_style: SubtitleStyle,
+    /// 預覽區目前選取的文字（sub_entries 索引），用於顯示縮放/旋轉控制框
+    sel_text: Option<usize>,
     fonts: Vec<(String, PathBuf)>,
     preview_selected: Option<usize>,
     preview_dirty: bool,
@@ -628,6 +624,7 @@ impl App {
             adj: Adjustments::default(),
             sub_entries: Vec::new(),
             sub_style: SubtitleStyle::default(),
+            sel_text: None,
             fonts: detect_fonts(),
             preview_selected: None,
             preview_dirty: false,
@@ -678,28 +675,19 @@ impl App {
         self.prefetch_for = None;
     }
 
-    /// 依選取的照片與目前調色參數，在背景執行 ffmpeg 產生預覽圖
+    /// 依選取的照片與目前調色參數，在背景執行 ffmpeg 產生預覽圖。
+    /// 文字不在這裡燒錄——預覽的文字由 egui 即時繪製，拖曳/縮放/旋轉不需重新渲染
     fn spawn_preview(&mut self, ctx: &egui::Context) {
         let Some(idx) = self.preview_selected else { return };
         let Some(photo) = self.photos.get(idx).cloned() else { return };
         let adj = self.adj;
         let res = self.resolution;
-        // 收集涵蓋這張照片的所有字幕段落（與輸出行為一致）
-        let idx1 = idx + 1;
-        let captions: Vec<String> = self
-            .sub_entries
-            .iter()
-            .filter(|e| e.start <= idx1 && idx1 <= e.end && !e.text.trim().is_empty())
-            .map(|e| e.text.clone())
-            .collect();
-        let style = self.sub_style.clone();
-        let font = self.fonts.get(style.font_idx).map(|(_, p)| p.clone());
         let (tx, rx) = std::sync::mpsc::channel();
         self.preview_rx = Some(rx);
         self.preview_dirty = false;
         let ctx = ctx.clone();
         thread::spawn(move || {
-            let _ = tx.send((idx, render_preview(&photo, &adj, res, &captions, &style, font.as_deref())));
+            let _ = tx.send((idx, render_preview(&photo, &adj, res)));
             ctx.request_repaint();
         });
     }
@@ -966,7 +954,15 @@ impl App {
                 .filter_map(|e| {
                     let s = e.start.max(1) - 1;
                     let end = e.end.min(total);
-                    (s < end).then(|| (s, end - 1, e.text.clone()))
+                    (s < end).then(|| TextJob {
+                        s,
+                        e: end - 1,
+                        text: e.text.clone(),
+                        x: e.x,
+                        y: e.y,
+                        size: e.size,
+                        rot: e.rot,
+                    })
                 })
                 .collect(),
         };
@@ -1334,7 +1330,7 @@ impl App {
                         ui.add_space(14.0);
                         ui.separator();
                         ui.add_space(10.0);
-                        self.ui_subtitle_section(ui);
+                        self.ui_text_section(ui);
                         ui.add_space(14.0);
                         ui.separator();
                         ui.add_space(10.0);
@@ -1390,53 +1386,60 @@ impl App {
         }
     }
 
-    fn ui_subtitle_section(&mut self, ui: &mut egui::Ui) {
-        let style_before = self.sub_style.clone();
+    fn ui_text_section(&mut self, ui: &mut egui::Ui) {
         let total = self.photos.len().max(1);
-        let mut entries_changed = false;
 
         ui.horizontal(|ui| {
-            section_toggle(ui, "字幕", &mut self.sec_sub_open);
+            section_toggle(ui, "文字", &mut self.sec_sub_open);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("＋ 新增段落").clicked() {
+                if ui.small_button("＋ 新增文字").clicked() {
                     let start = self.preview_selected.map(|i| i + 1).unwrap_or(1);
-                    self.sub_entries.push(SubtitleEntry {
-                        start,
-                        end: total,
-                        text: String::new(),
-                    });
-                    entries_changed = true;
-                    self.sec_sub_open = true; // 收合時新增段落 → 自動展開
+                    self.sub_entries.push(SubtitleEntry::new(start, total));
+                    self.sel_text = Some(self.sub_entries.len() - 1);
+                    self.sec_sub_open = true; // 收合時新增 → 自動展開
                 }
             });
         });
         if !self.sec_sub_open {
-            if entries_changed {
-                self.mark_preview_dirty();
-            }
             return;
         }
         ui.label(
-            egui::RichText::new("一段連續的照片共用同一句字幕；樣式為全部共用")
+            egui::RichText::new("在中央預覽直接拖曳文字調整位置；點選文字可縮放與旋轉")
                 .size(11.0)
                 .color(theme::TEXT_WEAK),
         );
         ui.add_space(8.0);
 
         let mut remove_entry: Option<usize> = None;
+        let mut select_entry: Option<usize> = None;
         for (k, entry) in self.sub_entries.iter_mut().enumerate() {
+            let selected = self.sel_text == Some(k);
             egui::Frame::default()
                 .fill(theme::CARD)
                 .corner_radius(8)
+                .stroke(if selected {
+                    egui::Stroke::new(1.5, theme::ACCENT)
+                } else {
+                    egui::Stroke::NONE
+                })
                 .inner_margin(egui::Margin::same(10))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!("段落 {}", k + 1))
-                                .strong()
-                                .size(12.5)
-                                .color(theme::ACCENT),
-                        );
+                        if ui
+                            .add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("文字 {}", k + 1))
+                                        .strong()
+                                        .size(12.5)
+                                        .color(theme::ACCENT),
+                                )
+                                .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text("點擊可在預覽中選取這段文字")
+                            .clicked()
+                        {
+                            select_entry = Some(k);
+                        }
                         ui.add_space(4.0);
                         ui.label(egui::RichText::new("第").size(12.0).color(theme::TEXT_WEAK));
                         let r1 =
@@ -1444,16 +1447,13 @@ impl App {
                         ui.label(egui::RichText::new("到").size(12.0).color(theme::TEXT_WEAK));
                         let r2 = ui.add(egui::DragValue::new(&mut entry.end).range(1..=total));
                         ui.label(egui::RichText::new("張").size(12.0).color(theme::TEXT_WEAK));
-                        if r1.changed() || r2.changed() {
-                            if entry.end < entry.start {
-                                entry.end = entry.start;
-                            }
-                            entries_changed = true;
+                        if (r1.changed() || r2.changed()) && entry.end < entry.start {
+                            entry.end = entry.start;
                         }
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                if ui.small_button("🗑").on_hover_text("刪除這個段落").clicked()
+                                if ui.small_button("🗑").on_hover_text("刪除這段文字").clicked()
                                 {
                                     remove_entry = Some(k);
                                 }
@@ -1464,34 +1464,81 @@ impl App {
                         egui::TextEdit::multiline(&mut entry.text)
                             .desired_rows(2)
                             .desired_width(f32::INFINITY)
-                            .hint_text("這段照片要顯示的字幕（可多行）"),
+                            .hint_text("這段照片要顯示的文字（可多行）"),
                     );
-                    if resp.changed() {
-                        entries_changed = true;
+                    if resp.gained_focus() {
+                        select_entry = Some(k);
                     }
+                    slider_row(ui, &mut entry.size, 8, 300, "大小");
+                    // 旋轉（f32 度數）：連點兩下歸零
+                    ui.horizontal(|ui| {
+                        let (rect, _) = ui
+                            .allocate_exact_size(egui::vec2(30.0, 18.0), egui::Sense::hover());
+                        ui.painter().text(
+                            rect.left_center(),
+                            egui::Align2::LEFT_CENTER,
+                            "旋轉",
+                            egui::FontId::proportional(12.5),
+                            theme::TEXT_WEAK,
+                        );
+                        ui.spacing_mut().slider_width =
+                            (ui.available_width() - 44.0).max(60.0);
+                        let resp = ui.add(
+                            egui::Slider::new(&mut entry.rot, -180.0..=180.0)
+                                .show_value(false),
+                        );
+                        if resp.hovered()
+                            && ui.input(|i| {
+                                i.pointer
+                                    .button_double_clicked(egui::PointerButton::Primary)
+                            })
+                        {
+                            entry.rot = 0.0;
+                        }
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.add_space(8.0);
+                                let color = if entry.rot.abs() > 0.01 {
+                                    theme::ACCENT
+                                } else {
+                                    theme::TEXT_WEAK
+                                };
+                                ui.label(
+                                    egui::RichText::new(format!("{:.0}°", entry.rot))
+                                        .size(11.5)
+                                        .color(color),
+                                );
+                            },
+                        );
+                    });
                 });
             ui.add_space(6.0);
         }
+        if let Some(k) = select_entry {
+            self.sel_text = Some(k);
+        }
         if let Some(k) = remove_entry {
             self.sub_entries.remove(k);
-            entries_changed = true;
+            self.sel_text = match self.sel_text {
+                Some(s) if s == k => None,
+                Some(s) if s > k => Some(s - 1),
+                other => other,
+            };
         }
         if self.sub_entries.is_empty() {
             ui.label(
-                egui::RichText::new("尚未加入字幕，點右上「＋ 新增段落」開始")
+                egui::RichText::new("尚未加入文字，點右上「＋ 新增文字」開始")
                     .size(11.5)
                     .color(theme::TEXT_WEAK),
             );
         }
-        if entries_changed {
-            self.mark_preview_dirty();
-        }
         ui.add_space(10.0);
 
         if self.fonts.is_empty() {
-            ui.colored_label(theme::ERROR, "找不到可用的系統字型，字幕功能無法使用");
+            ui.colored_label(theme::ERROR, "找不到可用的系統字型，文字功能無法使用");
         } else {
-            group_label(ui, "字幕樣式");
+            group_label(ui, "文字樣式（全部共用）");
             ui.add_space(2.0);
             egui::Frame::default()
                 .fill(theme::CARD)
@@ -1518,7 +1565,6 @@ impl App {
                                 }
                             });
                     });
-                    slider_row(ui, &mut self.sub_style.size, 12, 200, "大小");
                     slider_row(ui, &mut self.sub_style.outline_w, 0, 8, "外框");
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("文字").color(theme::TEXT_WEAK));
@@ -1527,22 +1573,9 @@ impl App {
                         ui.label(egui::RichText::new("外框").color(theme::TEXT_WEAK));
                         ui.color_edit_button_srgba(&mut self.sub_style.outline_color);
                         ui.add_space(10.0);
-                        ui.label(egui::RichText::new("位置").color(theme::TEXT_WEAK));
-                        egui::ComboBox::from_id_salt("sub_pos")
-                            .selected_text(self.sub_style.pos.label())
-                            .width(70.0)
-                            .show_ui(ui, |ui| {
-                                for p in SubPos::ALL {
-                                    ui.selectable_value(&mut self.sub_style.pos, p, p.label());
-                                }
-                            });
+                        ui.checkbox(&mut self.sub_style.boxed, "半透明底框");
                     });
-                    ui.checkbox(&mut self.sub_style.boxed, "半透明底框");
                 });
-        }
-
-        if self.sub_style != style_before {
-            self.mark_preview_dirty();
         }
     }
 
@@ -1759,9 +1792,10 @@ impl App {
         // 預覽卡片
         let film_h = 96.0;
         let preview_h = (ui.available_height() - film_h - 14.0).max(160.0);
-        let (rect, _) = ui.allocate_exact_size(
+        // Sense::click：點擊預覽空白處可取消文字選取
+        let (rect, bg_resp) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), preview_h),
-            egui::Sense::hover(),
+            egui::Sense::click(),
         );
         let p = ui.painter().clone();
         p.rect_filled(rect, 10, theme::PREVIEW_BG);
@@ -1780,8 +1814,10 @@ impl App {
             }),
             _ => None,
         };
+        let mut img_rect_opt: Option<egui::Rect> = None;
         if let Some(tex) = self.preview_tex.as_ref().or(placeholder.as_ref()) {
             let img_rect = fit_rect(tex.size_vec2(), rect.shrink(14.0));
+            img_rect_opt = Some(img_rect);
             p.image(
                 tex.id(),
                 img_rect,
@@ -1800,7 +1836,7 @@ impl App {
             p.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "點選下方縮圖即可預覽調色與字幕效果",
+                "點選下方縮圖即可預覽調色與文字效果",
                 egui::FontId::proportional(13.0),
                 theme::TEXT_WEAK,
             );
@@ -1852,6 +1888,14 @@ impl App {
                 egui::FontId::proportional(12.0),
                 theme::ERROR,
             );
+        }
+
+        // 文字即時繪製與互動編輯（拖曳移動、角落縮放、旋轉把手）
+        if let Some(ir) = img_rect_opt {
+            self.ui_text_overlay(ui, rect, ir);
+        }
+        if bg_resp.clicked() {
+            self.sel_text = None;
         }
 
         ui.add_space(10.0);
@@ -1961,6 +2005,202 @@ impl App {
                 self.clear_photos();
             } else if let Some(i) = remove_idx {
                 self.remove_photo(i);
+            }
+        }
+    }
+
+    /// 預覽區的文字即時繪製與互動編輯。
+    /// 文字由 egui 直接畫在預覽圖上（非 ffmpeg 燒錄），
+    /// 拖曳＝移動、角落把手＝縮放、頂部圓形把手＝旋轉，全部零延遲
+    fn ui_text_overlay(&mut self, ui: &mut egui::Ui, card: egui::Rect, img: egui::Rect) {
+        let Some(cur_idx) = self.preview_selected else { return };
+        let cur = cur_idx + 1;
+        let style = self.sub_style.clone();
+        let res_h = self.resolution.h as f32;
+        let p = ui.painter().with_clip_rect(card);
+        let scale = img.height() / 1080.0;
+        let ow_screen = style.outline_w as f32 * img.height() / res_h;
+
+        for k in 0..self.sub_entries.len() {
+            let e = &self.sub_entries[k];
+            if !(e.start..=e.end).contains(&cur) || e.text.trim().is_empty() {
+                continue;
+            }
+            let (text, ex, ey, esize, erot) =
+                (e.text.trim_end().to_string(), e.x, e.y, e.size, e.rot);
+
+            let font_px = (esize as f32 * scale).max(2.0);
+            let galley = p.layout(
+                text,
+                egui::FontId::proportional(font_px),
+                style.color,
+                f32::INFINITY,
+            );
+            let half = galley.size() / 2.0;
+            let center = img.min + egui::vec2(ex * img.width(), ey * img.height());
+            let angle = erot.to_radians();
+
+            // 半透明底框（近似輸出的 box=1）
+            if style.boxed {
+                let pad = (font_px * 0.25).max(2.0);
+                let ext = half + egui::vec2(pad, pad);
+                let corners: Vec<egui::Pos2> = [
+                    egui::vec2(-ext.x, -ext.y),
+                    egui::vec2(ext.x, -ext.y),
+                    egui::vec2(ext.x, ext.y),
+                    egui::vec2(-ext.x, ext.y),
+                ]
+                .into_iter()
+                .map(|v| center + rot_vec(v, angle))
+                .collect();
+                p.add(egui::Shape::convex_polygon(
+                    corners,
+                    egui::Color32::from_black_alpha(102),
+                    egui::Stroke::NONE,
+                ));
+            }
+
+            // 外框（近似 ffmpeg 的 borderw：以 8 個方向偏移重繪）＋本體
+            let mk = |off: egui::Vec2, override_color: Option<egui::Color32>| {
+                let pos = center + rot_vec(-half + off, angle);
+                let mut ts =
+                    egui::epaint::TextShape::new(pos.round(), galley.clone(), style.color);
+                ts.angle = angle;
+                ts.override_text_color = override_color;
+                egui::Shape::Text(ts)
+            };
+            if ow_screen > 0.05 {
+                for (dx, dy) in [
+                    (-1.0, 0.0),
+                    (1.0, 0.0),
+                    (0.0, -1.0),
+                    (0.0, 1.0),
+                    (-0.7, -0.7),
+                    (0.7, -0.7),
+                    (-0.7, 0.7),
+                    (0.7, 0.7),
+                ] {
+                    p.add(mk(
+                        egui::vec2(dx, dy) * ow_screen,
+                        Some(style.outline_color),
+                    ));
+                }
+            }
+            p.add(mk(egui::Vec2::ZERO, None));
+
+            // 主體互動：以旋轉後的外接矩形當點擊/拖曳範圍
+            let bb_ext = egui::vec2(
+                half.x * angle.cos().abs() + half.y * angle.sin().abs(),
+                half.x * angle.sin().abs() + half.y * angle.cos().abs(),
+            ) + egui::vec2(6.0, 6.0);
+            let bbox = egui::Rect::from_center_size(center, bb_ext * 2.0);
+            let id = ui.id().with(("free_text", k));
+            let resp = ui.interact(bbox, id, egui::Sense::click_and_drag());
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+            }
+            if resp.clicked() || resp.drag_started() {
+                self.sel_text = Some(k);
+            }
+            if resp.dragged() {
+                let d = resp.drag_delta();
+                let en = &mut self.sub_entries[k];
+                en.x = (en.x + d.x / img.width()).clamp(0.0, 1.0);
+                en.y = (en.y + d.y / img.height()).clamp(0.0, 1.0);
+            }
+
+            // 選取框與把手
+            if self.sel_text == Some(k) {
+                let ext = half + egui::vec2(8.0, 8.0);
+                let corners_local = [
+                    egui::vec2(-ext.x, -ext.y),
+                    egui::vec2(ext.x, -ext.y),
+                    egui::vec2(ext.x, ext.y),
+                    egui::vec2(-ext.x, ext.y),
+                ];
+                let corners: Vec<egui::Pos2> = corners_local
+                    .iter()
+                    .map(|v| center + rot_vec(*v, angle))
+                    .collect();
+                for i in 0..4 {
+                    p.line_segment(
+                        [corners[i], corners[(i + 1) % 4]],
+                        egui::Stroke::new(1.5, theme::ACCENT),
+                    );
+                }
+
+                // 角落縮放把手
+                for (ci, c) in corners.iter().enumerate() {
+                    let vis = egui::Rect::from_center_size(*c, egui::vec2(9.0, 9.0));
+                    p.rect_filled(vis, 2, egui::Color32::WHITE);
+                    p.rect_stroke(
+                        vis,
+                        2,
+                        egui::Stroke::new(1.5, theme::ACCENT),
+                        egui::StrokeKind::Inside,
+                    );
+                    let hresp = ui.interact(
+                        egui::Rect::from_center_size(*c, egui::vec2(14.0, 14.0)),
+                        id.with(("corner", ci)),
+                        egui::Sense::drag(),
+                    );
+                    if hresp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+                    }
+                    if hresp.dragged() {
+                        if let Some(ptr) = hresp.interact_pointer_pos() {
+                            let prev = ptr - hresp.drag_delta();
+                            let d0 = (prev - center).length();
+                            let d1 = (ptr - center).length();
+                            if d0 > 4.0 {
+                                let en = &mut self.sub_entries[k];
+                                en.size = (en.size as f32 * d1 / d0)
+                                    .round()
+                                    .clamp(8.0, 300.0)
+                                    as i32;
+                            }
+                        }
+                    }
+                }
+
+                // 旋轉把手（頂邊中點向外延伸的圓形）
+                let top_mid = center + rot_vec(egui::vec2(0.0, -ext.y), angle);
+                let handle = center + rot_vec(egui::vec2(0.0, -ext.y - 22.0), angle);
+                p.line_segment([top_mid, handle], egui::Stroke::new(1.5, theme::ACCENT));
+                p.circle_filled(handle, 5.5, theme::ACCENT);
+                p.circle_stroke(handle, 5.5, egui::Stroke::new(1.5, egui::Color32::WHITE));
+                let rresp = ui.interact(
+                    egui::Rect::from_center_size(handle, egui::vec2(16.0, 16.0)),
+                    id.with("rotate"),
+                    egui::Sense::drag(),
+                );
+                if rresp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                }
+                if rresp.dragged() {
+                    if let Some(ptr) = rresp.interact_pointer_pos() {
+                        let v = ptr - center;
+                        if v.length() > 4.0 {
+                            let mut deg = v.y.atan2(v.x).to_degrees() + 90.0;
+                            if deg > 180.0 {
+                                deg -= 360.0;
+                            }
+                            if deg < -180.0 {
+                                deg += 360.0;
+                            }
+                            // 靠近 45° 倍數時吸附
+                            for s in
+                                [-180.0f32, -135.0, -90.0, -45.0, 0.0, 45.0, 90.0, 135.0, 180.0]
+                            {
+                                if (deg - s).abs() < 4.0 {
+                                    deg = s;
+                                    break;
+                                }
+                            }
+                            self.sub_entries[k].rot = deg;
+                        }
+                    }
+                }
             }
         }
     }
@@ -2428,6 +2668,12 @@ fn fit_rect(tex_size: egui::Vec2, bounds: egui::Rect) -> egui::Rect {
     egui::Rect::from_center_size(bounds.center(), tex_size * s)
 }
 
+/// 以角度 a（弧度，順時針）旋轉向量
+fn rot_vec(v: egui::Vec2, a: f32) -> egui::Vec2 {
+    let (s, c) = a.sin_cos();
+    egui::vec2(v.x * c - v.y * s, v.x * s + v.y * c)
+}
+
 /// 膠卷縮圖項目
 fn thumb_item(
     ui: &mut egui::Ui,
@@ -2703,17 +2949,6 @@ fn ensure_ffmpeg(on_download: impl Fn()) -> Result<(), String> {
     Ok(())
 }
 
-/// 內容相同就不重寫，避免每次預覽渲染都做磁碟寫入
-/// （拖動調色滑桿時字幕內容通常沒變）
-fn write_if_changed(path: &Path, content: &str) -> std::io::Result<()> {
-    if let Ok(existing) = std::fs::read_to_string(path) {
-        if existing == content {
-            return Ok(());
-        }
-    }
-    std::fs::write(path, content)
-}
-
 /// 預覽底圖快取：拖動調色滑桿時會對同一張照片反覆重渲染，
 /// 把「縮放後的底圖」存成暫存 BMP 後改以小圖當輸入，
 /// 免去每次重新解碼原始大圖（大照片可省下大半渲染時間）
@@ -2813,15 +3048,8 @@ enum BaseRole {
     Skip,
 }
 
-/// 用 ffmpeg 渲染單張照片的預覽（含調色與字幕，縮小並依輸出比例補邊），回傳 RGB 像素
-fn render_preview(
-    photo: &Path,
-    adj: &Adjustments,
-    res: Resolution,
-    captions: &[String],
-    style: &SubtitleStyle,
-    font: Option<&Path>,
-) -> PreviewResult {
+/// 用 ffmpeg 渲染單張照片的預覽（含調色，縮小並依輸出比例補邊），回傳 RGB 像素
+fn render_preview(photo: &Path, adj: &Adjustments, res: Resolution) -> PreviewResult {
     ensure_ffmpeg(|| {})?;
 
     let (pw, ph) = preview_canvas(res);
@@ -2863,23 +3091,13 @@ fn render_preview(
         }
     };
 
-    // 與輸出相同順序：先縮放、再調色、後補邊，最後上字幕。
-    // chain 為縮放之後的濾鏡（調色、補邊、字幕）
+    // 與輸出相同順序：先縮放、再調色、後補邊。
+    // chain 為縮放之後的濾鏡（調色、補邊）
     let adjust_mid = adj
         .filter_chain()
         .map(|c| format!("{c},"))
         .unwrap_or_default();
-    let mut chain = format!("{adjust_mid}pad={pw}:{ph}:(ow-iw)/2:(oh-ih)/2:color=black");
-    if let Some(font) = font {
-        let fontsize = style.size as f64 * ph as f64 / 1080.0;
-        for (k, text) in captions.iter().enumerate() {
-            let cap_path = std::env::temp_dir().join(format!("photo2video_cap_preview_{k}.txt"));
-            write_if_changed(&cap_path, text.trim_end())
-                .map_err(|e| format!("無法寫入字幕暫存檔：{e}"))?;
-            chain.push(',');
-            chain.push_str(&drawtext_filter(font, &cap_path, style, fontsize, ph, None));
-        }
-    }
+    let chain = format!("{adjust_mid}pad={pw}:{ph}:(ow-iw)/2:(oh-ih)/2:color=black");
     let scale = format!("scale={pw}:{ph}:force_original_aspect_ratio=decrease");
 
     // 直接以 rawvideo 從 stdout 取回 RGB 像素，省去圖檔編碼、寫檔與再解碼
@@ -2958,11 +3176,22 @@ fn render_preview(
     Ok(frame.unwrap())
 }
 
-/// 一次轉換的字幕資料：全域樣式 + 各段落（0-based 含端點的照片區間與文字）
+/// 輸出用的一段文字（照片區間為 0-based 含端點）
+struct TextJob {
+    s: usize,
+    e: usize,
+    text: String,
+    x: f32,
+    y: f32,
+    size: i32,
+    rot: f32,
+}
+
+/// 一次轉換的文字資料：全域樣式 + 各段文字
 struct SubtitleJob {
     style: SubtitleStyle,
     font: Option<PathBuf>,
-    entries: Vec<(usize, usize, String)>,
+    entries: Vec<TextJob>,
 }
 
 // 轉換任務的完整參數組，拆包裝反而失去可讀性
@@ -3042,39 +3271,48 @@ fn run_conversion(
         vf.push_str(&format!(",fps={OUT_FPS}"));
     }
 
-    // 字幕：每個段落產生一段 drawtext，用時間區間涵蓋該段照片
+    // 文字：無旋轉的直接串 drawtext；有旋轉的先記下來，
+    // 之後走「透明畫布 drawtext → rotate → overlay」的 filter_complex 分支
     let out_fps = if animated { OUT_FPS } else { fps };
     let mut caption_files: Vec<PathBuf> = Vec::new();
+    // (段文字, 字幕檔, 顯示區間)
+    let mut rotated: Vec<(&TextJob, PathBuf, (f64, f64))> = Vec::new();
     if let Some(font) = &subs.font {
-        let fontsize = subs.style.size as f64 * h as f64 / 1080.0;
         let d = eff_dur;
         // 以半個「輸出影格」為緩衝，準確涵蓋第 s ~ e 張照片的所有格；
         // 動態模式輸出為 30fps，若以照片時長的比例當緩衝，
         // fps 低時字幕會提早出現/消失（如每張 1 秒會早 0.25 秒）
         let buf = 0.5 / out_fps as f64;
-        for (k, (s, e, text)) in subs.entries.iter().enumerate() {
-            let text = text.trim_end();
+        for (k, en) in subs.entries.iter().enumerate() {
+            let text = en.text.trim_end();
             if text.is_empty() {
                 continue;
             }
             let cap_path = std::env::temp_dir().join(format!("photo2video_cap_{k}.txt"));
             std::fs::write(&cap_path, text).map_err(|e| format!("無法寫入字幕暫存檔：{e}"))?;
-            let enable = (*s as f64 * d - buf, (*e as f64 + 1.0) * d - buf);
-            vf.push(',');
-            vf.push_str(&drawtext_filter(
-                font,
-                &cap_path,
-                &subs.style,
-                fontsize,
-                h,
-                Some(enable),
-            ));
+            let enable = (en.s as f64 * d - buf, (en.e as f64 + 1.0) * d - buf);
+            let fontsize = en.size as f64 * h as f64 / 1080.0;
+            if en.rot.abs() < 0.5 {
+                vf.push(',');
+                vf.push_str(&drawtext_filter(
+                    font,
+                    &cap_path,
+                    &subs.style,
+                    fontsize,
+                    en.x,
+                    en.y,
+                    Some(enable),
+                ));
+            } else {
+                rotated.push((en, cap_path.clone(), enable));
+            }
             caption_files.push(cap_path);
         }
     }
 
     // 轉場（淡入淡出）：eq 以每格評估的週期函數在每個切點附近把亮度與飽和度壓到黑，
     // 首尾也各有一次淡入/淡出；不用串接大量 fade 濾鏡（fade 的 st 前後會整段變黑）
+    let mut tail = String::new();
     if fx.transition == Transition::FadeBlack {
         let f = (eff_dur * 0.4).clamp(0.05, 0.5);
         let dip = format!(
@@ -3082,11 +3320,13 @@ fn run_conversion(
             d = eff_dur,
             f = f
         );
-        vf.push_str(&format!(
-            ",eq=eval=frame:brightness='-{dip}':saturation='max(0,1-{dip})'"
+        tail.push_str(&format!(
+            "eq=eval=frame:brightness='-{dip}':saturation='max(0,1-{dip})',"
         ));
     }
-    vf.push_str(",setsar=1,format=yuv420p");
+    tail.push_str("setsar=1,format=yuv420p");
+
+    let use_complex = !rotated.is_empty();
 
     let mut cmd = FfmpegCommand::new();
     cmd.arg("-y")
@@ -3098,13 +3338,47 @@ fn run_conversion(
         cmd.args(["-stream_loop", "-1"]);
         cmd.input(m.path.to_string_lossy());
     }
-    cmd.args(["-vf", &vf])
-        .args(["-r", &out_fps.to_string()])
+
+    if use_complex {
+        // 每段旋轉文字：畫在全幅透明畫布中央 → 以畫布中心旋轉 → overlay 到
+        // 目標位置（畫布中心對齊文字中心點），顯示區間由 overlay 的 enable 控制
+        let mut fc = format!("[0:v]{vf}[v0];");
+        let mut cur = "v0".to_string();
+        for (i, (en, cap, (ea, eb))) in rotated.iter().enumerate() {
+            let font = subs.font.as_ref().unwrap();
+            let fontsize = en.size as f64 * h as f64 / 1080.0;
+            let dt = drawtext_filter(font, cap, &subs.style, fontsize, 0.5, 0.5, None);
+            let rad = (en.rot as f64).to_radians();
+            fc.push_str(&format!(
+                "color=c=black@0.0:s={w}x{h}:r={out_fps}:d={total_secs:.3},format=rgba,{dt},rotate={rad:.6}:ow=iw:oh=ih:c=none[t{i}];"
+            ));
+            let ox = ((en.x - 0.5) * w as f32).round();
+            let oy = ((en.y - 0.5) * h as f32).round();
+            let next = format!("v{}", i + 1);
+            fc.push_str(&format!(
+                "[{cur}][t{i}]overlay=x={ox:.0}:y={oy:.0}:enable='between(t,{ea:.3},{eb:.3})'[{next}];"
+            ));
+            cur = next;
+        }
+        fc.push_str(&format!("[{cur}]{tail}[vout]"));
+        cmd.args(["-filter_complex", &fc]);
+        cmd.args(["-map", "[vout]"]);
+    } else {
+        vf.push(',');
+        vf.push_str(&tail);
+        cmd.args(["-vf", &vf]);
+    }
+
+    cmd.args(["-r", &out_fps.to_string()])
         // 精確限制總長度，避免 concat 清單重複最後一張造成多出一格
         .args(["-t", &format!("{total_secs}")]);
 
     if let Some(m) = &fx.music {
-        cmd.args(["-map", "0:v", "-map", "1:a"]);
+        if use_complex {
+            cmd.args(["-map", "1:a"]);
+        } else {
+            cmd.args(["-map", "0:v", "-map", "1:a"]);
+        }
         let mut af = format!("volume={:.3}", m.volume.max(0) as f64 / 100.0);
         if m.fade_out && total_secs > 3.0 {
             af.push_str(&format!(",afade=t=out:st={:.3}:d=2", total_secs - 2.0));
