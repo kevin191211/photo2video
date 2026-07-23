@@ -334,6 +334,52 @@ fn config_path() -> PathBuf {
         .join("config.json")
 }
 
+/// 閃退紀錄路徑：%APPDATA%\photo2video\crash.log
+fn crash_log_path() -> PathBuf {
+    config_path().with_file_name("crash.log")
+}
+
+/// 安裝 panic hook：任何執行緒 panic 時把訊息、位置與 backtrace 寫入 crash.log，
+/// 下次啟動偵測到就顯示回報介面。release 版已 strip 符號，backtrace 只有位址，
+/// 但 panic 訊息與原始碼位置（file:line）仍是編譯期字串，足以定位問題
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "（無法取得錯誤內容）".into());
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "未知位置".into());
+        let bt = std::backtrace::Backtrace::force_capture();
+        let report = format!(
+            "Photo2Video v{}\npanic：{msg}\n位置：{loc}\n\nbacktrace：\n{bt}",
+            env!("CARGO_PKG_VERSION")
+        );
+        let path = crash_log_path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        // 只保留最後一次：多次 panic 時最新的最接近使用者實際遇到的問題
+        let _ = std::fs::write(&path, &report);
+        default_hook(info);
+    }));
+}
+
+/// 讀出上次留下的閃退紀錄並刪除檔案（讀過就清掉，避免每次啟動重複提示）
+fn take_crash_report() -> Option<String> {
+    let path = crash_log_path();
+    let report = std::fs::read_to_string(&path)
+        .ok()
+        .filter(|s| !s.trim().is_empty())?;
+    let _ = std::fs::remove_file(&path);
+    Some(report)
+}
+
 /// 讀取上次儲存的每秒張數；沒有設定檔或值不合法時回傳 None
 fn load_saved_fps() -> Option<u32> {
     let txt = std::fs::read_to_string(config_path()).ok()?;
@@ -620,6 +666,10 @@ struct App {
     fps_pending_save: Option<Instant>,
     /// 按下「複製錯誤」的時間；短暫顯示「已複製」確認用
     err_copied_at: Option<Instant>,
+    /// 上次執行留下的閃退紀錄（crash.log 內容）；有值時在底欄顯示回報橫幅
+    crash_report: Option<String>,
+    /// 按下閃退橫幅「複製錯誤」的時間；短暫顯示「已複製」確認用
+    crash_copied_at: Option<Instant>,
     /// 剛選的資料夾/檔案沒有找到任何照片；在空狀態顯示提示，避免使用者以為沒反應
     import_found_nothing: bool,
 }
@@ -698,6 +748,8 @@ impl App {
             about_open: false,
             fps_pending_save: None,
             err_copied_at: None,
+            crash_report: take_crash_report(),
+            crash_copied_at: None,
             import_found_nothing: false,
         };
         // 啟動時在背景檢查是否有新版本（失敗不影響使用）
@@ -1234,6 +1286,70 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(16, 12)),
             )
             .show(ctx, |ui| {
+                // 上次執行閃退：顯示回報橫幅（複製錯誤／開 GitHub 回報頁／關閉）
+                if let Some(report) = self.crash_report.clone() {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("⚠ 程式上次異常關閉")
+                                .size(12.0)
+                                .strong()
+                                .color(theme::ERROR),
+                        );
+                        if ui
+                            .small_button("🔗 回報問題")
+                            .on_hover_text("開啟回報頁面（已帶入錯誤與版本）")
+                            .clicked()
+                        {
+                            // GitHub issue 網址有長度上限，中文經百分比編碼後長度
+                            // 會膨脹三倍，內文只帶前段；完整內容請使用者用「複製錯誤」貼上
+                            let mut excerpt: String = report.chars().take(1200).collect();
+                            if excerpt.len() < report.len() {
+                                excerpt.push_str(
+                                    "\n…（內容過長已截斷，完整訊息可按「複製錯誤」後貼上）",
+                                );
+                            }
+                            let body = format!(
+                                "版本：v{}\n作業系統：Windows\n\n閃退紀錄：\n{excerpt}\n\n（發生了什麼、當時在做哪個操作，可補充於此）",
+                                env!("CARGO_PKG_VERSION")
+                            );
+                            let url = format!(
+                                "https://github.com/{GITHUB_REPO}/issues/new?title={}&body={}",
+                                urlencode("程式閃退回報"),
+                                urlencode(&body)
+                            );
+                            ctx.open_url(egui::OpenUrl::new_tab(url));
+                        }
+                        let just_copied = self
+                            .crash_copied_at
+                            .is_some_and(|t| t.elapsed().as_secs_f32() < 2.0);
+                        let label = if just_copied {
+                            "✓ 已複製"
+                        } else {
+                            "📋 複製錯誤"
+                        };
+                        if ui
+                            .small_button(label)
+                            .on_hover_text("複製閃退紀錄，方便貼給開發者")
+                            .clicked()
+                        {
+                            ctx.copy_text(report.clone());
+                            self.crash_copied_at = Some(Instant::now());
+                        }
+                        if just_copied {
+                            ui.ctx().request_repaint_after(Duration::from_millis(300));
+                        }
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui.small_button("✕").on_hover_text("隱藏通知").clicked() {
+                                    self.crash_report = None;
+                                }
+                            },
+                        );
+                    });
+                    ui.add_space(8.0);
+                }
+
                 // 新版本通知：點「立即更新」直接下載並自動重啟完成更新
                 let new_tag = match &self.update_status {
                     UpdateStatus::Available(tag) if !self.update_banner_dismissed => {
@@ -3888,6 +4004,9 @@ fn load_app_icon() -> egui::IconData {
 }
 
 fn main() -> eframe::Result {
+    // 越早裝越好：連啟動階段（字型載入、視窗建立）的 panic 都要留下紀錄
+    install_panic_hook();
+
     // 清掉上次一鍵更新留下的舊版檔案
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::fs::remove_file(exe.with_extension("exe.old"));
