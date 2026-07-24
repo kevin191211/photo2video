@@ -609,6 +609,10 @@ fn download_update(tag: &str, progress: &dyn Fn(f32)) -> Result<(), String> {
 
 /// 重新啟動程式（新版 exe 已放在原本的路徑上）
 fn restart_app() {
+    // process::exit 不執行解構子，App::drop 的暫存清理不會跑；
+    // 暫存檔名帶行程 PID，重啟後的新行程也不會清到這些檔案，
+    // 不在這裡先清掉的話，每次自動更新都會留下孤兒暫存檔持續累積
+    clean_own_temp_files();
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::process::Command::new(exe).spawn();
     }
