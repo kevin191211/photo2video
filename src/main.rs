@@ -1370,6 +1370,11 @@ impl App {
         self.preview_error = None;
         // 主動清空不是「找不到照片」，別讓上次的提示殘留到空狀態
         self.import_found_nothing = false;
+        // 清掉上一次的轉換結果橫幅（完成/失敗）：否則「清空」後底欄仍
+        // 顯示「✔ 轉換完成＋舊輸出路徑」，「開啟資料夾」也指向舊輸出，
+        // 與空白畫面不符。clear_photos 只在非轉檔時被呼叫，重置為 Idle
+        // 安全（new_project／load_project 呼叫本函式後不必再自行重置）
+        self.state = ConvertState::Idle;
     }
 
     fn remove_photo(&mut self, i: usize) {
@@ -1556,11 +1561,7 @@ impl App {
     /// 開新專案：回到空狀態，所有編輯設定回復預設
     /// （fps 保留使用者慣用值，與程式啟動時一致）
     fn new_project(&mut self) {
-        self.clear_photos();
-        // 清掉上一個專案的轉換結果橫幅（完成/失敗）：留著會誤導使用者
-        // 以為目前的專案已轉出，「開啟資料夾」也會指向舊專案的輸出。
-        // 只能在非轉檔中觸發，直接重置為 Idle 安全
-        self.state = ConvertState::Idle;
+        self.clear_photos(); // 內含轉換結果橫幅（state）的重置
         self.adj = Adjustments::default();
         self.sel_adj = Adjustments::default();
         self.sub_entries.clear();
@@ -1656,9 +1657,7 @@ impl App {
             kept_before[i + 1] = kept_before[i] + usize::from(*e);
         }
 
-        self.clear_photos();
-        // 與 new_project 相同：清掉上一個專案殘留的轉換完成/失敗橫幅
-        self.state = ConvertState::Idle;
+        self.clear_photos(); // 內含轉換結果橫幅（state）的重置
         self.photos = pf
             .photos
             .iter()
