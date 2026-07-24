@@ -1565,13 +1565,19 @@ impl App {
                 return;
             }
         };
-        match std::fs::write(path, json) {
+        // 原子寫入：先寫臨時檔再 rename 覆蓋。直接覆寫既有專案檔時若寫到
+        // 一半崩潰/斷電，會損壞使用者辛苦設定的整個專案（照片、調色、文字、
+        // 音樂全丟）。先寫 .tmp 成功才置換，既有專案檔在意外時仍完好
+        let tmp = path.with_extension(format!("{PROJECT_EXT}.tmp"));
+        let result = std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, path));
+        match result {
             Ok(()) => {
                 self.remember_recent_project(path);
                 self.current_project = Some(path.to_path_buf());
                 self.project_saved_at = Some(Instant::now());
             }
             Err(e) => {
+                let _ = std::fs::remove_file(&tmp); // 失敗時不留臨時檔
                 rfd::MessageDialog::new()
                     .set_level(rfd::MessageLevel::Error)
                     .set_title("儲存專案失敗")
