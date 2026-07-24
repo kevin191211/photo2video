@@ -3797,8 +3797,11 @@ impl eframe::App for App {
                         any_dir = true;
                         files.extend(collect_images_in_dir(&p));
                     } else if is_audio(&p) {
-                        // 拖入音訊檔＝設定為背景音樂
+                        // 拖入音訊檔＝設定為背景音樂，並展開「轉場與音樂」區塊
+                        // （比照新增文字自動展開）：收合時拖入音樂否則毫無回饋，
+                        // 使用者會以為沒設定成功
                         self.music_path = Some(p);
+                        self.sec_fx_open = true;
                     } else {
                         files.push(p);
                     }
