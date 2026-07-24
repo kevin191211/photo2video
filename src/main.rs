@@ -1612,6 +1612,10 @@ impl App {
             .map(|(p, _)| p.clone())
             .collect();
         self.fps = pf.fps.clamp(1, 60);
+        // 取消尚未落盤的 fps 延遲寫入：設定檔的 fps 是「使用者慣用值」，
+        // 若剛拖完滑桿（計時器還掛著）就載入專案，時間一到會把「專案的
+        // fps」誤存成慣用值（關閉程式時 App::drop 的補寫同理）
+        self.fps_pending_save = None;
         self.format = OutputFormat::from_ext(&pf.format).unwrap_or(OutputFormat::Mp4);
         // 只接受選單裡有的解析度，避免手改出怪尺寸讓下拉選單對不上
         self.resolution = Resolution::ALL
