@@ -1879,6 +1879,9 @@ impl App {
         ) {
             return;
         }
+        // 清掉上次的下載失敗訊息：重新檢查代表要重走更新流程，否則檢查完
+        // 底欄會同時顯示「有新版本」與殘留的「更新下載失敗」，互相矛盾
+        self.update_download_error = None;
         self.update_status = UpdateStatus::Checking;
         let (tx, rx) = std::sync::mpsc::channel();
         self.update_rx = Some(rx);
