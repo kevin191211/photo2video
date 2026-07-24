@@ -603,37 +603,46 @@ fn download_update(tag: &str, progress: &dyn Fn(f32)) -> Result<(), String> {
 
     // 下載到同資料夾的暫存檔（同一磁碟才能直接改名替換）
     let tmp = exe.with_extension("exe.new");
-    let mut reader = resp.into_reader();
-    let mut file = std::fs::File::create(&tmp).map_err(|e| format!("無法建立暫存檔：{e}"))?;
-    let mut buf = [0u8; 64 * 1024];
-    let mut done: f64 = 0.0;
-    let mut last_pct: i32 = -1;
-    loop {
-        let n = reader.read(&mut buf).map_err(|e| format!("下載中斷：{e}"))?;
-        if n == 0 {
-            break;
-        }
-        file.write_all(&buf[..n])
-            .map_err(|e| format!("寫入暫存檔失敗：{e}"))?;
-        done += n as f64;
-        if total > 0.0 {
-            let pct = (done / total * 100.0) as i32;
-            if pct != last_pct {
-                last_pct = pct;
-                progress((done / total) as f32);
+    // 下載＋驗證包成一段，任何一步失敗都清掉暫存檔：否則網路中斷（read/
+    // write 失敗）會在程式目錄留下殘缺的 exe.new，只有 MZ 驗證那步會清
+    let download = || -> Result<(), String> {
+        let mut reader = resp.into_reader();
+        let mut file =
+            std::fs::File::create(&tmp).map_err(|e| format!("無法建立暫存檔：{e}"))?;
+        let mut buf = [0u8; 64 * 1024];
+        let mut done: f64 = 0.0;
+        let mut last_pct: i32 = -1;
+        loop {
+            let n = reader.read(&mut buf).map_err(|e| format!("下載中斷：{e}"))?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n])
+                .map_err(|e| format!("寫入暫存檔失敗：{e}"))?;
+            done += n as f64;
+            if total > 0.0 {
+                let pct = (done / total * 100.0) as i32;
+                if pct != last_pct {
+                    last_pct = pct;
+                    progress((done / total) as f32);
+                }
             }
         }
-    }
-    drop(file);
+        drop(file);
 
-    // 簡單驗證是 Windows 執行檔（MZ 開頭），避免把錯誤頁面存成 exe
-    let mut magic = [0u8; 2];
-    std::fs::File::open(&tmp)
-        .and_then(|mut f| f.read_exact(&mut magic))
-        .map_err(|e| format!("暫存檔讀取失敗：{e}"))?;
-    if &magic != b"MZ" {
+        // 簡單驗證是 Windows 執行檔（MZ 開頭），避免把錯誤頁面存成 exe
+        let mut magic = [0u8; 2];
+        std::fs::File::open(&tmp)
+            .and_then(|mut f| f.read_exact(&mut magic))
+            .map_err(|e| format!("暫存檔讀取失敗：{e}"))?;
+        if &magic != b"MZ" {
+            return Err("下載的檔案不是有效的執行檔".into());
+        }
+        Ok(())
+    };
+    if let Err(e) = download() {
         let _ = std::fs::remove_file(&tmp);
-        return Err("下載的檔案不是有效的執行檔".into());
+        return Err(e);
     }
 
     // 執行中的 exe 不能覆寫，但可以改名：舊檔改 .old、新檔補上原位
@@ -687,6 +696,22 @@ fn detect_fonts() -> Vec<(String, PathBuf)> {
 
 /// 百分比編碼（供組 GitHub 回報網址用）：非「未保留字元」的位元組一律以 %XX 表示，
 /// 中文等 UTF-8 多位元組也逐位元組編碼，瀏覽器與 GitHub 都能正確還原
+/// 把秒數格式化為易讀的影片長度（給底欄顯示預計輸出長度用）。
+/// 一分鐘以上顯示「M 分 S 秒」，短片顯示一位小數，才看得出每秒張數的差別
+fn fmt_video_len(secs: f64) -> String {
+    if secs >= 60.0 {
+        let total = secs.round() as u64;
+        let (m, s) = (total / 60, total % 60);
+        if s == 0 {
+            format!("{m} 分")
+        } else {
+            format!("{m} 分 {s} 秒")
+        }
+    } else {
+        format!("{secs:.1} 秒")
+    }
+}
+
 fn urlencode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
@@ -2457,6 +2482,24 @@ impl App {
                                     ui.selectable_value(&mut self.resolution, r, r.label());
                                 }
                             });
+                        // 預計影片長度＝照片張數÷每秒張數。讓使用者一眼知道成品多長，
+                        // 好搭配背景音樂或抓節奏，不必等轉完才發現太長／太短
+                        if !self.photos.is_empty() {
+                            ui.add_space(12.0);
+                            let secs = self.photos.len() as f64 / self.fps.max(1) as f64;
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "≈ {} 影片",
+                                    fmt_video_len(secs)
+                                ))
+                                .color(theme::ACCENT),
+                            )
+                            .on_hover_text(format!(
+                                "依 {} 張照片、每秒 {} 張估算的影片總長度",
+                                self.photos.len(),
+                                self.fps
+                            ));
+                        }
                     });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
