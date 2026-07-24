@@ -2956,15 +2956,17 @@ impl App {
         if self.import_found_nothing {
             child.add_space(14.0);
             child.label(
-                egui::RichText::new("⚠ 這個資料夾裡沒有找到照片")
+                egui::RichText::new("⚠ 沒有可以加入的照片")
                     .size(12.5)
                     .strong()
                     .color(theme::ERROR),
             );
             child.label(
-                egui::RichText::new("請確認資料夾內有 JPG／PNG 等圖片；子資料夾裡的照片不會被掃描")
-                    .size(11.5)
-                    .color(theme::TEXT_WEAK),
+                egui::RichText::new(
+                    "支援 JPG／PNG／BMP／WebP／TIFF；其他格式（如 iPhone 的 HEIC）與子資料夾內的照片不會被加入",
+                )
+                .size(11.5)
+                .color(theme::TEXT_WEAK),
             );
         }
     }
@@ -3848,6 +3850,7 @@ impl eframe::App for App {
             } else {
                 let mut files = Vec::new();
                 let mut any_dir = false;
+                let mut had_unsupported = false;
                 for p in dropped {
                     if p.is_dir() {
                         any_dir = true;
@@ -3858,12 +3861,16 @@ impl eframe::App for App {
                         // 使用者會以為沒設定成功
                         self.music_path = Some(p);
                         self.sec_fx_open = true;
-                    } else {
+                    } else if is_image(&p) {
                         files.push(p);
+                    } else {
+                        // 非圖片非音訊非專案（如 iPhone 的 HEIC、GIF）：記下以便
+                        // 提示，否則拖入後 add_photos 靜默過濾掉、使用者毫無回饋
+                        had_unsupported = true;
                     }
                 }
-                // 拖入的是資料夾卻掃不到任何照片：與用按鈕選資料夾一致地提示
-                if any_dir && files.is_empty() {
+                // 掃不到照片時提示（空資料夾、照片都在子資料夾、或格式不支援）
+                if files.is_empty() && (any_dir || had_unsupported) {
                     self.import_found_nothing = true;
                 }
                 self.add_photos(files);
