@@ -1022,18 +1022,12 @@ impl App {
             }
         });
         if !initial_files.is_empty() {
-            // 「開啟方式」或拖到執行檔圖示上的 .p2v：當作開啟專案，
-            // 不能丟給 add_photos（會被 is_image 過濾而靜默沒反應）；
-            // 其餘照片檔在專案載入後再一併加入
-            if let Some(proj) = initial_files.iter().find(|p| is_project_file(p)).cloned() {
-                app.load_project(&proj);
-                let photos: Vec<PathBuf> = initial_files
-                    .into_iter()
-                    .filter(|p| !is_project_file(p))
-                    .collect();
-                if !photos.is_empty() {
-                    app.add_photos(photos);
-                }
+            // 「開啟方式」或拖到執行檔圖示上：含 .p2v 就只開專案（與拖入
+            // 視窗的處理一致）。開專案是「取代整個工作狀態」的操作，同批
+            // 夾帶的照片語意不明，加上去只會弄髒剛開的專案。
+            // 專案檔也不能丟給 add_photos——會被 is_image 過濾而靜默沒反應
+            if let Some(proj) = initial_files.iter().find(|p| is_project_file(p)) {
+                app.load_project(proj);
             } else {
                 app.add_photos(initial_files);
             }
