@@ -2350,6 +2350,13 @@ impl App {
                                 .truncate(),
                             );
                             if ui
+                                .small_button("▶ 播放")
+                                .on_hover_text("用預設播放器開啟這支影片")
+                                .clicked()
+                            {
+                                open_file(&path);
+                            }
+                            if ui
                                 .small_button("開啟資料夾")
                                 .on_hover_text("在檔案總管中開啟並選取這支影片")
                                 .clicked()
@@ -4660,6 +4667,17 @@ fn open_in_explorer(path: &Path) {
     if let Some(dir) = path.parent() {
         let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
     }
+}
+
+/// 用系統預設程式開啟檔案（轉檔完成後直接播放影片用）
+#[cfg(windows)]
+fn open_file(path: &Path) {
+    // explorer <檔案> 會以副檔名關聯的預設程式開啟（影片即播放器）
+    let _ = std::process::Command::new("explorer").arg(path).spawn();
+}
+#[cfg(not(windows))]
+fn open_file(path: &Path) {
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
 }
 
 /// 序列化「檢查＋下載」：首次使用時預覽與轉檔可能同時走到這裡，
