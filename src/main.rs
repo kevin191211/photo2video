@@ -5235,6 +5235,11 @@ fn run_conversion(
     // 以指定的視訊編碼器參數組裝並執行一次 ffmpeg。抽成閉包，硬體編碼器失敗時
     // 可用軟體編碼器重跑同一組濾鏡設定
     let run_once = |video_codec: &[&str]| -> Result<(), String> {
+        // 取消可能發生在 ffmpeg 尚未啟動的空檔（首次下載 ffmpeg、準備階段）：
+        // 此時 kill 的 PID 為 0 無效，若不在此攔下，主編碼一啟動就會跑到底
+        if CONVERT_CANCEL.load(Ordering::Relaxed) {
+            return Err("已取消".into());
+        }
         let mut cmd = FfmpegCommand::new();
         cmd.arg("-y")
             .args(["-filter_threads", &ft])
