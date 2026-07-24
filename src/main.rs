@@ -1604,6 +1604,22 @@ impl App {
         // 與照片清單同因（見 add_photos）：以相對路徑開啟（CLI 參數、
         // 「開啟方式」）時，字面路徑存進最近清單會隨工作目錄失效
         let path = &std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        // 與「新專案」的確認一致：目前已有照片（可能有未存檔的編輯）時
+        // 先確認再取代，否則開啟/拖入其他專案會默默清掉現有工作。
+        // 啟動參數與空狀態的最近清單此時照片為空，維持一鍵直開不多問
+        if !self.photos.is_empty() {
+            let r = rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Warning)
+                .set_title("開啟專案")
+                .set_description(
+                    "將以開啟的專案取代目前的照片與所有設定，尚未儲存的變更會遺失。",
+                )
+                .set_buttons(rfd::MessageButtons::OkCancel)
+                .show();
+            if r != rfd::MessageDialogResult::Ok {
+                return;
+            }
+        }
         let pf: ProjectFile = match std::fs::read_to_string(path)
             .map_err(|e| e.to_string())
             .and_then(|txt| serde_json::from_str(&txt).map_err(|e| e.to_string()))
