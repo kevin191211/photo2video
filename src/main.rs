@@ -1485,9 +1485,15 @@ impl App {
         self.remember_recent_project(path);
 
         // kept_before[i] = 原始清單前 i 張中仍存在的張數；
-        // 文字段落編號用它平移，結果與逐張執行 remove_photo 一致
+        // 文字段落編號用它平移，結果與逐張執行 remove_photo 一致。
+        // 除了檔案存在，也要求是支援的圖片格式：專案檔可能被手改塞入
+        // 非圖片路徑，不先擋下會直到轉檔才由 ffmpeg 失敗
         let orig_n = pf.photos.len();
-        let exists: Vec<bool> = pf.photos.iter().map(|p| p.is_file()).collect();
+        let exists: Vec<bool> = pf
+            .photos
+            .iter()
+            .map(|p| p.is_file() && is_image(p))
+            .collect();
         let missing = exists.iter().filter(|e| !**e).count();
         let mut kept_before = vec![0usize; orig_n + 1];
         for (i, e) in exists.iter().enumerate() {
@@ -1537,6 +1543,8 @@ impl App {
                 e.x = e.x.clamp(0.0, 1.0);
                 e.y = e.y.clamp(0.0, 1.0);
                 e.size = e.size.clamp(8, 300);
+                // 旋轉角與 UI 滑桿同範圍；手改出超界值會讓滑桿與顯示值對不上
+                e.rot = e.rot.clamp(-180.0, 180.0);
                 Some(e)
             })
             .collect();
@@ -1569,7 +1577,9 @@ impl App {
         if missing > 0 || music_missing {
             let mut lines = Vec::new();
             if missing > 0 {
-                lines.push(format!("有 {missing} 張照片已不在原路徑，已從清單移除。"));
+                lines.push(format!(
+                    "有 {missing} 張照片已不在原路徑（或不是支援的圖片檔），已從清單移除。"
+                ));
             }
             if music_missing {
                 lines.push("背景音樂檔已不在原路徑，已清除音樂設定。".into());
