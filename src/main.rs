@@ -3130,13 +3130,25 @@ impl App {
                         }
                     }
                     resp.context_menu(|ui| {
-                        if ui.button("移除這張照片").clicked() {
-                            remove_idx = Some(i);
-                            ui.close_menu();
-                        }
-                        if ui.button("清空全部").clicked() {
-                            clear_all = true;
-                            ui.close_menu();
+                        // 轉檔中要與工具列一致地「明確禁用」：照常可點但被
+                        // 後面的 !working 守門擋掉的話，點了毫無反應也沒有
+                        // 回饋，使用者會以為程式壞了
+                        ui.add_enabled_ui(!working, |ui| {
+                            if ui.button("移除這張照片").clicked() {
+                                remove_idx = Some(i);
+                                ui.close_menu();
+                            }
+                            if ui.button("清空全部").clicked() {
+                                clear_all = true;
+                                ui.close_menu();
+                            }
+                        });
+                        if working {
+                            ui.label(
+                                egui::RichText::new("轉換中無法修改照片")
+                                    .size(11.0)
+                                    .color(theme::TEXT_WEAK),
+                            );
                         }
                     });
                 }
