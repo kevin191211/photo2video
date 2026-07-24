@@ -1839,6 +1839,8 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         self.rx = Some(rx);
         self.convert_output = Some(output.clone());
+        // 開新轉檔前清掉上次的取消旗標
+        CONVERT_CANCEL.store(false, Ordering::Relaxed);
         self.state = ConvertState::Working {
             progress: 0.0,
             status: "準備中…".into(),
@@ -1907,6 +1909,24 @@ impl App {
                 Err(e) => send(WorkerMsg::Error(e)),
             }
         });
+    }
+
+    /// 使用者按「取消」：設旗標並終止 ffmpeg。worker 的 ffmpeg 被 kill 後
+    /// run_conversion 回錯誤，退回軟體編碼的邏輯因旗標而不重跑；
+    /// poll_worker 收到錯誤時據旗標把狀態設回 Idle（取消不算轉換失敗），
+    /// 半成品輸出檔由 run_conversion 的失敗清理刪除
+    fn cancel_convert(&mut self) {
+        if !self.is_working() {
+            return;
+        }
+        CONVERT_CANCEL.store(true, Ordering::Relaxed);
+        let pid = CONVERT_FFMPEG_PID.swap(0, Ordering::Relaxed);
+        if pid != 0 {
+            kill_pid(pid);
+        }
+        if let ConvertState::Working { status, .. } = &mut self.state {
+            *status = "正在取消…".into();
+        }
     }
 
     /// 在背景執行緒檢查 GitHub 是否有新版本
@@ -2046,8 +2066,13 @@ impl App {
                     done = true;
                 }
                 Ok(WorkerMsg::Error(e)) => {
-                    // 半成品輸出檔已由 run_conversion 的清理刪除
-                    self.state = ConvertState::Error(e);
+                    // 半成品輸出檔已由 run_conversion 的清理刪除。
+                    // 使用者取消造成的中斷回到 Idle（不顯示為轉換失敗）
+                    self.state = if CONVERT_CANCEL.swap(false, Ordering::Relaxed) {
+                        ConvertState::Idle
+                    } else {
+                        ConvertState::Error(e)
+                    };
                     self.convert_output = None;
                     done = true;
                 }
@@ -2266,6 +2291,7 @@ impl App {
                 }
 
                 // 狀態列
+                let mut cancel_convert = false;
                 match &self.state {
                     ConvertState::Idle => {}
                     ConvertState::Working { progress, status } => {
@@ -2280,6 +2306,14 @@ impl App {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
+                                    if ui
+                                        .small_button("✕ 取消")
+                                        .on_hover_text("停止轉換並刪除未完成的影片")
+                                        .clicked()
+                                    {
+                                        cancel_convert = true;
+                                    }
+                                    ui.add_space(8.0);
                                     ui.label(
                                         egui::RichText::new(format!(
                                             "{:.0}%",
@@ -2366,6 +2400,9 @@ impl App {
                         });
                         ui.add_space(8.0);
                     }
+                }
+                if cancel_convert {
+                    self.cancel_convert();
                 }
 
                 let working = self.is_working();
@@ -4584,6 +4621,10 @@ static FFMPEG_READY: AtomicBool = AtomicBool::new(false);
 /// 關閉程式時（App::drop）據此主動終止
 static CONVERT_FFMPEG_PID: AtomicU32 = AtomicU32::new(0);
 
+/// 使用者按下「取消轉換」：終止 ffmpeg 並讓退回軟體編碼的邏輯不再重跑；
+/// worker 據此把中斷回報為「已取消」而非轉換失敗
+static CONVERT_CANCEL: AtomicBool = AtomicBool::new(false);
+
 /// 強制終止指定行程（含其子行程）；行程已結束時安靜失敗
 #[cfg(windows)]
 fn kill_pid(pid: u32) {
@@ -4986,6 +5027,14 @@ fn run_conversion(
             })
             .collect();
         for (k, &i) in need.iter().enumerate() {
+            // 主編碼還沒開始（CONVERT_FFMPEG_PID 為 0，取消無法 kill），
+            // 在這裡檢查取消旗標，讓套用調色階段的取消也能提早中止
+            if CONVERT_CANCEL.load(Ordering::Relaxed) {
+                for f in &adj_temp {
+                    let _ = std::fs::remove_file(f);
+                }
+                return Err("已取消".into());
+            }
             send(WorkerMsg::Status(format!(
                 "套用照片調色…（{}/{}）",
                 k + 1,
@@ -5270,8 +5319,12 @@ fn run_conversion(
             )));
             let first = run_once(&enc.codec_args());
             // 硬體編碼器可能因驅動/負載不穩而中途失敗（如 AMD AMF 的
-            // SubmitInput 錯誤）；此時自動退回軟體 libx264 重跑，確保能轉出
-            if first.is_err() && enc != H264Encoder::Software {
+            // SubmitInput 錯誤）；此時自動退回軟體 libx264 重跑，確保能轉出。
+            // 但使用者按取消而 kill ffmpeg 導致的失敗不該退回軟體重跑
+            if first.is_err()
+                && enc != H264Encoder::Software
+                && !CONVERT_CANCEL.load(Ordering::Relaxed)
+            {
                 send(WorkerMsg::Status(
                     "硬體編碼器失敗，改用軟體編碼重試…".into(),
                 ));
