@@ -1987,12 +1987,21 @@ impl App {
                     ui.add_space(8.0);
                     if open_report {
                         if let Some(report) = &self.crash_report {
-                            // GitHub issue 網址有長度上限，中文經百分比編碼後長度
-                            // 會膨脹三倍，內文只帶前段；panic 訊息與位置在最前面，
-                            // 截掉的只有 backtrace 尾段（strip 後僅剩位址，價值不高）
-                            let mut excerpt: String = report.chars().take(1200).collect();
-                            if excerpt.len() < report.len() {
-                                excerpt.push_str("\n…（內容過長已截斷）");
+                            // 系統開啟網址的長度上限約 2048：不能以「字元數」截斷
+                            // （1200 字元經百分比編碼可達上萬字元，URL 超限時瀏覽器
+                            // 根本開不起來、按鈕看似沒反應）。改以編碼後長度預算
+                            // 截斷（每字元最壞 3 倍保守估算）；panic 訊息與位置在
+                            // 最前面一定保得住，截掉的只有 backtrace 尾段
+                            let mut excerpt = String::new();
+                            let mut enc_len = 0usize;
+                            for c in report.chars() {
+                                let l = c.len_utf8() * 3;
+                                if enc_len + l > 1500 {
+                                    excerpt.push_str("\n…（內容過長已截斷）");
+                                    break;
+                                }
+                                enc_len += l;
+                                excerpt.push(c);
                             }
                             let body = format!(
                                 "版本：v{}\n作業系統：Windows\n\n閃退紀錄：\n{excerpt}\n\n（發生了什麼、當時在做哪個操作，可補充於此）",
