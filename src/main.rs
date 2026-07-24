@@ -1224,11 +1224,16 @@ impl App {
         const SLACK: usize = 192;
 
         let n = self.photos.len();
-        // 請求可視範圍＋預取邊界內還沒有縮圖的
+        // 請求可視範圍＋預取邊界內還沒有縮圖的。
+        // 順序即解碼優先序：可視範圍最先，接著右側預取、再左側預取——
+        // 由左到右一路排的話，用捲軸大幅跳轉時眼前的縮圖
+        // 得等左側 64 張幕後預取解碼完才輪到，畫面停在一排佔位符
         let lo = first.saturating_sub(PREFETCH);
         let hi = (last + PREFETCH).min(n);
-        let need: Vec<PathBuf> = self.photos[lo..hi]
-            .iter()
+        let need: Vec<PathBuf> = (first..last)
+            .chain(last..hi)
+            .chain(lo..first)
+            .map(|i| &self.photos[i])
             .filter(|p| !self.thumbs.contains_key(*p))
             .cloned()
             .collect();
