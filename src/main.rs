@@ -261,6 +261,7 @@ impl Default for SubtitleStyle {
 /// 一段文字：從第 start 張到第 end 張（1-based、含端點）顯示；
 /// 位置為文字中心點在畫面上的比例（0~1），大小以 1080p 高度為基準，旋轉單位為度（順時針）
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 struct SubtitleEntry {
     start: usize,
     end: usize,
@@ -282,6 +283,15 @@ impl SubtitleEntry {
             size: 48,
             rot: 0.0,
         }
+    }
+}
+
+// 專案檔的相容性保證（缺欄位不會整份開不起來）也要涵蓋巢狀的文字段落：
+// SubtitleEntry 沒掛 serde(default) 的話，未來版本加欄位後，舊版程式
+// 讀新版專案檔會因段落缺欄位而整份反序列化失敗
+impl Default for SubtitleEntry {
+    fn default() -> Self {
+        Self::new(1, 1)
     }
 }
 
