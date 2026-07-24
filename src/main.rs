@@ -1239,10 +1239,17 @@ impl App {
         self.native_res_cache = None;
         // 加入前的照片順序：供下方把文字段落的編號對回排序後的新位置
         let old_photos: Vec<PathBuf> = self.photos.clone();
-        // 用 HashSet 去重；逐一 contains 是 O(n²)，加入數千張照片要數百萬次路徑比對
-        let mut seen: HashSet<PathBuf> = self.photos.iter().cloned().collect();
+        // 用 HashSet 去重；逐一 contains 是 O(n²)，加入數千張照片要數百萬次路徑比對。
+        // 去重 key 用小寫路徑：Windows 檔案系統不分大小寫，但 PathBuf 比較區分，
+        // 同一張照片以不同大小寫路徑加入（命令列/開啟方式 vs 對話框）會被當成
+        // 兩張重複（比照最近專案清單的 same_path_ci）
+        let mut seen: HashSet<String> = self
+            .photos
+            .iter()
+            .map(|p| p.to_string_lossy().to_lowercase())
+            .collect();
         for f in files {
-            if seen.insert(f.clone()) {
+            if seen.insert(f.to_string_lossy().to_lowercase()) {
                 self.photos.push(f);
             }
         }
