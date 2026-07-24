@@ -917,6 +917,11 @@ struct App {
     /// 目前專案檔路徑（最近一次開啟或儲存的 .p2v）：Ctrl+S 直接覆寫
     /// 存檔，不再每次都跳「另存新檔」對話框；新專案時清除
     current_project: Option<PathBuf>,
+    /// 專案最近一次儲存成功的時間：Ctrl+S 直接覆寫沒有對話框，
+    /// 底欄短暫顯示「已儲存」讓使用者確認有存進去
+    project_saved_at: Option<Instant>,
+    /// 目前已套用的視窗標題（避免每幀重送 ViewportCommand）
+    applied_title: String,
 }
 
 impl App {
@@ -1002,6 +1007,8 @@ impl App {
             recent_projects: load_recent_projects(),
             convert_output: None,
             current_project: None,
+            project_saved_at: None,
+            applied_title: String::new(),
         };
         // 啟動時在背景檢查是否有新版本（失敗不影響使用）
         app.spawn_update_check(&cc.egui_ctx);
@@ -1526,6 +1533,7 @@ impl App {
             Ok(()) => {
                 self.remember_recent_project(path);
                 self.current_project = Some(path.to_path_buf());
+                self.project_saved_at = Some(Instant::now());
             }
             Err(e) => {
                 rfd::MessageDialog::new()
@@ -2126,6 +2134,36 @@ impl App {
                         }
                     });
                     ui.add_space(8.0);
+                }
+
+                // Ctrl+S 直接覆寫不開對話框，短暫顯示已儲存供使用者確認
+                if let Some(t) = self.project_saved_at {
+                    let elapsed = t.elapsed();
+                    if elapsed < Duration::from_millis(2500) {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("✔ 專案已儲存")
+                                    .size(12.0)
+                                    .strong()
+                                    .color(theme::SUCCESS),
+                            );
+                            if let Some(p) = &self.current_project {
+                                ui.label(
+                                    egui::RichText::new(
+                                        p.file_name().unwrap_or_default().to_string_lossy(),
+                                    )
+                                    .size(11.5)
+                                    .color(theme::TEXT_WEAK),
+                                );
+                            }
+                        });
+                        ui.add_space(8.0);
+                        ctx.request_repaint_after(
+                            Duration::from_millis(2550) - elapsed,
+                        );
+                    } else {
+                        self.project_saved_at = None;
+                    }
                 }
 
                 // 狀態列
@@ -3688,6 +3726,22 @@ fn clean_stale_temp_files() {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 視窗標題顯示目前專案名稱（看得出正在編輯哪個 .p2v）；
+        // 只在變動時送指令，不每幀重送
+        let desired_title = match &self.current_project {
+            Some(p) => format!(
+                "{} — Photo2Video",
+                p.file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            ),
+            None => "Photo2Video — 照片轉影片".to_string(),
+        };
+        if self.applied_title != desired_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(desired_title.clone()));
+            self.applied_title = desired_title;
+        }
+
         // fps 停止變動 800ms 後才寫設定檔，拖動過程不做磁碟 I/O
         if let Some(t) = self.fps_pending_save {
             let elapsed = t.elapsed();
