@@ -1482,6 +1482,11 @@ impl App {
             .add_filter("圖片檔", IMAGE_EXTS)
             .pick_files()
         {
+            // 使用者可切「所有檔案」選到不支援格式（如 HEIC）：全部不支援時
+            // add_photos 會靜默過濾掉，與拖放一致地提示（見 update 的拖放處理）
+            if !files.is_empty() && !files.iter().any(|p| is_image(p)) {
+                self.import_found_nothing = true;
+            }
             self.add_photos(files);
         }
     }
