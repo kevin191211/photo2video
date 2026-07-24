@@ -1935,8 +1935,12 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(16, 12)),
             )
             .show(ctx, |ui| {
-                // 上次執行閃退：顯示回報橫幅（開 GitHub 回報頁／關閉）
-                if let Some(report) = self.crash_report.clone() {
+                // 上次執行閃退：顯示回報橫幅（開 GitHub 回報頁／關閉）。
+                // 不在這裡 clone 內容：報告含 backtrace 可達數十 KB，
+                // 橫幅顯示期間每幀複製一次是純浪費；只在點擊時借用組網址
+                if self.crash_report.is_some() {
+                    let mut open_report = false;
+                    let mut dismiss = false;
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new("⚠ 程式上次異常關閉")
@@ -1949,6 +1953,20 @@ impl App {
                             .on_hover_text("開啟回報頁面（已帶入錯誤與版本）")
                             .clicked()
                         {
+                            open_report = true;
+                        }
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui.small_button("✕").on_hover_text("隱藏通知").clicked() {
+                                    dismiss = true;
+                                }
+                            },
+                        );
+                    });
+                    ui.add_space(8.0);
+                    if open_report {
+                        if let Some(report) = &self.crash_report {
                             // GitHub issue 網址有長度上限，中文經百分比編碼後長度
                             // 會膨脹三倍，內文只帶前段；panic 訊息與位置在最前面，
                             // 截掉的只有 backtrace 尾段（strip 後僅剩位址，價值不高）
@@ -1967,16 +1985,10 @@ impl App {
                             );
                             ctx.open_url(egui::OpenUrl::new_tab(url));
                         }
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if ui.small_button("✕").on_hover_text("隱藏通知").clicked() {
-                                    self.crash_report = None;
-                                }
-                            },
-                        );
-                    });
-                    ui.add_space(8.0);
+                    }
+                    if dismiss {
+                        self.crash_report = None;
+                    }
                 }
 
                 // 新版本通知：點「立即更新」直接下載並自動重啟完成更新
