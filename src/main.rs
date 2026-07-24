@@ -140,10 +140,25 @@ impl Adjustments {
         *self == Self::default()
     }
 
-    /// 把所有參數夾回合法範圍；專案檔可能被手改出超界值，
-    /// 直接餵給 filter_chain 會產生不合法的 ffmpeg 濾鏡參數
-    fn clamped(mut self) -> Self {
-        for v in [
+    /// 所有參數的值（固定順序，與 values_mut 對應）
+    fn values(&self) -> [i32; 11] {
+        [
+            self.temp,
+            self.tint,
+            self.exposure,
+            self.contrast,
+            self.brightness,
+            self.shadows,
+            self.whites,
+            self.blacks,
+            self.clarity,
+            self.vibrance,
+            self.saturation,
+        ]
+    }
+
+    fn values_mut(&mut self) -> [&mut i32; 11] {
+        [
             &mut self.temp,
             &mut self.tint,
             &mut self.exposure,
@@ -155,7 +170,13 @@ impl Adjustments {
             &mut self.clarity,
             &mut self.vibrance,
             &mut self.saturation,
-        ] {
+        ]
+    }
+
+    /// 把所有參數夾回合法範圍；專案檔可能被手改出超界值，
+    /// 直接餵給 filter_chain 會產生不合法的 ffmpeg 濾鏡參數
+    fn clamped(mut self) -> Self {
+        for v in self.values_mut() {
             *v = (*v).clamp(-100, 100);
         }
         self
@@ -2229,9 +2250,11 @@ impl App {
     fn ui_adjust_section(&mut self, ui: &mut egui::Ui) {
         // 多選模式：滑桿改編輯 sel_adj，寫入所有選取照片的覆寫；否則編輯全域 adj
         let scoped = !self.multi_sel.is_empty();
-        let mut work = if scoped { self.sel_adj } else { self.adj };
+        let orig = if scoped { self.sel_adj } else { self.adj };
+        let mut work = orig;
         let mut changed = false;
         let mut unpin = false;
+        let mut reset_all = false;
 
         let title = if scoped {
             format!("調色（選取 {} 張）", self.multi_sel.len())
@@ -2244,6 +2267,7 @@ impl App {
                 if !work.is_neutral() && ui.small_button("↺ 重設").clicked() {
                     work = Adjustments::default();
                     changed = true;
+                    reset_all = true;
                 }
                 if scoped && ui.small_button("取消個別調色").clicked() {
                     unpin = true;
@@ -2315,9 +2339,30 @@ impl App {
             self.mark_preview_dirty();
         } else if changed {
             if scoped {
+                // 滑桿顯示的是第一張選取照片的值：整組覆蓋會把其他選取
+                // 照片在「別的參數」上的個別設定靜默蓋成第一張的值。
+                // 只把這次實際改動的欄位套進每張照片自己的調色；
+                // 「重設」才是明確要求整組歸零，維持全部覆蓋
                 self.sel_adj = work;
                 for p in &self.multi_sel {
-                    self.adj_overrides.insert(p.clone(), work);
+                    let mut a = if reset_all {
+                        Adjustments::default()
+                    } else {
+                        self.effective_adj(p)
+                    };
+                    if !reset_all {
+                        for ((dst, o), n) in a
+                            .values_mut()
+                            .into_iter()
+                            .zip(orig.values())
+                            .zip(work.values())
+                        {
+                            if n != o {
+                                *dst = n;
+                            }
+                        }
+                    }
+                    self.adj_overrides.insert(p.clone(), a);
                 }
             } else {
                 self.adj = work;
