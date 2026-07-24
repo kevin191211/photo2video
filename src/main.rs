@@ -944,7 +944,21 @@ impl App {
             }
         });
         if !initial_files.is_empty() {
-            app.add_photos(initial_files);
+            // 「開啟方式」或拖到執行檔圖示上的 .p2v：當作開啟專案，
+            // 不能丟給 add_photos（會被 is_image 過濾而靜默沒反應）；
+            // 其餘照片檔在專案載入後再一併加入
+            if let Some(proj) = initial_files.iter().find(|p| is_project_file(p)).cloned() {
+                app.load_project(&proj);
+                let photos: Vec<PathBuf> = initial_files
+                    .into_iter()
+                    .filter(|p| !is_project_file(p))
+                    .collect();
+                if !photos.is_empty() {
+                    app.add_photos(photos);
+                }
+            } else {
+                app.add_photos(initial_files);
+            }
         }
         app
     }
@@ -3392,11 +3406,7 @@ impl eframe::App for App {
                 if p.is_dir() {
                     any_dir = true;
                     files.extend(collect_images_in_dir(&p));
-                } else if p
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXT))
-                {
+                } else if is_project_file(&p) {
                     // 拖入專案檔＝開啟專案
                     self.load_project(&p);
                 } else if is_audio(&p) {
@@ -3873,6 +3883,10 @@ fn is_image(p: &Path) -> bool {
 
 fn is_audio(p: &Path) -> bool {
     ext_in(p, AUDIO_EXTS)
+}
+
+fn is_project_file(p: &Path) -> bool {
+    ext_in(p, &[PROJECT_EXT])
 }
 
 fn collect_images_in_dir(dir: &Path) -> Vec<PathBuf> {
@@ -4857,7 +4871,8 @@ fn main() -> eframe::Result {
         return Ok(());
     }
 
-    // 其餘參數視為要開啟的照片或資料夾（支援「開啟方式」與拖曳到執行檔上）
+    // 其餘參數視為要開啟的照片、資料夾或 .p2v 專案檔
+    // （支援「開啟方式」與拖曳到執行檔上）
     let mut initial_files: Vec<PathBuf> = Vec::new();
     for a in &args[1..] {
         let p = PathBuf::from(a);
