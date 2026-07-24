@@ -4219,8 +4219,10 @@ fn ensure_ffmpeg(on_download: impl Fn()) -> Result<(), String> {
 /// 把「縮放後的底圖」存成暫存 BMP 後改以小圖當輸入，
 /// 免去每次重新解碼原始大圖（大照片可省下大半渲染時間）
 struct PreviewBase {
-    /// (照片路徑, 檔案修改時間, 預覽高度)
-    key: (PathBuf, Option<SystemTime>, u32),
+    /// (照片路徑, 檔案修改時間, 預覽畫布寬高)。
+    /// 畫布寬不再固定 960（直向輸出以高度為限），寬高都要進 key，
+    /// 否則同高不同寬的兩種解析度會誤用彼此的底圖
+    key: (PathBuf, Option<SystemTime>, (u32, u32)),
     /// None 表示建置中或建置失敗（失敗就維持完整流程，不重試）
     file: Option<PathBuf>,
     /// 底圖檔名流水號：新舊底圖用不同檔名，替換時不互踩
@@ -4234,10 +4236,14 @@ const PREVIEW_BASE_CAP: usize = 4;
 /// 底圖檔名全域流水號
 static PREVIEW_BASE_SERIAL: AtomicU64 = AtomicU64::new(0);
 
-/// 預覽畫布尺寸：寬 960、依輸出解析度等比例的高（取偶數）
+/// 預覽畫布尺寸：輸出解析度等比縮放至 960×960 邊界內（取偶數、至少 2）。
+/// 橫向輸出與舊版「寬固定 960」結果相同；直向輸出以高度為限（如 1080×1920
+/// → 540×960），不再產生比顯示區大數倍的像素緩衝；極端長寬比也不會把
+/// 另一邊四捨五入成 0 讓 ffmpeg 的 scale 直接失敗
 fn preview_canvas(res: Resolution) -> (u32, u32) {
-    let pw: u32 = 960;
-    let ph = ((pw as f64 * res.h as f64 / res.w as f64 / 2.0).round() as u32) * 2;
+    let s = (960.0 / res.w as f64).min(960.0 / res.h as f64);
+    let pw = ((res.w as f64 * s / 2.0).round() as u32 * 2).max(2);
+    let ph = ((res.h as f64 * s / 2.0).round() as u32 * 2).max(2);
     (pw, ph)
 }
 
@@ -4250,7 +4256,7 @@ fn prefetch_preview_base(photo: PathBuf, pw: u32, ph: u32) {
     let key = (
         photo.clone(),
         std::fs::metadata(&photo).and_then(|m| m.modified()).ok(),
-        ph,
+        (pw, ph),
     );
     let (out, serial) = {
         let mut g = PREVIEW_BASE.lock().unwrap();
@@ -4320,7 +4326,7 @@ fn render_preview(photo: &Path, adj: &Adjustments, res: Resolution) -> PreviewRe
     let key = (
         photo.to_path_buf(),
         std::fs::metadata(photo).and_then(|m| m.modified()).ok(),
-        ph,
+        (pw, ph),
     );
     let base = {
         let mut g = PREVIEW_BASE.lock().unwrap();
