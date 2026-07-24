@@ -3508,6 +3508,33 @@ fn clean_own_temp_files() {
     }
 }
 
+/// 清掉先前執行留下的孤兒暫存檔。閃退、強制結束或斷電時 App::drop
+/// 不會執行，該次 pid 前綴的暫存檔（預覽底圖每張約 1.5MB）沒人清、
+/// 之後的啟動都是新 pid 也永遠不會清到，會無限累積。
+/// 以「修改時間超過 48 小時」認定孤兒：其他執行中實例的暫存檔極少
+/// 存活這麼久，即使誤刪，預覽底圖讀不到時也會自動退回完整流程重建
+fn clean_stale_temp_files() {
+    const STALE_AGE: Duration = Duration::from_secs(48 * 60 * 60);
+    let own_prefix = format!("photo2video_{}_", std::process::id());
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("photo2video_") || name.starts_with(&own_prefix) {
+            continue;
+        }
+        let stale = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > STALE_AGE);
+        if stale {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // fps 停止變動 800ms 後才寫設定檔，拖動過程不做磁碟 I/O
@@ -5038,6 +5065,9 @@ fn main() -> eframe::Result {
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::fs::remove_file(exe.with_extension("exe.old"));
     }
+
+    // 在背景清掉先前閃退/強制結束留下的孤兒暫存檔（不佔啟動時間）
+    thread::spawn(clean_stale_temp_files);
 
     // 提早在背景讀取中文字型檔（20MB+），與視窗建立同時進行，縮短啟動時間
     let font_loader = thread::spawn(load_cjk_font_bytes);
