@@ -691,6 +691,24 @@ fn urlencode(s: &str) -> String {
     out
 }
 
+/// 依「百分比編碼後」的長度預算截斷文字（每字元以最壞 3 倍估算）。
+/// 系統開啟網址的長度上限約 2048：以「字元數」截斷時，中文經 UTF-8
+/// ＋百分比編碼可膨脹 9 倍，URL 超限瀏覽器根本開不起來、按鈕看似沒反應
+fn truncate_for_url(s: &str, budget: usize) -> String {
+    let mut out = String::new();
+    let mut enc_len = 0usize;
+    for c in s.chars() {
+        let l = c.len_utf8() * 3;
+        if enc_len + l > budget {
+            out.push_str("\n…（內容過長已截斷）");
+            break;
+        }
+        enc_len += l;
+        out.push(c);
+    }
+    out
+}
+
 /// 解碼縮圖並套用 EXIF 方向。手機照片常以「未旋轉的原始像素＋方向標記」儲存，
 /// image::open 不會自動套用方向，但輸出／預覽走的 ffmpeg 會自動旋轉——兩者不一致
 /// 會讓縮圖列與預覽佔位圖側躺，實際影片卻是正的。這裡讀取方向並套用後再縮圖
@@ -1987,22 +2005,9 @@ impl App {
                     ui.add_space(8.0);
                     if open_report {
                         if let Some(report) = &self.crash_report {
-                            // 系統開啟網址的長度上限約 2048：不能以「字元數」截斷
-                            // （1200 字元經百分比編碼可達上萬字元，URL 超限時瀏覽器
-                            // 根本開不起來、按鈕看似沒反應）。改以編碼後長度預算
-                            // 截斷（每字元最壞 3 倍保守估算）；panic 訊息與位置在
-                            // 最前面一定保得住，截掉的只有 backtrace 尾段
-                            let mut excerpt = String::new();
-                            let mut enc_len = 0usize;
-                            for c in report.chars() {
-                                let l = c.len_utf8() * 3;
-                                if enc_len + l > 1500 {
-                                    excerpt.push_str("\n…（內容過長已截斷）");
-                                    break;
-                                }
-                                enc_len += l;
-                                excerpt.push(c);
-                            }
+                            // panic 訊息與位置在最前面一定保得住，
+                            // 截掉的只有 backtrace 尾段（strip 後僅剩位址，價值不高）
+                            let excerpt = truncate_for_url(report, 1500);
                             let body = format!(
                                 "版本：v{}\n作業系統：Windows\n\n閃退紀錄：\n{excerpt}\n\n（發生了什麼、當時在做哪個操作，可補充於此）",
                                 env!("CARGO_PKG_VERSION")
@@ -2165,15 +2170,9 @@ impl App {
                                         .on_hover_text("開啟回報頁面（已帶入錯誤與版本）")
                                         .clicked()
                                     {
-                                        // 錯誤太長會讓網址超過系統開啟網址的長度上限（約 2048），
-                                        // 截短帶入 URL；以字元為界避免切壞中文
-                                        let short_e: String = if e.chars().count() > 400 {
-                                            let mut s: String = e.chars().take(400).collect();
-                                            s.push_str("…（訊息過長已截斷）");
-                                            s
-                                        } else {
-                                            e.clone()
-                                        };
+                                        // 以編碼後長度截短帶入 URL：400「字元」的中文經
+                                        // 百分比編碼可達 3600 字元，一樣超過系統上限
+                                        let short_e = truncate_for_url(&e, 1500);
                                         let body = format!(
                                             "版本：v{}\n作業系統：Windows\n\n錯誤訊息：\n{short_e}\n\n（發生了什麼、用了哪些設定，可補充於此）",
                                             env!("CARGO_PKG_VERSION")
