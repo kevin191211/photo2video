@@ -1232,9 +1232,11 @@ impl App {
                 *f = abs;
             }
         }
-        // 這批有真的加入照片就清掉「找不到照片」提示
+        // 這批有真的加入照片就清掉「找不到照片」提示，並讓上次的轉換
+        // 結果橫幅失效（照片變了，上次輸出已過時）
         if !files.is_empty() {
             self.import_found_nothing = false;
+            self.clear_result_banner();
         }
         self.native_res_cache = None;
         // 加入前的照片順序：供下方把文字段落的編號對回排序後的新位置
@@ -1388,11 +1390,21 @@ impl App {
         self.state = ConvertState::Idle;
     }
 
+    /// 讓上次的轉換結果橫幅（完成/失敗）失效：照片或設定變更後上次的
+    /// 輸出已過時，殘留的「✔ 轉換完成＋舊路徑」會誤導使用者、「開啟
+    /// 資料夾」也指向無關的舊輸出。只清結果橫幅，不動轉檔中/閒置狀態
+    fn clear_result_banner(&mut self) {
+        if matches!(self.state, ConvertState::Done(_) | ConvertState::Error(_)) {
+            self.state = ConvertState::Idle;
+        }
+    }
+
     fn remove_photo(&mut self, i: usize) {
         let removed = self.photos.remove(i);
         self.thumbs.remove(&removed);
         self.adj_overrides.remove(&removed);
         let was_multi = self.multi_sel.remove(&removed);
+        self.clear_result_banner();
         self.dims_cache.remove(&removed);
         self.native_res_cache = None;
         // 移除的若是多選中的照片，重新同步調色滑桿顯示值到剩餘的第一張，
