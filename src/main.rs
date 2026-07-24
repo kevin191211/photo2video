@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
@@ -3370,6 +3370,13 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        // 轉檔進行中關閉視窗：worker 執行緒會隨行程結束，但 ffmpeg 是
+        // 獨立子行程，不主動終止會留在背景繼續編碼佔用 CPU，
+        // 還寫出使用者以為已取消的輸出檔
+        let pid = CONVERT_FFMPEG_PID.swap(0, Ordering::Relaxed);
+        if pid != 0 {
+            kill_pid(pid);
+        }
         // 關閉程式時若還有未寫入的 fps 設定，補寫一次
         if self.fps_pending_save.is_some() {
             save_fps(self.fps);
@@ -4090,6 +4097,27 @@ fn filter_threads() -> String {
 /// 確認一次後快取，預覽渲染就不用每張都多付一次程序啟動的成本
 static FFMPEG_READY: AtomicBool = AtomicBool::new(false);
 
+/// 轉檔中的 ffmpeg 行程 ID（0 表示沒有）。ffmpeg 是獨立子行程，
+/// Windows 上父行程結束不會連帶終止它：轉檔中關閉視窗，ffmpeg 會留在
+/// 背景繼續編碼佔用 CPU，還寫出使用者以為已取消的輸出檔。
+/// 關閉程式時（App::drop）據此主動終止
+static CONVERT_FFMPEG_PID: AtomicU32 = AtomicU32::new(0);
+
+/// 強制終止指定行程（含其子行程）；行程已結束時安靜失敗
+#[cfg(windows)]
+fn kill_pid(pid: u32) {
+    use std::os::windows::process::CommandExt;
+    // 不建主控台視窗：本程式為 windows 子系統，taskkill 是主控台程式，
+    // 不加旗標會在關閉瞬間閃出黑窗
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+}
+#[cfg(not(windows))]
+fn kill_pid(_pid: u32) {}
+
 /// 序列化「檢查＋下載」：首次使用時預覽與轉檔可能同時走到這裡，
 /// 兩個 auto_download 並發會互踩同一個安裝目錄，留下損毀的 ffmpeg
 static FFMPEG_INIT: Mutex<()> = Mutex::new(());
@@ -4671,6 +4699,8 @@ fn run_conversion(
 
         let mut error_log: Vec<String> = Vec::new();
         let mut child = cmd.spawn().map_err(|e| format!("FFmpeg 啟動失敗：{e}"))?;
+        // 記下行程 ID：轉檔中關閉視窗時，App::drop 據此終止 ffmpeg
+        CONVERT_FFMPEG_PID.store(child.as_inner().id(), Ordering::Relaxed);
         let iter = child
             .iter()
             .map_err(|e| format!("FFmpeg 輸出讀取失敗：{e}"))?;
@@ -4689,7 +4719,9 @@ fn run_conversion(
                 _ => {}
             }
         }
-        let status = child.wait().map_err(|e| format!("FFmpeg 執行失敗：{e}"))?;
+        let status = child.wait();
+        CONVERT_FFMPEG_PID.store(0, Ordering::Relaxed);
+        let status = status.map_err(|e| format!("FFmpeg 執行失敗：{e}"))?;
         if !status.success() {
             let detail = error_log.join("\n");
             return Err(if detail.is_empty() {
