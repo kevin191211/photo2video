@@ -853,6 +853,9 @@ struct App {
     import_found_nothing: bool,
     /// 最近開啟/儲存的專案檔（新的在前），顯示在空狀態畫面供一鍵開啟
     recent_projects: Vec<PathBuf>,
+    /// 轉檔中的輸出檔路徑；轉檔中關窗或 worker 異常中斷時據此清掉
+    /// 半成品檔案（與 run_conversion 失敗時的清理一致），完成後清為 None
+    convert_output: Option<PathBuf>,
 }
 
 impl App {
@@ -935,6 +938,7 @@ impl App {
             crash_report: take_crash_report(),
             import_found_nothing: false,
             recent_projects: load_recent_projects(),
+            convert_output: None,
         };
         // 啟動時在背景檢查是否有新版本（失敗不影響使用）
         app.spawn_update_check(&cc.egui_ctx);
@@ -1637,6 +1641,7 @@ impl App {
 
         let (tx, rx) = std::sync::mpsc::channel();
         self.rx = Some(rx);
+        self.convert_output = Some(output.clone());
         self.state = ConvertState::Working {
             progress: 0.0,
             status: "準備中…".into(),
@@ -1822,10 +1827,13 @@ impl App {
                 }
                 Ok(WorkerMsg::Done(path)) => {
                     self.state = ConvertState::Done(path);
+                    self.convert_output = None;
                     done = true;
                 }
                 Ok(WorkerMsg::Error(e)) => {
+                    // 半成品輸出檔已由 run_conversion 的清理刪除
                     self.state = ConvertState::Error(e);
+                    self.convert_output = None;
                     done = true;
                 }
                 Err(TryRecvError::Empty) => break,
@@ -1834,6 +1842,15 @@ impl App {
                     // 狀態永遠停在「轉換中」、按鈕全部鎖死，只能重開程式。
                     // 已收到 Done/Error（is_working 為否）則屬正常收尾，不覆蓋
                     if self.is_working() {
+                        // run_conversion 的收尾（終止 ffmpeg、刪半成品）沒機會
+                        // 執行，在這裡補做，否則 ffmpeg 繼續在背景寫損毀的檔案
+                        let pid = CONVERT_FFMPEG_PID.swap(0, Ordering::Relaxed);
+                        if pid != 0 {
+                            kill_pid(pid);
+                        }
+                        if let Some(out) = self.convert_output.take() {
+                            let _ = std::fs::remove_file(&out);
+                        }
                         self.state = ConvertState::Error(
                             "轉換程序異常中斷（可能為程式錯誤），請重試或回報問題".into(),
                         );
@@ -3415,6 +3432,19 @@ impl Drop for App {
         let pid = CONVERT_FFMPEG_PID.swap(0, Ordering::Relaxed);
         if pid != 0 {
             kill_pid(pid);
+        }
+        // 清掉寫到一半的輸出檔：留著看起來像轉好的影片，播放才發現損毀
+        // （與 run_conversion 失敗時的清理一致）。ffmpeg 剛被終止，
+        // 檔案控制代碼可能要一瞬間才釋放，失敗就稍候重試幾次
+        if self.is_working() {
+            if let Some(out) = self.convert_output.take() {
+                for _ in 0..5 {
+                    if std::fs::remove_file(&out).is_ok() || !out.exists() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
         }
         // 關閉程式時若還有未寫入的 fps 設定，補寫一次
         if self.fps_pending_save.is_some() {
