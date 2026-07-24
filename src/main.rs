@@ -3782,27 +3782,33 @@ impl eframe::App for App {
                 .collect()
         });
         if !dropped.is_empty() && !self.is_working() {
-            let mut files = Vec::new();
-            let mut any_dir = false;
-            for p in dropped {
-                if p.is_dir() {
-                    any_dir = true;
-                    files.extend(collect_images_in_dir(&p));
-                } else if is_project_file(&p) {
-                    // 拖入專案檔＝開啟專案
-                    self.load_project(&p);
-                } else if is_audio(&p) {
-                    // 拖入音訊檔＝設定為背景音樂
-                    self.music_path = Some(p);
-                } else {
-                    files.push(p);
+            // 這批含專案檔就只開專案：開專案是「取代整個工作狀態」的操作，
+            // 同批夾帶的照片/音訊語意不明。若照原順序逐一處理，load_project
+            // 會先清空並載入專案，接著 add_photos 又把同批照片加上去弄髒
+            // 專案；且 load_project 的取代確認被按「取消」時，照片仍會被加入。
+            // 多個專案檔也只取第一個，不連續跳出多個確認框
+            if let Some(proj) = dropped.iter().find(|p| is_project_file(p)) {
+                self.load_project(proj);
+            } else {
+                let mut files = Vec::new();
+                let mut any_dir = false;
+                for p in dropped {
+                    if p.is_dir() {
+                        any_dir = true;
+                        files.extend(collect_images_in_dir(&p));
+                    } else if is_audio(&p) {
+                        // 拖入音訊檔＝設定為背景音樂
+                        self.music_path = Some(p);
+                    } else {
+                        files.push(p);
+                    }
                 }
+                // 拖入的是資料夾卻掃不到任何照片：與用按鈕選資料夾一致地提示
+                if any_dir && files.is_empty() {
+                    self.import_found_nothing = true;
+                }
+                self.add_photos(files);
             }
-            // 拖入的是資料夾卻掃不到任何照片：與用按鈕選資料夾一致地提示
-            if any_dir && files.is_empty() {
-                self.import_found_nothing = true;
-            }
-            self.add_photos(files);
         }
 
         // Ctrl+S 儲存專案、Ctrl+O 開啟專案（轉換中不動作）
