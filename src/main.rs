@@ -1253,6 +1253,11 @@ impl App {
         self.thumbs.clear();
         self.adj_overrides.clear();
         self.multi_sel.clear();
+        // 文字段落以照片編號綁定，照片全沒了段落就沒有依附對象；
+        // 與 remove_photo 一致（段落綁定的照片全移除時段落一併刪除），
+        // 否則清空後加入另一批照片，舊文字會靜默套在不相干的新照片上
+        self.sub_entries.clear();
+        self.sel_text = None;
         self.native_res_cache = None;
         // 清掉還在排隊的解碼工作，工作池不再為已移除的照片做白工
         self.thumb_jobs.0.lock().unwrap().clear();
