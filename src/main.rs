@@ -1804,9 +1804,19 @@ impl App {
                 // 轉檔進行中不強制重啟，等使用者按「重新啟動完成更新」
                 self.update_status = UpdateStatus::ReadyToRestart;
             } else {
-                restart_app();
+                self.restart_for_update();
             }
         }
+    }
+
+    /// 更新完成後的重新啟動。restart_app 以 process::exit 結束、不會執行
+    /// App::drop：尚未寫入的 fps 設定（變動後延遲 800ms 才寫檔）要在這裡
+    /// 先補寫，否則重啟瞬間剛調過的 fps 會靜默遺失
+    fn restart_for_update(&mut self) {
+        if self.fps_pending_save.take().is_some() {
+            save_fps(self.fps);
+        }
+        restart_app();
     }
 
     fn poll_worker(&mut self) {
@@ -1980,7 +1990,7 @@ impl App {
                             btn = btn.on_disabled_hover_text("轉換完成後即可重新啟動");
                         }
                         if btn.clicked() {
-                            restart_app();
+                            self.restart_for_update();
                         }
                     });
                     ui.add_space(8.0);
@@ -3383,7 +3393,7 @@ impl App {
             self.spawn_self_update(ctx, tag);
         }
         if restart_now {
-            restart_app();
+            self.restart_for_update();
         }
     }
 
