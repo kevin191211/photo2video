@@ -914,6 +914,9 @@ struct App {
     /// 轉檔中的輸出檔路徑；轉檔中關窗或 worker 異常中斷時據此清掉
     /// 半成品檔案（與 run_conversion 失敗時的清理一致），完成後清為 None
     convert_output: Option<PathBuf>,
+    /// 目前專案檔路徑（最近一次開啟或儲存的 .p2v）：Ctrl+S 直接覆寫
+    /// 存檔，不再每次都跳「另存新檔」對話框；新專案時清除
+    current_project: Option<PathBuf>,
 }
 
 impl App {
@@ -998,6 +1001,7 @@ impl App {
             import_found_nothing: false,
             recent_projects: load_recent_projects(),
             convert_output: None,
+            current_project: None,
         };
         // 啟動時在背景檢查是否有新版本（失敗不影響使用）
         app.spawn_update_check(&cc.egui_ctx);
@@ -1475,10 +1479,17 @@ impl App {
     }
 
     fn save_project_dialog(&mut self) {
+        // 預帶目前專案的檔名，另存時不用重打
+        let default_name = self
+            .current_project
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("我的專案.{PROJECT_EXT}"));
         let Some(mut path) = rfd::FileDialog::new()
             .set_title("儲存專案")
             .add_filter("Photo2Video 專案", &[PROJECT_EXT])
-            .set_file_name(format!("我的專案.{PROJECT_EXT}"))
+            .set_file_name(default_name)
             .save_file()
         else {
             return;
@@ -1495,6 +1506,11 @@ impl App {
                 .unwrap_or_default();
             path.set_file_name(format!("{name}.{PROJECT_EXT}"));
         }
+        self.save_project_to(&path);
+    }
+
+    /// 寫入專案檔到指定路徑；成功時更新最近清單與「目前專案」
+    fn save_project_to(&mut self, path: &Path) {
         let json = match serde_json::to_string_pretty(&self.project_data()) {
             Ok(j) => j,
             Err(e) => {
@@ -1506,8 +1522,11 @@ impl App {
                 return;
             }
         };
-        match std::fs::write(&path, json) {
-            Ok(()) => self.remember_recent_project(&path),
+        match std::fs::write(path, json) {
+            Ok(()) => {
+                self.remember_recent_project(path);
+                self.current_project = Some(path.to_path_buf());
+            }
             Err(e) => {
                 rfd::MessageDialog::new()
                     .set_level(rfd::MessageLevel::Error)
@@ -1515,6 +1534,15 @@ impl App {
                     .set_description(format!("無法寫入檔案：\n{e}"))
                     .show();
             }
+        }
+    }
+
+    /// Ctrl+S：已知目前專案就直接覆寫存檔（快速儲存的通用慣例），
+    /// 還沒存過才開「另存新檔」對話框
+    fn quick_save_project(&mut self) {
+        match self.current_project.clone() {
+            Some(p) => self.save_project_to(&p),
+            None => self.save_project_dialog(),
         }
     }
 
@@ -1538,6 +1566,8 @@ impl App {
         self.music_fade = true;
         self.format = OutputFormat::Mp4;
         self.resolution = Resolution { w: 1920, h: 1080 };
+        // 新專案不再屬於任何 .p2v：避免 Ctrl+S 把空白狀態覆寫進舊專案檔
+        self.current_project = None;
     }
 
     /// 記到最近專案清單最前面（去重、最多保留 8 筆）並寫入設定檔
@@ -1584,6 +1614,8 @@ impl App {
             }
         };
         self.remember_recent_project(path);
+        // 之後 Ctrl+S 直接覆寫回這個檔案
+        self.current_project = Some(path.to_path_buf());
 
         // kept_before[i] = 原始清單前 i 張中仍存在的張數；
         // 文字段落編號用它平移，結果與逐張執行 remove_photo 一致。
@@ -2858,7 +2890,11 @@ impl App {
                 if ui.button("📂  開啟專案").clicked() {
                     self.open_project_dialog();
                 }
-                if ui.button("💾  儲存專案").clicked() {
+                if ui
+                    .button("💾  儲存專案")
+                    .on_hover_text("選擇位置儲存（另存新檔）；Ctrl+S 可直接覆寫目前專案")
+                    .clicked()
+                {
                     self.save_project_dialog();
                 }
             });
@@ -3704,7 +3740,7 @@ impl eframe::App for App {
             if !self.photos.is_empty()
                 && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S))
             {
-                self.save_project_dialog();
+                self.quick_save_project();
             }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
                 self.open_project_dialog();
