@@ -3802,7 +3802,11 @@ impl Drop for App {
     fn drop(&mut self) {
         // 轉檔進行中關閉視窗：worker 執行緒會隨行程結束，但 ffmpeg 是
         // 獨立子行程，不主動終止會留在背景繼續編碼佔用 CPU，
-        // 還寫出使用者以為已取消的輸出檔
+        // 還寫出使用者以為已取消的輸出檔。
+        // 先設取消旗標再 kill：否則 kill 硬體編碼後 worker 會退回軟體編碼
+        // 再 spawn 一個 ffmpeg，drop 已執行不會再 kill，那個軟體 ffmpeg
+        // 就成了孤兒。旗標讓退回邏輯與 run_once 都不再啟動新的 ffmpeg
+        CONVERT_CANCEL.store(true, Ordering::Relaxed);
         let pid = CONVERT_FFMPEG_PID.swap(0, Ordering::Relaxed);
         if pid != 0 {
             kill_pid(pid);
