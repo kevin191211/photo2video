@@ -2230,11 +2230,12 @@ impl App {
                                 )
                                 .truncate(),
                             );
-                            if ui.small_button("開啟資料夾").clicked() {
-                                if let Some(dir) = path.parent() {
-                                    let _ =
-                                        std::process::Command::new("explorer").arg(dir).spawn();
-                                }
+                            if ui
+                                .small_button("開啟資料夾")
+                                .on_hover_text("在檔案總管中開啟並選取這支影片")
+                                .clicked()
+                            {
+                                open_in_explorer(&path);
                             }
                         });
                         ui.add_space(8.0);
@@ -4505,6 +4506,28 @@ fn kill_pid(pid: u32) {
 }
 #[cfg(not(windows))]
 fn kill_pid(_pid: u32) {}
+
+/// 在檔案總管開啟並選取指定檔案（比只開父目錄好找）。
+/// 檔案已不在（被刪/移動）時退回開啟父目錄
+#[cfg(windows)]
+fn open_in_explorer(path: &Path) {
+    use std::os::windows::process::CommandExt;
+    if path.exists() {
+        // /select 的引數格式特殊（逗號後直接接路徑），用 raw_arg 原樣傳遞；
+        // 路徑以引號包住以容忍空白
+        let _ = std::process::Command::new("explorer")
+            .raw_arg(format!("/select,\"{}\"", path.display()))
+            .spawn();
+    } else if let Some(dir) = path.parent() {
+        let _ = std::process::Command::new("explorer").arg(dir).spawn();
+    }
+}
+#[cfg(not(windows))]
+fn open_in_explorer(path: &Path) {
+    if let Some(dir) = path.parent() {
+        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+    }
+}
 
 /// 序列化「檢查＋下載」：首次使用時預覽與轉檔可能同時走到這裡，
 /// 兩個 auto_download 並發會互踩同一個安裝目錄，留下損毀的 ffmpeg
