@@ -548,7 +548,16 @@ fn update_config(key: &str, value: serde_json::Value) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(&path, cfg.to_string());
+    // 原子寫入：先寫臨時檔再 rename 覆蓋。直接 write 若寫到一半崩潰/斷電，
+    // 會留下損壞的 config.json，下次啟動解析失敗就丟失 fps 慣用值與整份
+    // 最近專案清單。臨時檔壞了也不影響既有的 config.json
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, cfg.to_string()).is_ok() {
+        // rename 失敗（如防毒鎖檔）就清掉臨時檔，不留垃圾
+        if std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
 }
 
 /// 儲存每秒張數設定
