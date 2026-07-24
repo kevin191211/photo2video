@@ -4605,10 +4605,30 @@ fn test_encoder(name: &str) -> bool {
         "-f", "null", "-",
     ]);
     let Ok(mut child) = cmd.spawn() else { return false };
+    // 逾時保護：0.2 秒的測試正常在 1~2 秒內結束，但硬體編碼器初始化可能
+    // 因顯卡驅動問題而卡住不返回，讓整個偵測（進而整個轉檔）永久卡在
+    // 「偵測硬體編碼器」。10 秒後強制終止並視為不可用，退回下一個候選
+    let pid = child.as_inner().id();
+    let finished = Arc::new(AtomicBool::new(false));
+    let watchdog = {
+        let finished = Arc::clone(&finished);
+        thread::spawn(move || {
+            for _ in 0..100 {
+                thread::sleep(Duration::from_millis(100));
+                if finished.load(Ordering::Relaxed) {
+                    return;
+                }
+            }
+            kill_pid(pid);
+        })
+    };
     if let Ok(iter) = child.iter() {
         for _ in iter {}
     }
-    child.wait().map(|s| s.success()).unwrap_or(false)
+    let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+    finished.store(true, Ordering::Relaxed);
+    let _ = watchdog.join();
+    ok
 }
 
 /// 偵測可用的 H.264 硬體編碼器（只偵測一次並快取）
