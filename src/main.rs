@@ -994,27 +994,36 @@ impl App {
 
     fn poll_preview(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.preview_rx {
-            if let Ok((for_photo, res)) = rx.try_recv() {
-                self.preview_rx = None;
-                // 以路徑辨識：渲染期間使用者切到別張、或移除照片使索引重排時，
-                // 只有目前選取的正是這張照片才採用結果，否則丟棄（dirty 仍在會重render）
-                let is_current = self
-                    .preview_selected
-                    .and_then(|i| self.photos.get(i))
-                    .map(|p| p == &for_photo)
-                    .unwrap_or(false);
-                if is_current {
-                    match res {
-                        Ok((w, h, rgb)) => {
-                            let img = egui::ColorImage::from_rgb(
-                                [w as usize, h as usize],
-                                &rgb,
-                            );
-                            self.preview_tex =
-                                Some(ctx.load_texture("preview", img, Default::default()));
+            match rx.try_recv() {
+                Ok((for_photo, res)) => {
+                    self.preview_rx = None;
+                    // 以路徑辨識：渲染期間使用者切到別張、或移除照片使索引重排時，
+                    // 只有目前選取的正是這張照片才採用結果，否則丟棄（dirty 仍在會重render）
+                    let is_current = self
+                        .preview_selected
+                        .and_then(|i| self.photos.get(i))
+                        .map(|p| p == &for_photo)
+                        .unwrap_or(false);
+                    if is_current {
+                        match res {
+                            Ok((w, h, rgb)) => {
+                                let img = egui::ColorImage::from_rgb(
+                                    [w as usize, h as usize],
+                                    &rgb,
+                                );
+                                self.preview_tex =
+                                    Some(ctx.load_texture("preview", img, Default::default()));
+                            }
+                            Err(e) => self.preview_error = Some(e),
                         }
-                        Err(e) => self.preview_error = Some(e),
                     }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // 渲染執行緒異常結束沒回傳結果：不清掉等待狀態的話，
+                    // 之後永遠不會再啟動渲染，預覽卡在「產生中…」
+                    self.preview_rx = None;
+                    self.preview_error = Some("預覽渲染異常中斷".into());
                 }
             }
         }
@@ -1742,12 +1751,13 @@ impl App {
     }
 
     fn poll_update(&mut self) {
+        use std::sync::mpsc::TryRecvError;
         let Some(rx) = &self.update_rx else { return };
         let mut finished = false;
         let mut restart = false;
-        while let Ok(msg) = rx.try_recv() {
-            match msg {
-                UpdateMsg::CheckResult(res) => {
+        loop {
+            match rx.try_recv() {
+                Ok(UpdateMsg::CheckResult(res)) => {
                     finished = true;
                     self.update_status = match res {
                         Ok(Some(tag)) => UpdateStatus::Available(tag),
@@ -1755,14 +1765,29 @@ impl App {
                         Err(e) => UpdateStatus::Failed(e),
                     };
                 }
-                UpdateMsg::Progress(p) => self.update_status = UpdateStatus::Downloading(p),
-                UpdateMsg::Ready => {
+                Ok(UpdateMsg::Progress(p)) => self.update_status = UpdateStatus::Downloading(p),
+                Ok(UpdateMsg::Ready) => {
                     finished = true;
                     restart = true;
                 }
-                UpdateMsg::Failed(e) => {
+                Ok(UpdateMsg::Failed(e)) => {
                     finished = true;
                     self.update_status = UpdateStatus::Failed(e);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // 更新執行緒異常結束沒回報：不處理的話狀態卡在
+                    // 「檢查中/下載中」，busy 旗標讓「檢查更新」永遠按不下去
+                    if !finished
+                        && matches!(
+                            self.update_status,
+                            UpdateStatus::Checking | UpdateStatus::Downloading(_)
+                        )
+                    {
+                        self.update_status = UpdateStatus::Failed("更新程序異常中斷".into());
+                    }
+                    finished = true;
+                    break;
                 }
             }
         }
@@ -1780,27 +1805,41 @@ impl App {
     }
 
     fn poll_worker(&mut self) {
+        use std::sync::mpsc::TryRecvError;
         let Some(rx) = &self.rx else { return };
         let mut done = false;
-        while let Ok(msg) = rx.try_recv() {
-            match msg {
-                WorkerMsg::Status(s) => {
+        loop {
+            match rx.try_recv() {
+                Ok(WorkerMsg::Status(s)) => {
                     if let ConvertState::Working { status, .. } = &mut self.state {
                         *status = s;
                     }
                 }
-                WorkerMsg::Progress(p) => {
+                Ok(WorkerMsg::Progress(p)) => {
                     if let ConvertState::Working { progress, .. } = &mut self.state {
                         *progress = p;
                     }
                 }
-                WorkerMsg::Done(path) => {
+                Ok(WorkerMsg::Done(path)) => {
                     self.state = ConvertState::Done(path);
                     done = true;
                 }
-                WorkerMsg::Error(e) => {
+                Ok(WorkerMsg::Error(e)) => {
                     self.state = ConvertState::Error(e);
                     done = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // 轉檔執行緒 panic 等異常結束而沒回報結果：不處理的話
+                    // 狀態永遠停在「轉換中」、按鈕全部鎖死，只能重開程式。
+                    // 已收到 Done/Error（is_working 為否）則屬正常收尾，不覆蓋
+                    if self.is_working() {
+                        self.state = ConvertState::Error(
+                            "轉換程序異常中斷（可能為程式錯誤），請重試或回報問題".into(),
+                        );
+                    }
+                    done = true;
+                    break;
                 }
             }
         }
