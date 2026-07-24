@@ -1403,6 +1403,10 @@ impl App {
     /// （fps 保留使用者慣用值，與程式啟動時一致）
     fn new_project(&mut self) {
         self.clear_photos();
+        // 清掉上一個專案的轉換結果橫幅（完成/失敗）：留著會誤導使用者
+        // 以為目前的專案已轉出，「開啟資料夾」也會指向舊專案的輸出。
+        // 只能在非轉檔中觸發，直接重置為 Idle 安全
+        self.state = ConvertState::Idle;
         self.adj = Adjustments::default();
         self.sel_adj = Adjustments::default();
         self.sub_entries.clear();
@@ -1468,6 +1472,8 @@ impl App {
         }
 
         self.clear_photos();
+        // 與 new_project 相同：清掉上一個專案殘留的轉換完成/失敗橫幅
+        self.state = ConvertState::Idle;
         self.photos = pf
             .photos
             .iter()
