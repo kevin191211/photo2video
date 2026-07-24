@@ -1796,10 +1796,18 @@ impl App {
 
     fn start_convert(&mut self, ctx: &egui::Context) {
         let ext = self.format.ext();
+        // 有開啟專案就用專案名當輸出預設檔名（如「日本旅遊.p2v」→
+        // 「日本旅遊.mp4」），比固定的 output 更貼合使用者、不用每次改名
+        let stem = self
+            .current_project
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "output".into());
         let Some(mut output) = rfd::FileDialog::new()
             .set_title("選擇影片儲存位置")
             .add_filter(format!("{} 影片", ext.to_uppercase()), &[ext])
-            .set_file_name(format!("output.{ext}"))
+            .set_file_name(format!("{stem}.{ext}"))
             .save_file()
         else {
             return;
