@@ -788,20 +788,30 @@ fn drawtext_filter(
     textfile: &Path,
     style: &SubtitleStyle,
     fontsize: f64,
+    // outline_scale：外框像素以 1080p 為基準的縮放係數（= 輸出高 / 1080），
+    // 讓外框粗細與字級一致地隨解析度縮放（否則 4K 文字放大、外框卻維持原
+    // 像素而相對變細，與預覽比例不符）
+    outline_scale: f64,
     x_frac: f32,
     y_frac: f32,
     enable: Option<(f64, f64)>,
 ) -> String {
+    // 外框以 1080p 基準縮放；outline_w>0 時至少 1px，低解析度才不會縮到消失
+    let borderw = if style.outline_w > 0 {
+        (style.outline_w as f64 * outline_scale).round().max(1.0)
+    } else {
+        0.0
+    };
     // expansion=none：文字完全照字面輸出。預設的 normal 展開會把內容裡的
     // %{...} 當內建變數、% 觸發 strftime，使用者打「特價 50% off」「{重點}」
     // 之類的文字會掉字甚至讓整個轉檔失敗；檔案中的真實換行仍正常斷行
     let mut f = format!(
-        "drawtext=expansion=none:fontfile='{}':textfile='{}':fontsize={:.0}:fontcolor={}:borderw={}:bordercolor={}:x=(w*{:.4}-text_w/2):y=(h*{:.4}-text_h/2)",
+        "drawtext=expansion=none:fontfile='{}':textfile='{}':fontsize={:.0}:fontcolor={}:borderw={:.0}:bordercolor={}:x=(w*{:.4}-text_w/2):y=(h*{:.4}-text_h/2)",
         ff_path_escape(fontfile),
         ff_path_escape(textfile),
         fontsize.max(1.0),
         ff_color(style.color),
-        style.outline_w,
+        borderw,
         ff_color(style.outline_color),
         x_frac,
         y_frac,
@@ -3422,14 +3432,14 @@ impl App {
         let Some(cur_idx) = self.preview_selected else { return };
         let cur = cur_idx + 1;
         let style = self.sub_style.clone();
-        let res_h = self.resolved_resolution().h as f32;
         // 文字內容裁切到畫布（與輸出一致：輸出只到畫面邊界，溢出補邊黑邊的部分
         // 會被切掉，預覽若畫到黑邊區就會所見非所得）；選取框與把手則裁切到整張
         // 卡片，文字靠邊時把手才不會一起被切掉、仍可操作
         let p = ui.painter().with_clip_rect(img);
         let chrome = ui.painter().with_clip_rect(card);
         let scale = img.height() / 1080.0;
-        let ow_screen = style.outline_w as f32 * img.height() / res_h;
+        // 外框與字級同樣以 1080p 為基準縮放，與輸出的 drawtext borderw 一致
+        let ow_screen = style.outline_w as f32 * scale;
 
         for k in 0..self.sub_entries.len() {
             let e = &self.sub_entries[k];
@@ -5162,6 +5172,9 @@ fn run_conversion(
         }
     }
 
+    // 外框像素以 1080p 為基準隨輸出解析度縮放（與字級一致）
+    let outline_scale = h as f64 / 1080.0;
+
     // 有任何旋轉文字才需要 filter_complex（旋轉要走「透明畫布→rotate→overlay」）；
     // 全部無旋轉時維持單純的 -vf 路徑。無旋轉文字在此直接依序串進 vf
     let use_complex = ops.iter().any(|(en, ..)| en.rot.abs() >= 0.5);
@@ -5170,7 +5183,7 @@ fn run_conversion(
             for (en, cap, enable, fontsize) in &ops {
                 vf.push(',');
                 vf.push_str(&drawtext_filter(
-                    font, cap, &subs.style, *fontsize, en.x, en.y, Some(*enable),
+                    font, cap, &subs.style, *fontsize, outline_scale, en.x, en.y, Some(*enable),
                 ));
             }
         }
@@ -5209,11 +5222,13 @@ fn run_conversion(
         for (i, (en, cap, (ea, eb), fontsize)) in ops.iter().enumerate() {
             let next = format!("v{}", i + 1);
             if en.rot.abs() < 0.5 {
-                let dt =
-                    drawtext_filter(font, cap, &subs.style, *fontsize, en.x, en.y, Some((*ea, *eb)));
+                let dt = drawtext_filter(
+                    font, cap, &subs.style, *fontsize, outline_scale, en.x, en.y, Some((*ea, *eb)),
+                );
                 fc.push_str(&format!("[{cur}]{dt}[{next}];"));
             } else {
-                let dt = drawtext_filter(font, cap, &subs.style, *fontsize, 0.5, 0.5, None);
+                let dt =
+                    drawtext_filter(font, cap, &subs.style, *fontsize, outline_scale, 0.5, 0.5, None);
                 let rad = (en.rot as f64).to_radians();
                 fc.push_str(&format!(
                     "color=c=black@0.0:s={w}x{h}:r={out_fps}:d={total_secs:.3},format=rgba,{dt},rotate={rad:.6}:ow=iw:oh=ih:c=none[t{i}];"
