@@ -736,9 +736,15 @@ fn oriented_dimensions(path: &Path) -> Option<(u32, u32)> {
     Some(if swapped { (h, w) } else { (w, h) })
 }
 
-/// 把 Windows 路徑轉成 filtergraph 內安全的形式（/ 分隔、跳脫冒號）
+/// 把 Windows 路徑轉成 filtergraph 內安全的形式（/ 分隔、跳脫冒號與單引號）。
+/// 呼叫端以 fontfile='…' 單引號包住路徑：路徑本身含 ' 時（如使用者名稱
+/// O'Brien，字幕暫存檔就在 %TEMP% 使用者目錄下）會提前終止引號、
+/// 整條濾鏡解析失敗；比照 concat_escape 以 '\'' 跳脫
 fn ff_path_escape(p: &Path) -> String {
-    p.to_string_lossy().replace('\\', "/").replace(':', r"\:")
+    p.to_string_lossy()
+        .replace('\\', "/")
+        .replace(':', r"\:")
+        .replace('\'', r"'\''")
 }
 
 fn ff_color(c: egui::Color32) -> String {
