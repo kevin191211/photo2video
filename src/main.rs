@@ -3532,12 +3532,16 @@ impl App {
         }
     }
 
-    /// 拖曳檔案進視窗時的全螢幕提示
+    /// 拖曳檔案進視窗時的全螢幕提示。
+    /// 轉檔中放開的檔案會被忽略（update 有 !is_working 守門）：這裡不能
+    /// 直接不畫——拖著檔案毫無反應、放開又默默消失，看起來像程式壞掉；
+    /// 改顯示「轉換中無法加入」讓使用者放開前就知道現在不能加
     fn ui_drop_overlay(&self, ctx: &egui::Context) {
         let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
-        if !hovering || self.is_working() {
+        if !hovering {
             return;
         }
+        let working = self.is_working();
         let screen = ctx.screen_rect();
         let p = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
@@ -3546,23 +3550,28 @@ impl App {
         p.rect_filled(screen, 0, egui::Color32::from_black_alpha(150));
         let card = egui::Rect::from_center_size(screen.center(), egui::vec2(340.0, 116.0));
         p.rect_filled(card, 12, theme::CARD);
+        let (accent, icon, msg) = if working {
+            (theme::TEXT_WEAK, "⏳", "轉換中，暫時無法加入檔案")
+        } else {
+            (theme::ACCENT, "⬇", "放開滑鼠加入照片")
+        };
         p.rect_stroke(
             card,
             12,
-            egui::Stroke::new(1.5, theme::ACCENT),
+            egui::Stroke::new(1.5, accent),
             egui::StrokeKind::Inside,
         );
         p.text(
             card.center() - egui::vec2(0.0, 16.0),
             egui::Align2::CENTER_CENTER,
-            "⬇",
+            icon,
             egui::FontId::proportional(26.0),
-            theme::ACCENT,
+            accent,
         );
         p.text(
             card.center() + egui::vec2(0.0, 20.0),
             egui::Align2::CENTER_CENTER,
-            "放開滑鼠加入照片",
+            msg,
             egui::FontId::proportional(15.0),
             theme::TEXT,
         );
