@@ -1483,7 +1483,9 @@ impl App {
 
     /// 記到最近專案清單最前面（去重、最多保留 8 筆）並寫入設定檔
     fn remember_recent_project(&mut self, path: &Path) {
-        self.recent_projects.retain(|p| p != path);
+        // Windows 路徑不分大小寫：精確比對會讓同一專案檔因大小寫寫法
+        // 不同（D:\a.p2v 與 d:\a.p2v）在清單重複出現
+        self.recent_projects.retain(|p| !same_path_ci(p, path));
         self.recent_projects.insert(0, path.to_path_buf());
         self.recent_projects.truncate(8);
         save_recent_projects(&self.recent_projects);
@@ -1502,6 +1504,9 @@ impl App {
     /// 讀入專案檔並還原所有編輯狀態。照片檔已不在原路徑時略過該張並提醒；
     /// 文字段落的照片編號跟著平移，維持綁在同一張照片上
     fn load_project(&mut self, path: &Path) {
+        // 與照片清單同因（見 add_photos）：以相對路徑開啟（CLI 參數、
+        // 「開啟方式」）時，字面路徑存進最近清單會隨工作目錄失效
+        let path = &std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
         let pf: ProjectFile = match std::fs::read_to_string(path)
             .map_err(|e| e.to_string())
             .and_then(|txt| serde_json::from_str(&txt).map_err(|e| e.to_string()))
@@ -1509,7 +1514,7 @@ impl App {
             Ok(p) => p,
             Err(e) => {
                 // 開不起來的檔案從最近清單移除，之後不再顯示
-                self.recent_projects.retain(|p| p != path);
+                self.recent_projects.retain(|p| !same_path_ci(p, path));
                 save_recent_projects(&self.recent_projects);
                 rfd::MessageDialog::new()
                     .set_level(rfd::MessageLevel::Error)
@@ -4016,6 +4021,11 @@ fn is_audio(p: &Path) -> bool {
 
 fn is_project_file(p: &Path) -> bool {
     ext_in(p, &[PROJECT_EXT])
+}
+
+/// Windows 路徑不分大小寫的比較（最近專案清單去重用）
+fn same_path_ci(a: &Path, b: &Path) -> bool {
+    a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
 }
 
 fn collect_images_in_dir(dir: &Path) -> Vec<PathBuf> {
