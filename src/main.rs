@@ -1382,9 +1382,14 @@ impl App {
         let removed = self.photos.remove(i);
         self.thumbs.remove(&removed);
         self.adj_overrides.remove(&removed);
-        self.multi_sel.remove(&removed);
+        let was_multi = self.multi_sel.remove(&removed);
         self.dims_cache.remove(&removed);
         self.native_res_cache = None;
+        // 移除的若是多選中的照片，重新同步調色滑桿顯示值到剩餘的第一張，
+        // 否則滑桿仍顯示已移除照片的舊值，誤導使用者拖動時套錯絕對值
+        if was_multi {
+            self.sync_sel_adj();
+        }
 
         // 文字段落以 1-based 照片編號綁定，移除照片後其後編號整體前移一位，
         // 段落須跟著調整，否則文字會靜默套到錯誤的照片上。
