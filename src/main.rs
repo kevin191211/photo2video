@@ -846,6 +846,9 @@ struct App {
     sel_adj: Adjustments,
     /// 「原始像素」解析度的快取（照片中最大寬高）；照片增減時清除重算
     native_res_cache: Option<Resolution>,
+    /// 每張照片的尺寸快取（已套用 EXIF 方向；None＝讀取失敗不重試），
+    /// 讓 native 解析度重算只讀「新照片」的檔頭
+    dims_cache: HashMap<PathBuf, Option<(u32, u32)>>,
     sub_entries: Vec<SubtitleEntry>,
     sub_style: SubtitleStyle,
     /// 預覽區目前選取的文字（sub_entries 索引），用於顯示縮放/旋轉控制框
@@ -938,6 +941,7 @@ impl App {
             multi_sel: HashSet::new(),
             sel_adj: Adjustments::default(),
             native_res_cache: None,
+            dims_cache: HashMap::new(),
             sub_entries: Vec::new(),
             sub_style: SubtitleStyle::default(),
             sel_text: None,
@@ -1134,7 +1138,10 @@ impl App {
     }
 
     /// 解析度選「原始像素」時，以照片中最大的寬與高為輸出解析度；
-    /// 讀取所有照片檔頭有成本，結果快取到照片增減時再重算
+    /// 讀取所有照片檔頭有成本，結果快取到照片增減時再重算。
+    /// 尺寸另有一層「每張照片」的持久快取：照片增減只需讀新照片的
+    /// 檔頭，其餘用快取值重算最大值——否則每加/刪一張都在 UI 執行緒
+    /// 重讀全部照片的檔頭，上千張時每次增減凍結一兩秒
     fn resolved_resolution(&mut self) -> Resolution {
         if !self.resolution.is_native() {
             return self.resolution;
@@ -1144,7 +1151,12 @@ impl App {
         }
         let (mut w, mut h) = (0u32, 0u32);
         for p in &self.photos {
-            if let Some((pw, ph)) = oriented_dimensions(p) {
+            // None 也快取：讀不到的檔案不重試，避免壞檔每次重算都拖慢
+            let dims = self
+                .dims_cache
+                .entry(p.clone())
+                .or_insert_with(|| oriented_dimensions(p));
+            if let Some((pw, ph)) = *dims {
                 w = w.max(pw);
                 h = h.max(ph);
             }
@@ -1321,6 +1333,7 @@ impl App {
         self.sub_entries.clear();
         self.sel_text = None;
         self.native_res_cache = None;
+        self.dims_cache.clear();
         // 清掉還在排隊的解碼工作，工作池不再為已移除的照片做白工
         self.thumb_jobs.0.lock().unwrap().clear();
         self.preview_selected = None;
@@ -1335,6 +1348,7 @@ impl App {
         self.thumbs.remove(&removed);
         self.adj_overrides.remove(&removed);
         self.multi_sel.remove(&removed);
+        self.dims_cache.remove(&removed);
         self.native_res_cache = None;
 
         // 文字段落以 1-based 照片編號綁定，移除照片後其後編號整體前移一位，
