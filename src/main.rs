@@ -2649,7 +2649,13 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("＋ 新增文字").clicked() {
                     let start = self.preview_selected.map(|i| i + 1).unwrap_or(1);
-                    self.sub_entries.push(SubtitleEntry::new(start, total));
+                    let mut entry = SubtitleEntry::new(start, total);
+                    // 同一批連續新增的文字若都用預設底部中央會完全疊住，
+                    // 依現有段數往上錯開（每段 8%、循環 5 段），使用者較好分辨、
+                    // 不必先把上面的拖開才看得到新的；仍可自由拖曳到想要位置
+                    let offset = (self.sub_entries.len() % 5) as f32 * 0.08;
+                    entry.y = (0.85 - offset).clamp(0.1, 0.85);
+                    self.sub_entries.push(entry);
                     self.sel_text = Some(self.sub_entries.len() - 1);
                     self.sec_sub_open = true; // 收合時新增 → 自動展開
                 }
