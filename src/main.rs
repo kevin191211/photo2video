@@ -3013,9 +3013,10 @@ impl App {
                 ui.skip_ahead_auto_ids(first);
                 for i in first..last {
                     let photo = &self.photos[i];
-                    let tex = match self.thumbs.get(photo) {
-                        Some(Thumb::Ready(t)) => Some(t.clone()),
-                        _ => None,
+                    let (tex, failed) = match self.thumbs.get(photo) {
+                        Some(Thumb::Ready(t)) => (Some(t.clone()), false),
+                        Some(Thumb::Failed) => (None, true),
+                        _ => (None, false),
                     };
                     let selected = self.preview_selected == Some(i);
                     let has_caption = self.sub_entries.iter().any(|e| {
@@ -3023,8 +3024,12 @@ impl App {
                     });
                     let multi = self.multi_sel.contains(photo);
                     let has_adj = self.adj_overrides.contains_key(photo);
-                    let resp =
-                        thumb_item(ui, tex.as_ref(), i, selected, has_caption, multi, has_adj);
+                    let mut resp = thumb_item(
+                        ui, tex.as_ref(), i, selected, has_caption, multi, has_adj, failed,
+                    );
+                    if failed {
+                        resp = resp.on_hover_text("這張照片無法讀取（檔案損毀或格式不支援）");
+                    }
                     if resp.clicked() {
                         let mods = ui.input(|inp| inp.modifiers);
                         if mods.ctrl {
@@ -3935,7 +3940,9 @@ fn rot_vec(v: egui::Vec2, a: f32) -> egui::Vec2 {
     egui::vec2(v.x * c - v.y * s, v.x * s + v.y * c)
 }
 
-/// 膠卷縮圖項目。multi＝在個別調色的多選集合中；has_adj＝這張照片有個別調色
+/// 膠卷縮圖項目。multi＝在個別調色的多選集合中；has_adj＝這張照片有個別調色；
+/// failed＝縮圖解碼失敗（檔案損毀或格式不支援），顯示警告而非載入中
+#[allow(clippy::too_many_arguments)]
 fn thumb_item(
     ui: &mut egui::Ui,
     tex: Option<&egui::TextureHandle>,
@@ -3944,6 +3951,7 @@ fn thumb_item(
     has_caption: bool,
     multi: bool,
     has_adj: bool,
+    failed: bool,
 ) -> egui::Response {
     let size = egui::vec2(132.0, 84.0);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -3959,6 +3967,23 @@ fn thumb_item(
             img_rect,
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             egui::Color32::WHITE,
+        );
+    } else if failed {
+        // 解碼失敗與載入中要能區分：一直顯示「…」會被當成程式卡住，
+        // 使用者也不知道這張照片有問題（直到轉檔才爆錯）
+        p.text(
+            rect.center() - egui::vec2(0.0, 8.0),
+            egui::Align2::CENTER_CENTER,
+            "⚠",
+            egui::FontId::proportional(18.0),
+            theme::ERROR,
+        );
+        p.text(
+            rect.center() + egui::vec2(0.0, 14.0),
+            egui::Align2::CENTER_CENTER,
+            "無法讀取",
+            egui::FontId::proportional(10.5),
+            theme::TEXT_WEAK,
         );
     } else {
         p.text(
