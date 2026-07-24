@@ -4379,50 +4379,62 @@ fn render_preview(photo: &Path, adj: &Adjustments, res: Resolution) -> PreviewRe
     let scale = format!("scale={pw}:{ph}:force_original_aspect_ratio=decrease");
 
     // 直接以 rawvideo 從 stdout 取回 RGB 像素，省去圖檔編碼、寫檔與再解碼
-    let mut cmd = FfmpegCommand::new();
-    match &base {
-        // 底圖已是縮放後的尺寸，直接跑後段濾鏡
-        BaseRole::Cached(f) => {
-            cmd.input(f.to_string_lossy())
-                .args(["-vf", &chain])
-                .args(["-frames:v", "1"])
-                .rawvideo();
-        }
-        BaseRole::Skip => {
-            cmd.input(photo.to_string_lossy())
-                .args(["-vf", &format!("{scale},{chain}")])
-                .args(["-frames:v", "1"])
-                .rawvideo();
-        }
-    }
-
-    let mut error_log: Vec<String> = Vec::new();
-    let mut frame: Option<(u32, u32, Vec<u8>)> = None;
-    let mut child = cmd.spawn().map_err(|e| format!("FFmpeg 啟動失敗：{e}"))?;
-    let iter = child
-        .iter()
-        .map_err(|e| format!("FFmpeg 輸出讀取失敗：{e}"))?;
-    for event in iter {
-        use ffmpeg_sidecar::event::LogLevel;
-        match event {
-            FfmpegEvent::OutputFrame(f) => frame = Some((f.width, f.height, f.data)),
-            FfmpegEvent::Log(LogLevel::Error | LogLevel::Fatal, msg) => {
-                error_log.push(msg);
+    let render_once = |input: &Path, vf: &str| -> PreviewResult {
+        let mut cmd = FfmpegCommand::new();
+        cmd.input(input.to_string_lossy())
+            .args(["-vf", vf])
+            .args(["-frames:v", "1"])
+            .rawvideo();
+        let mut error_log: Vec<String> = Vec::new();
+        let mut frame: Option<(u32, u32, Vec<u8>)> = None;
+        let mut child = cmd.spawn().map_err(|e| format!("FFmpeg 啟動失敗：{e}"))?;
+        let iter = child
+            .iter()
+            .map_err(|e| format!("FFmpeg 輸出讀取失敗：{e}"))?;
+        for event in iter {
+            use ffmpeg_sidecar::event::LogLevel;
+            match event {
+                FfmpegEvent::OutputFrame(f) => frame = Some((f.width, f.height, f.data)),
+                FfmpegEvent::Log(LogLevel::Error | LogLevel::Fatal, msg) => {
+                    error_log.push(msg);
+                }
+                _ => {}
             }
-            _ => {}
         }
-    }
-    let status = child.wait().map_err(|e| format!("FFmpeg 執行失敗：{e}"))?;
-    let ok = status.success() && frame.is_some();
-
-    if !ok {
-        return Err(if error_log.is_empty() {
+        let status = child.wait().map_err(|e| format!("FFmpeg 執行失敗：{e}"))?;
+        if status.success() {
+            if let Some(f) = frame {
+                return Ok(f);
+            }
+        }
+        Err(if error_log.is_empty() {
             "預覽渲染失敗".into()
         } else {
             error_log.join("\n")
-        });
+        })
+    };
+
+    let full_vf = format!("{scale},{chain}");
+    match &base {
+        // 底圖已是縮放後的尺寸，直接跑後段濾鏡
+        BaseRole::Cached(f) => render_once(f, &chain).or_else(|_| {
+            // 取得路徑到 ffmpeg 開檔之間，底圖可能剛被 LRU 汰換刪除
+            // （或被清暫存/防毒移走）：直接失敗會卡在「預覽失敗」且
+            // dirty 已清、不會自動重試。移除失效的快取項目後
+            // 退回完整流程重渲染
+            {
+                let mut g = PREVIEW_BASE.lock().unwrap();
+                if let Some(pos) = g.iter().position(|b| b.key == key) {
+                    let old = g.remove(pos);
+                    if let Some(f) = old.file {
+                        let _ = std::fs::remove_file(f);
+                    }
+                }
+            }
+            render_once(photo, &full_vf)
+        }),
+        BaseRole::Skip => render_once(photo, &full_vf),
     }
-    Ok(frame.unwrap())
 }
 
 /// 把單張照片套用調色後輸出成暫存 PNG（已縮放至目標解析度內），
