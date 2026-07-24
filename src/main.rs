@@ -902,6 +902,9 @@ struct App {
     update_rx: Option<Receiver<UpdateMsg>>,
     update_status: UpdateStatus,
     update_banner_dismissed: bool,
+    /// 下載更新失敗的訊息：使用者主動點「立即更新」後失敗才設，供底欄
+    /// 顯示告知（啟動背景檢查失敗屬 Failed 但不設此，維持靜默不打擾）
+    update_download_error: Option<String>,
     about_open: bool,
     /// fps 最後一次變動的時間；拖動時不即時寫設定檔，停止變動後才寫
     fps_pending_save: Option<Instant>,
@@ -1000,6 +1003,7 @@ impl App {
             update_rx: None,
             update_status: UpdateStatus::Idle,
             update_banner_dismissed: false,
+            update_download_error: None,
             about_open: false,
             fps_pending_save: None,
             crash_report: take_crash_report(),
@@ -1884,6 +1888,8 @@ impl App {
             return;
         }
         self.update_status = UpdateStatus::Downloading(0.0);
+        // 重試時清掉上次的下載失敗訊息
+        self.update_download_error = None;
         let (tx, rx) = std::sync::mpsc::channel();
         self.update_rx = Some(rx);
         let ctx = ctx.clone();
@@ -1923,6 +1929,9 @@ impl App {
                 }
                 Ok(UpdateMsg::Failed(e)) => {
                     finished = true;
+                    // 只有下載才會送 UpdateMsg::Failed（使用者主動觸發），
+                    // 記下供底欄告知；檢查失敗走 CheckResult(Err) 不設此
+                    self.update_download_error = Some(e.clone());
                     self.update_status = UpdateStatus::Failed(e);
                 }
                 Err(TryRecvError::Empty) => break,
@@ -2146,6 +2155,32 @@ impl App {
                         if btn.clicked() {
                             self.restart_for_update();
                         }
+                    });
+                    ui.add_space(8.0);
+                }
+                // 下載更新失敗：使用者從「立即更新」觸發後失敗，若不顯示，
+                // banner 的下載中訊息消失後就毫無回饋，使用者不知已失敗
+                if let Some(err) = self.update_download_error.clone() {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("✖ 更新下載失敗")
+                                .size(12.0)
+                                .strong()
+                                .color(theme::ERROR),
+                        )
+                        .on_hover_text(&err);
+                        ui.hyperlink_to(
+                            egui::RichText::new("改用瀏覽器下載").size(12.0),
+                            format!("https://github.com/{GITHUB_REPO}/releases/latest"),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui.small_button("✕").on_hover_text("隱藏通知").clicked() {
+                                    self.update_download_error = None;
+                                }
+                            },
+                        );
                     });
                     ui.add_space(8.0);
                 }
