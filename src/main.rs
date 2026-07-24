@@ -1147,6 +1147,15 @@ impl App {
 
     fn add_photos(&mut self, mut files: Vec<PathBuf>) {
         files.retain(|p| is_image(p));
+        // 統一轉絕對路徑：以相對路徑啟動（CLI 參數、「開啟方式」）加入的
+        // 照片，字面路徑存進專案檔後會隨工作目錄不同而「遺失」；
+        // 去重也不受同檔案相對/絕對兩種寫法影響（轉檔的 concat_escape
+        // 已為同因做絕對化，這裡讓清單本身就是絕對路徑）
+        for f in &mut files {
+            if let Ok(abs) = std::path::absolute(&*f) {
+                *f = abs;
+            }
+        }
         // 這批有真的加入照片就清掉「找不到照片」提示
         if !files.is_empty() {
             self.import_found_nothing = false;
