@@ -817,7 +817,9 @@ fn drawtext_filter(
         y_frac,
     );
     if style.boxed {
-        let pad = (fontsize * 0.25).round().max(4.0);
+        // 內距地板也以 1080p 基準隨解析度縮放（與外框、字級一致），
+        // 否則 4K 的極小字底框內距相對太窄
+        let pad = (fontsize * 0.25).round().max(4.0 * outline_scale);
         f.push_str(&format!(":box=1:boxcolor=black@0.4:boxborderw={pad:.0}"));
     }
     if let Some((a, b)) = enable {
@@ -3462,7 +3464,8 @@ impl App {
 
             // 半透明底框（近似輸出的 box=1）
             if style.boxed {
-                let pad = (font_px * 0.25).max(2.0);
+                // 地板與輸出的 boxborderw 同以 1080p 基準（4px * scale）縮放
+                let pad = (font_px * 0.25).max(4.0 * scale);
                 let ext = half + egui::vec2(pad, pad);
                 let corners: Vec<egui::Pos2> = [
                     egui::vec2(-ext.x, -ext.y),
