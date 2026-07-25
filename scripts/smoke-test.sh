@@ -235,8 +235,40 @@ PY
     echo "✗ EXIF 方向：未依 EXIF 轉正（輸出為 $verdict），直拍照片會躺著"; FAIL=1
   fi
   rm -rf "$EXIFDIR" "$exif_out" "$exif_frame"
+
+  # 自然排序實際套用：不同位數編號的照片須依「數值」而非字典序排列，否則
+  # 影片裡照片會亂序（img10 跑到 img2 前面）。時長／解析度檢查抓不到順序錯誤，
+  # 這裡逐格比對顏色確認 img1→img2→img10→img20 的實際播放順序正確。
+  ORDDIR="$TMP/order"; rm -rf "$ORDDIR"; mkdir -p "$ORDDIR"
+  "$FF" -f lavfi -i color=0xFF0000:s=320x240:d=1 -frames:v 1 -y "$ORDDIR/img1.png"  >/dev/null 2>&1
+  "$FF" -f lavfi -i color=0x00FF00:s=320x240:d=1 -frames:v 1 -y "$ORDDIR/img2.png"  >/dev/null 2>&1
+  "$FF" -f lavfi -i color=0x0000FF:s=320x240:d=1 -frames:v 1 -y "$ORDDIR/img10.png" >/dev/null 2>&1
+  "$FF" -f lavfi -i color=0xFFFF00:s=320x240:d=1 -frames:v 1 -y "$ORDDIR/img20.png" >/dev/null 2>&1
+  ord_out="$TMP/order.mp4"; rm -f "$ord_out"
+  "$EXE" --cli "$ORDDIR" 1 "$ord_out" >/dev/null 2>&1
+  ord_fr="$TMP/order_frames"; rm -rf "$ord_fr"; mkdir -p "$ord_fr"
+  "$FF" -v error -i "$ord_out" -vf fps=1 "$ord_fr/%02d.png" >/dev/null 2>&1
+  ord_res=$(PYTHONIOENCODING=utf-8 python - "$ord_fr" <<'PY'
+import sys, glob, os
+from PIL import Image
+files = sorted(glob.glob(os.path.join(sys.argv[1], "*.png")))
+expect = [(255,0,0),(0,255,0),(0,0,255),(255,255,0)]  # img1,img2,img10,img20
+ok = len(files) == 4
+for i, f in enumerate(files):
+    im = Image.open(f).convert("RGB"); W, H = im.size
+    r, g, b = im.getpixel((W//2, H//2)); er, eg, eb = expect[i]
+    ok &= max(abs(r-er), abs(g-eg), abs(b-eb)) < 50
+print("ok" if ok else "bad")
+PY
+)
+  if [ "$ord_res" = ok ]; then
+    echo "✓ 自然排序套用：img1→img2→img10→img20 依數值順序播放"
+  else
+    echo "✗ 自然排序：影片內照片順序錯誤（可能退回字典序）"; FAIL=1
+  fi
+  rm -rf "$ORDDIR" "$ord_out" "$ord_fr"
 else
-  echo "↷ 略過 EXIF 方向測試（環境未安裝 python3 + Pillow）"
+  echo "↷ 略過 EXIF 方向與排序順序測試（環境未安裝 python3 + Pillow）"
 fi
 
 # 錯誤路徑：確認各種不合法輸入都被明確拒絕（非 0 退出碼＋易懂訊息）
