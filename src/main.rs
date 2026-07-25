@@ -648,9 +648,14 @@ fn download_update(tag: &str, progress: &dyn Fn(f32)) -> Result<(), String> {
     // 執行中的 exe 不能覆寫，但可以改名：舊檔改 .old、新檔補上原位
     let old = exe.with_extension("exe.old");
     let _ = std::fs::remove_file(&old);
-    std::fs::rename(&exe, &old).map_err(|e| format!("無法替換舊版程式：{e}"))?;
+    if let Err(e) = std::fs::rename(&exe, &old) {
+        // 舊 exe 改名失敗（如被防毒鎖住）：清掉已下載的新 exe，不留 8MB 殘檔
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("無法替換舊版程式：{e}"));
+    }
     if let Err(e) = std::fs::rename(&tmp, &exe) {
         let _ = std::fs::rename(&old, &exe); // 失敗時還原
+        let _ = std::fs::remove_file(&tmp); // 清掉未能就位的新 exe
         return Err(format!("無法安裝新版程式：{e}"));
     }
     Ok(())
