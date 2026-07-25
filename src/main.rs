@@ -6088,4 +6088,33 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn urlencode_percent_encodes_correctly() {
+        // 未保留字元原樣保留
+        assert_eq!(urlencode("abc123-_.~"), "abc123-_.~");
+        // 空白、百分比等要編碼（回報文字常有「50% off」）
+        assert_eq!(urlencode("a b"), "a%20b");
+        assert_eq!(urlencode("50%"), "50%25");
+        // 中文逐位元組編碼（UTF-8）
+        assert_eq!(urlencode("中"), "%E4%B8%AD");
+        // 換行（回報內文用）
+        assert_eq!(urlencode("a\nb"), "a%0Ab");
+    }
+
+    #[test]
+    fn truncate_for_url_respects_budget_and_char_boundary() {
+        // 短字串不截斷
+        assert_eq!(truncate_for_url("short", 1500), "short");
+        // 超預算時截斷並附提示；且 urlencode 後長度不超過預算太多（估算為上界）
+        let long = "中".repeat(1000); // 每字 UTF-8 3 bytes → urlencode 9 倍
+        let t = truncate_for_url(&long, 90);
+        assert!(t.contains("內容過長已截斷"), "超長未附截斷提示：{t}");
+        // 逐字元截斷不切壞多位元組字元：能被正常 urlencode（不會 panic）
+        let enc = urlencode(&t);
+        assert!(enc.is_char_boundary(0)); // 存在即代表 t 是合法 UTF-8
+        // 截斷保留的內容（不含提示）其估算編碼長度不超過預算
+        let kept = t.split('\n').next().unwrap_or("");
+        assert!(kept.chars().map(|c| c.len_utf8() * 3).sum::<usize>() <= 90, "超出預算：{kept}");
+    }
 }
