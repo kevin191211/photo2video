@@ -5831,9 +5831,6 @@ fn main() -> eframe::Result {
     // 在背景清掉先前閃退/強制結束留下的孤兒暫存檔（不佔啟動時間）
     thread::spawn(clean_stale_temp_files);
 
-    // 提早在背景讀取中文字型檔（20MB+），與視窗建立同時進行，縮短啟動時間
-    let font_loader = thread::spawn(load_cjk_font_bytes);
-
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 && args[1] == "--cli" {
         // 需在任何 println! 之前附加主控台，否則 release 版的 CLI 輸出會看不到
@@ -5844,6 +5841,11 @@ fn main() -> eframe::Result {
         }
         return Ok(());
     }
+
+    // 提早在背景讀取中文字型檔（20MB+），與視窗建立同時進行，縮短啟動時間。
+    // 放在 CLI 分支之後：命令列模式不畫 UI、用不到這個字型，先前在此之前讀取
+    // 等於每次批次轉檔都白讀一次 20MB
+    let font_loader = thread::spawn(load_cjk_font_bytes);
 
     // 其餘參數視為要開啟的照片、資料夾或 .p2v 專案檔
     // （支援「開啟方式」與拖曳到執行檔上）
