@@ -1311,17 +1311,10 @@ impl App {
         matches!(self.state, ConvertState::Working { .. })
     }
 
-    /// 預估輸出影片總長度（秒），與 run_conversion 的 total_secs 一致。
-    /// Ken Burns 會把每張時長對齊到 30fps 的整數格，fps 無法整除 30 時
-    /// 與純幻燈片（張數÷fps）有落差，估算須比照，否則顯示的長度與成品不符
+    /// 預估輸出影片總長度（秒），與 run_conversion 的 total_secs 一致
+    /// （兩者共用 photo_frame_timing，保證顯示的長度與成品相符）。
     fn estimated_video_secs(&self) -> f64 {
-        let fps = self.fps.max(1) as f64;
-        let eff_dur = if self.ken_burns {
-            let d = ((OUT_FPS as f64 / fps).round() as i64).max(1);
-            d as f64 / OUT_FPS as f64
-        } else {
-            1.0 / fps
-        };
+        let (eff_dur, _) = photo_frame_timing(self.fps, self.ken_burns);
         self.photos.len() as f64 * eff_dur
     }
 
@@ -5256,6 +5249,19 @@ struct SubtitleJob {
     entries: Vec<TextJob>,
 }
 
+/// 每張照片的實際顯示秒數與 Ken Burns 的每張格數。純幻燈片為 1/fps、格數 0；
+/// Ken Burns 用 zoompan 以整數格計時，須把 1/fps 對齊到 OUT_FPS 的整數格
+/// （fps 無法整除 30 時會有落差）。估算長度與實際轉檔共用此函式，兩者才一致。
+fn photo_frame_timing(fps: u32, ken_burns: bool) -> (f64, i64) {
+    let fps = fps.max(1) as f64;
+    if ken_burns {
+        let d = ((OUT_FPS as f64 / fps).round() as i64).max(1);
+        (d as f64 / OUT_FPS as f64, d)
+    } else {
+        (1.0 / fps, 0)
+    }
+}
+
 /// 淡入淡出轉場：每張照片邊界的淡黑「半寬」（秒）。約取每張時長的 0.4，
 /// 下限 0.05、上限 0.5 秒。關鍵是最後再 `.min(eff_dur*0.5)`：淡出半寬絕不
 /// 能超過半張照片時長，否則畫面中點也回不到全亮、整支影片會恆定變暗
@@ -5461,14 +5467,10 @@ fn run_conversion(
     let animated = fx.ken_burns || fx.transition != Transition::None || avi_with_audio;
 
     // 每張照片的顯示秒數。Ken Burns 用 zoompan 以「每張輸出 kb_frames 格」計時，
-    // 需把實際秒數對齊到 30fps 的格數，字幕與轉場時間點才不會累積漂移
-    let duration = 1.0 / fps as f64;
-    let (eff_dur, kb_frames) = if fx.ken_burns {
-        let d = ((duration * OUT_FPS as f64).round() as i64).max(1);
-        (d as f64 / OUT_FPS as f64, d)
-    } else {
-        (duration, 0)
-    };
+    // 需把實際秒數對齊到 30fps 的格數，字幕與轉場時間點才不會累積漂移。
+    // 與工具列的預估長度共用 photo_frame_timing，兩者才會一致。
+    let duration = 1.0 / fps as f64; // concat 清單每張的原始時長（非 Ken Burns 量化值）
+    let (eff_dur, kb_frames) = photo_frame_timing(fps, fx.ken_burns);
     let total_secs = photos.len() as f64 * eff_dur;
 
     // 用 concat demuxer 列出每張照片與顯示時間（個別調色的照片指向暫存圖）
@@ -6405,5 +6407,24 @@ mod tests {
         // 具體值：fps=2（eff=0.5）→ 0.2；fps=30（eff≈0.0333）→ 夾到 eff/2
         assert!((transition_fade_width(0.5) - 0.2).abs() < 1e-9);
         assert!((transition_fade_width(1.0 / 30.0) - (1.0 / 60.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn photo_frame_timing_slideshow_and_kenburns() {
+        // 純幻燈片：每張 1/fps 秒、格數 0
+        assert_eq!(photo_frame_timing(2, false), (0.5, 0));
+        assert_eq!(photo_frame_timing(10, false), (0.1, 0));
+        // Ken Burns：把 1/fps 對齊到 30fps 的整數格
+        assert_eq!(photo_frame_timing(2, true), (15.0 / 30.0, 15)); // 30/2=15
+        assert_eq!(photo_frame_timing(3, true), (10.0 / 30.0, 10)); // 30/3=10
+        assert_eq!(photo_frame_timing(7, true), (4.0 / 30.0, 4)); // 30/7=4.28→4
+        assert_eq!(photo_frame_timing(60, true), (1.0 / 30.0, 1)); // 30/60=0.5→夾到 1
+        // 格數恆 ≥1（Ken Burns 每張至少 1 格，否則 zoompan d=0 無效）
+        for fps in 1..=60 {
+            let (_, kb) = photo_frame_timing(fps, true);
+            assert!(kb >= 1, "fps={fps}：Ken Burns 格數應 ≥1");
+        }
+        // fps=0 也不 panic（除以零）：夾到 1
+        assert_eq!(photo_frame_timing(0, false), (1.0, 0));
     }
 }
