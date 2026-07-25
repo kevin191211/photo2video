@@ -6378,6 +6378,44 @@ mod tests {
     }
 
     #[test]
+    fn preview_canvas_fits_box_even_and_keeps_aspect() {
+        // 標準解析度：等比縮到「較長邊 = 960」，偶數；16:9 → 960x540
+        assert_eq!(preview_canvas(Resolution { w: 1920, h: 1080 }), (960, 540));
+        assert_eq!(preview_canvas(Resolution { w: 1280, h: 720 }), (960, 540));
+        assert_eq!(preview_canvas(Resolution { w: 3840, h: 2160 }), (960, 540));
+        // 直向與方形也不超出 960 的框
+        assert_eq!(preview_canvas(Resolution { w: 1080, h: 1920 }), (540, 960));
+        assert_eq!(preview_canvas(Resolution { w: 1000, h: 1000 }), (960, 960));
+
+        // 各種尺寸（含被 cap 過的極端 native 值）都要守住不變式：
+        // 兩邊皆偶數、≥2、都不超出 960 的預覽框、長寬比與來源相近
+        let cases = [
+            (1920u32, 1080u32),
+            (720, 1280),
+            (2560, 1440),
+            (16384, 8192), // cap_native 後可能出現的超寬
+            (8192, 16384),
+            (3000, 4000),
+            (1, 1),
+        ];
+        for (w, h) in cases {
+            let (pw, ph) = preview_canvas(Resolution { w, h });
+            assert!(pw % 2 == 0 && ph % 2 == 0, "非偶數：{pw}x{ph}（來源 {w}x{h}）");
+            assert!(pw >= 2 && ph >= 2, "小於 2：{pw}x{ph}");
+            assert!(pw <= 960 && ph <= 960, "超出預覽框：{pw}x{ph}（來源 {w}x{h}）");
+            // 長寬比相近（容忍偶數化捨入；退化的 1px 邊夾到 2 會失真，故排除極端比例）
+            if w.min(h) as f64 / w.max(h) as f64 > 0.02 {
+                let src = w as f64 / h as f64;
+                let out = pw as f64 / ph as f64;
+                assert!(
+                    (src / out - 1.0).abs() < 0.02,
+                    "長寬比走樣：來源 {w}x{h}={src:.4} vs 預覽 {pw}x{ph}={out:.4}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn project_file_json_roundtrip_is_lossless_and_stable() {
         // .p2v 存讀是核心功能，且 has_unsaved_changes 靠「序列化穩定＋能反映
         // 任何變更」偵測未儲存變更。用涵蓋各欄位型別的非預設值驗證。
