@@ -5560,9 +5560,18 @@ fn run_cli(args: &[String]) -> Result<(), String> {
         }
     }
 
+    // 只在整數百分比變動時印進度：ffmpeg 每個影格都回報，相鄰影格四捨五入
+    // 後常是同一個百分比，不去重會刷出大量重複的「進度 50%」
+    let last_pct = std::cell::Cell::new(-1i32);
     let send = |msg: WorkerMsg| match msg {
         WorkerMsg::Status(s) => println!("{s}"),
-        WorkerMsg::Progress(p) => println!("進度 {:.0}%", p * 100.0),
+        WorkerMsg::Progress(p) => {
+            let pct = (p * 100.0).round() as i32;
+            if pct != last_pct.get() {
+                last_pct.set(pct);
+                println!("進度 {pct}%");
+            }
+        }
         _ => {}
     };
     let no_subs = SubtitleJob {
