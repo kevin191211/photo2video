@@ -6011,4 +6011,33 @@ mod tests {
         let sb = drawtext_filter(font, cap, &boxed, 60.0, 1.0, 0.5, 0.85, None);
         assert!(sb.contains(":box=1:boxcolor=black@0.4:boxborderw="), "底框參數缺失：{sb}");
     }
+
+    #[test]
+    fn filter_chain_values_and_clarity_scaling() {
+        // 中性（全 0）不產生任何濾鏡，主管線才能省下運算
+        assert_eq!(Adjustments::default().filter_chain(1.0), None);
+
+        // 對比 +50 → eq contrast = 1 + 50*0.008 = 1.4
+        let c = Adjustments { contrast: 50, ..Default::default() }
+            .filter_chain(1.0)
+            .unwrap();
+        assert!(c.contains("eq=contrast=1.4000:brightness=0.0000:saturation=1.0000"), "{c}");
+
+        // 色溫 +100 → 6500 - 100*35 = 3000K
+        let t = Adjustments { temp: 100, ..Default::default() }
+            .filter_chain(1.0)
+            .unwrap();
+        assert!(t.contains("colortemperature=temperature=3000"), "{t}");
+
+        // 清晰度的 unsharp 半徑以像素計，須隨輸出解析度縮放：1080p(scale=1)→13、
+        // 4K(scale=2)→上限 23；核心尺寸恆為奇數
+        let s1 = Adjustments { clarity: 100, ..Default::default() }
+            .filter_chain(1.0)
+            .unwrap();
+        assert!(s1.contains("unsharp=luma_msize_x=13:luma_msize_y=13:luma_amount=1.5000"), "{s1}");
+        let s2 = Adjustments { clarity: 100, ..Default::default() }
+            .filter_chain(2.0)
+            .unwrap();
+        assert!(s2.contains("luma_msize_x=23:luma_msize_y=23"), "{s2}");
+    }
 }
