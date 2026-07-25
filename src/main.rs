@@ -5207,6 +5207,16 @@ fn run_conversion(
         }
     }
 
+    // 確保輸出檔的父資料夾存在：ffmpeg 不會自動建立缺少的資料夾，只會回一句
+    // 技術性的「No such file or directory」。命令列指定尚未建立的資料夾路徑
+    // （如 out\2026\影片.mp4）時先補建，讓轉檔直接成功而非莫名失敗；資料夾
+    // 已存在則無作用。GUI 的輸出路徑來自存檔對話框、父資料夾必存在，不受影響
+    if let Some(parent) = output.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+
     // 第一次執行時自動下載 ffmpeg
     ensure_ffmpeg(|| {
         send(WorkerMsg::Status(
