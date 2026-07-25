@@ -6317,4 +6317,22 @@ mod tests {
         assert!(!a.is_neutral());
         assert!(Adjustments::default().is_neutral());
     }
+
+    #[test]
+    fn adjustments_clamped_bounds_all_fields() {
+        // 開檔時把手改過的專案檔夾回 -100~100，否則超界值餵給 filter_chain
+        // 會產生不合法的 ffmpeg 濾鏡參數、轉檔失敗。每欄都必須被夾。
+        let mut a = Adjustments::default();
+        // 用超界值填滿每一欄（正負交錯）
+        for (i, v) in a.values_mut().into_iter().enumerate() {
+            *v = if i % 2 == 0 { 9999 } else { -9999 };
+        }
+        for &v in a.clamped().values().iter() {
+            assert!((-100..=100).contains(&v), "clamped 後仍超界：{v}");
+        }
+        // 界內值原樣保留
+        let ok = Adjustments { contrast: 50, temp: -80, ..Default::default() }.clamped();
+        assert_eq!(ok.contrast, 50);
+        assert_eq!(ok.temp, -80);
+    }
 }
