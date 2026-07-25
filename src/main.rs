@@ -6416,6 +6416,28 @@ mod tests {
     }
 
     #[test]
+    fn rot_vec_is_clockwise_in_screen_space_and_length_preserving() {
+        use egui::vec2;
+        let approx =
+            |a: egui::Vec2, b: egui::Vec2| (a.x - b.x).abs() < 1e-5 && (a.y - b.y).abs() < 1e-5;
+        // 零角＝原樣
+        assert!(approx(rot_vec(vec2(1.0, 0.0), 0.0), vec2(1.0, 0.0)));
+        // egui 為 Y 向下：正角度＝順時針（與輸出 ffmpeg rotate、TextShape.angle 一致，
+        // 方向反了會讓預覽文字與成品旋轉相反）。右向 (1,0) 轉 90° → 下向 (0,1)
+        let hp = std::f32::consts::FRAC_PI_2;
+        assert!(approx(rot_vec(vec2(1.0, 0.0), hp), vec2(0.0, 1.0)), "90° 應順時針到 (0,1)");
+        // 下向 (0,1) 轉 90° → 左向 (-1,0)
+        assert!(approx(rot_vec(vec2(0.0, 1.0), hp), vec2(-1.0, 0.0)));
+        // 180°：反向
+        assert!(approx(rot_vec(vec2(1.0, 0.0), std::f32::consts::PI), vec2(-1.0, 0.0)));
+        // 保長：任意角度都不改變向量長度（外框 8 向偏移與底框四角靠這個維持形狀）
+        for deg in [13.0_f32, 47.0, 90.0, 137.0, 200.0, 359.0] {
+            let r = rot_vec(vec2(3.0, -4.0), deg.to_radians()); // 來源長度 5
+            assert!((r.length() - 5.0).abs() < 1e-4, "{deg}° 改變了長度：{}", r.length());
+        }
+    }
+
+    #[test]
     fn project_file_json_roundtrip_is_lossless_and_stable() {
         // .p2v 存讀是核心功能，且 has_unsaved_changes 靠「序列化穩定＋能反映
         // 任何變更」偵測未儲存變更。用涵蓋各欄位型別的非預設值驗證。
