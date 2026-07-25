@@ -5256,6 +5256,14 @@ struct SubtitleJob {
     entries: Vec<TextJob>,
 }
 
+/// 淡入淡出轉場：每張照片邊界的淡黑「半寬」（秒）。約取每張時長的 0.4，
+/// 下限 0.05、上限 0.5 秒。關鍵是最後再 `.min(eff_dur*0.5)`：淡出半寬絕不
+/// 能超過半張照片時長，否則畫面中點也回不到全亮、整支影片會恆定變暗
+/// （高 fps 時 0.05 的下限就會超過 d/2，故必須夾）。
+fn transition_fade_width(eff_dur: f64) -> f64 {
+    (eff_dur * 0.4).clamp(0.05, 0.5).min(eff_dur * 0.5)
+}
+
 /// 背景音樂的 -af 濾鏡字串：音量（volume 百分比→倍率）＋結尾淡出。
 /// 淡出最多 2 秒；短片按總長一半縮短、才不會比影片還長；總長 ≤1 秒不淡出
 /// （淡出區間會超過影片本身）。
@@ -5568,9 +5576,7 @@ fn run_conversion(
     // 首尾也各有一次淡入/淡出；不用串接大量 fade 濾鏡（fade 的 st 前後會整段變黑）
     let mut tail = String::new();
     if fx.transition == Transition::FadeBlack {
-        // 淡出時間不能超過半張照片時長，否則畫面中點也回不到全亮：
-        // fps 高於 10 時 0.05 秒的下限會超過 d/2，整支影片會恆定變暗
-        let f = (eff_dur * 0.4).clamp(0.05, 0.5).min(eff_dur * 0.5);
+        let f = transition_fade_width(eff_dur);
         let dip = format!(
             "max(0,1-min(mod(t,{d:.6}),{d:.6}-mod(t,{d:.6}))/{f:.6})",
             d = eff_dur,
@@ -6380,5 +6386,24 @@ mod tests {
         // 總長 ≤1 秒不淡出（淡出區間會超過影片）
         assert_eq!(audio_filter_string(100, true, 1.0), "volume=1.000");
         assert_eq!(audio_filter_string(100, true, 0.5), "volume=1.000");
+    }
+
+    #[test]
+    fn transition_fade_width_never_exceeds_half_photo() {
+        // 關鍵不變式：淡出半寬 ≤ 半張照片時長，否則畫面中點回不到全亮、整支
+        // 影片恆定變暗。涵蓋各種 fps（eff_dur=1/fps）——尤其高 fps 的短時長。
+        for fps in [1, 2, 3, 5, 10, 15, 24, 30, 60] {
+            let eff = 1.0 / fps as f64;
+            let f = transition_fade_width(eff);
+            assert!(
+                f <= eff * 0.5 + 1e-9,
+                "fps={fps}：淡出半寬 {f} > 半張時長 {}",
+                eff * 0.5
+            );
+            assert!(f > 0.0, "fps={fps}：淡出半寬應為正");
+        }
+        // 具體值：fps=2（eff=0.5）→ 0.2；fps=30（eff≈0.0333）→ 夾到 eff/2
+        assert!((transition_fade_width(0.5) - 0.2).abs() < 1e-9);
+        assert!((transition_fade_width(1.0 / 30.0) - (1.0 / 60.0)).abs() < 1e-9);
     }
 }
