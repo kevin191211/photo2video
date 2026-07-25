@@ -5256,6 +5256,18 @@ struct SubtitleJob {
     entries: Vec<TextJob>,
 }
 
+/// 背景音樂的 -af 濾鏡字串：音量（volume 百分比→倍率）＋結尾淡出。
+/// 淡出最多 2 秒；短片按總長一半縮短、才不會比影片還長；總長 ≤1 秒不淡出
+/// （淡出區間會超過影片本身）。
+fn audio_filter_string(volume: i32, fade_out: bool, total_secs: f64) -> String {
+    let mut af = format!("volume={:.3}", volume.max(0) as f64 / 100.0);
+    if fade_out && total_secs > 1.0 {
+        let fd = (total_secs * 0.5).min(2.0);
+        af.push_str(&format!(",afade=t=out:st={:.3}:d={fd:.3}", total_secs - fd));
+    }
+    af
+}
+
 // 轉換任務的完整參數組，拆包裝反而失去可讀性
 #[allow(clippy::too_many_arguments)]
 fn run_conversion(
@@ -5613,15 +5625,10 @@ fn run_conversion(
     };
 
     // 音訊濾鏡（有背景音樂時）
-    let audio_filter = fx.music.as_ref().map(|m| {
-        let mut af = format!("volume={:.3}", m.volume.max(0) as f64 / 100.0);
-        // 結尾淡出：最多 2 秒；短片按總長一半縮短，才不會比影片還長
-        if m.fade_out && total_secs > 1.0 {
-            let fd = (total_secs * 0.5).min(2.0);
-            af.push_str(&format!(",afade=t=out:st={:.3}:d={fd:.3}", total_secs - fd));
-        }
-        af
-    });
+    let audio_filter = fx
+        .music
+        .as_ref()
+        .map(|m| audio_filter_string(m.volume, m.fade_out, total_secs));
 
     let total_frames = if animated {
         (total_secs * OUT_FPS as f64) as f32
@@ -6351,5 +6358,27 @@ mod tests {
         }
         assert!(!is_audio(Path::new("m.mid")), "midi 未支援");
         assert!(!is_audio(Path::new("p.png")), "圖片不是音訊");
+    }
+
+    #[test]
+    fn audio_filter_string_volume_and_fade() {
+        // 音量：百分比→倍率（實測 50%＝-6dB、200%＝+6dB）
+        assert_eq!(audio_filter_string(100, false, 4.0), "volume=1.000");
+        assert_eq!(audio_filter_string(50, false, 4.0), "volume=0.500");
+        assert_eq!(audio_filter_string(200, false, 4.0), "volume=2.000");
+        assert_eq!(audio_filter_string(0, false, 4.0), "volume=0.000");
+        // 淡出：st=總長-淡出長、d=淡出長；長片封頂 2 秒
+        assert_eq!(
+            audio_filter_string(100, true, 10.0),
+            "volume=1.000,afade=t=out:st=8.000:d=2.000"
+        );
+        // 短片：淡出長=總長一半（不會比影片長）
+        assert_eq!(
+            audio_filter_string(100, true, 3.0),
+            "volume=1.000,afade=t=out:st=1.500:d=1.500"
+        );
+        // 總長 ≤1 秒不淡出（淡出區間會超過影片）
+        assert_eq!(audio_filter_string(100, true, 1.0), "volume=1.000");
+        assert_eq!(audio_filter_string(100, true, 0.5), "volume=1.000");
     }
 }
