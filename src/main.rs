@@ -557,8 +557,10 @@ fn update_config(key: &str, value: serde_json::Value) {
     }
     // 原子寫入：先寫臨時檔再 rename 覆蓋。直接 write 若寫到一半崩潰/斷電，
     // 會留下損壞的 config.json，下次啟動解析失敗就丟失 fps 慣用值與整份
-    // 最近專案清單。臨時檔壞了也不影響既有的 config.json
-    let tmp = path.with_extension("json.tmp");
+    // 最近專案清單。臨時檔壞了也不影響既有的 config.json。
+    // 臨時檔名帶行程 ID（比照 temp_path）：同時開兩個視窗各自存設定時，才不會
+    // 共用同一個 config.json.tmp 互相覆寫、導致其中一次更新遺失或殘留半成品
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     if std::fs::write(&tmp, cfg.to_string()).is_ok() {
         // rename 失敗（如防毒鎖檔）就清掉臨時檔，不留垃圾
         if std::fs::rename(&tmp, &path).is_err() {
