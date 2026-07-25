@@ -6040,4 +6040,19 @@ mod tests {
             .unwrap();
         assert!(s2.contains("luma_msize_x=23:luma_msize_y=23"), "{s2}");
     }
+
+    #[test]
+    fn concat_escape_backslash_then_quote_order() {
+        // concat 清單以 file '…' 包住路徑。反斜線要先轉斜線、單引號再以 '\'' 跳脫。
+        // 順序不能反：若先跳脫單引號，'\'' 裡的反斜線會被後面的「反斜線→斜線」
+        // 破壞成 '/''，整條清單解析失敗、那張之後的照片全被丟掉。
+        let out = concat_escape(Path::new(r"C:\O'Brien\相片.jpg"));
+        // 分隔用的反斜線→斜線（注意：'\'' 跳脫序列本身含一個反斜線，屬正常）
+        assert!(out.contains("C:/O") && out.contains("Brien/相片.jpg"), "分隔反斜線未轉斜線：{out}");
+        // 單引號跳脫成 '\''，且順序正確
+        assert!(out.contains(r"O'\''Brien"), "單引號跳脫或順序錯誤：{out}");
+        // 若順序反了（先跳脫單引號再轉斜線），會變成 O'/''Brien
+        assert!(!out.contains("O'/''"), "跳脫順序反了，'\\'' 的反斜線被轉成斜線：{out}");
+        assert!(out.contains("相片.jpg"), "非 ASCII 檔名應原樣保留：{out}");
+    }
 }
