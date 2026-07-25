@@ -6335,4 +6335,21 @@ mod tests {
         assert_eq!(ok.contrast, 50);
         assert_eq!(ok.temp, -80);
     }
+
+    #[test]
+    fn is_image_and_is_audio_extension_matching() {
+        // 收集照片/音樂都靠這兩個判斷（含空檔排除 is_nonempty_file）；不分大小寫、
+        // 只認清單內的副檔名。壞掉會靜默漏收有效檔或收進不支援的檔。
+        for f in ["p.jpg", "p.JPG", "p.jpeg", "p.png", "p.PNG", "p.bmp", "p.webp", "p.tif", "p.TIFF"] {
+            assert!(is_image(Path::new(f)), "{f} 應被視為圖片");
+        }
+        for f in ["p.heic", "p.gif", "p.txt", "p.mp4", "noext", "p."] {
+            assert!(!is_image(Path::new(f)), "{f} 不該被視為圖片");
+        }
+        for f in ["m.mp3", "m.WAV", "m.m4a", "m.aac", "m.flac", "m.ogg", "m.opus", "m.wma"] {
+            assert!(is_audio(Path::new(f)), "{f} 應被視為音訊");
+        }
+        assert!(!is_audio(Path::new("m.mid")), "midi 未支援");
+        assert!(!is_audio(Path::new("p.png")), "圖片不是音訊");
+    }
 }
