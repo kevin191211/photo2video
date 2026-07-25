@@ -704,8 +704,6 @@ fn detect_fonts() -> Vec<(String, PathBuf)> {
         .collect()
 }
 
-/// 百分比編碼（供組 GitHub 回報網址用）：非「未保留字元」的位元組一律以 %XX 表示，
-/// 中文等 UTF-8 多位元組也逐位元組編碼，瀏覽器與 GitHub 都能正確還原
 /// 把秒數格式化為易讀的影片長度（給底欄顯示預計輸出長度用）。
 /// 一分鐘以上顯示「M 分 S 秒」，短片顯示一位小數，才看得出每秒張數的差別
 fn fmt_video_len(secs: f64) -> String {
@@ -722,6 +720,8 @@ fn fmt_video_len(secs: f64) -> String {
     }
 }
 
+/// 百分比編碼（供組 GitHub 回報網址用）：非「未保留字元」的位元組一律以 %XX 表示，
+/// 中文等 UTF-8 多位元組也逐位元組編碼，瀏覽器與 GitHub 都能正確還原
 fn urlencode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
@@ -3171,9 +3171,9 @@ impl App {
                     .show(ui, |ui| {
                         ui.label(
                             egui::RichText::new(format!(
-                                "{} 張照片 · 約 {:.1} 秒",
+                                "{} 張照片 · 約 {}",
                                 self.photos.len(),
-                                secs
+                                fmt_video_len(secs)
                             ))
                             .size(11.5)
                             .color(theme::TEXT_WEAK),
