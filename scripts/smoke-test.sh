@@ -98,6 +98,25 @@ else
 fi
 rm -rf "$MIX" "$mix_out"
 
+# 特殊字元路徑：資料夾與檔名含單引號、空格、中文（都是 Windows 合法檔名）。
+# concat 清單以單引號包住每個路徑，escape 沒處理好單引號會讓整條清單解析失敗、
+# 轉檔中止。這條路徑（concat_escape）先前無自動化覆蓋。
+SPDIR="$TMP/引號 don't test"
+rm -rf "$SPDIR"; mkdir -p "$SPDIR"
+"$FF" -f lavfi -i color=red:s=640x480:d=1   -frames:v 1 -y "$SPDIR/don't 1.png"       >/dev/null 2>&1
+"$FF" -f lavfi -i color=blue:s=640x480:d=1  -frames:v 1 -y "$SPDIR/我的 2.png"         >/dev/null 2>&1
+"$FF" -f lavfi -i color=green:s=640x480:d=1 -frames:v 1 -y "$SPDIR/it's a test 10.png" >/dev/null 2>&1
+sp_out="$TMP/引號 out.mp4"; rm -f "$sp_out"
+"$EXE" --cli "$SPDIR" 2 "$sp_out" >/dev/null 2>&1
+sp_res=$("$FF" -i "$sp_out" 2>&1 | sed -n 's/.*, \([0-9]*x[0-9]*\).*/\1/p' | head -1)
+sp_dur=$(duration "$sp_out")
+if [ "$sp_res" = "1920x1080" ] && [ "$sp_dur" = "1.50" ]; then
+  echo "✓ 特殊字元路徑（單引號/空格/中文）：時長 ${sp_dur}s、解析度 $sp_res"
+else
+  echo "✗ 特殊字元路徑：時長 ${sp_dur}s（期望 1.50）、解析度 $sp_res（期望 1920x1080）"; FAIL=1
+fi
+rm -rf "$SPDIR" "$sp_out"
+
 # EXIF 方向：手機直拍照片常以「未旋轉像素＋方向標記」儲存，轉檔必須依 EXIF
 # 自動轉正（與縮圖、預覽、原始像素解析度的判斷一致），否則直拍照片會躺著輸出。
 # 需 python3 + Pillow 產生帶 EXIF orientation 的測試圖；沒有就略過這個案例。
