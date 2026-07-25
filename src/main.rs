@@ -4585,10 +4585,33 @@ fn natural_sort(paths: &mut [PathBuf]) {
     paths.sort_by_cached_key(|p| natural_key(&p.to_string_lossy().to_lowercase()));
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
+#[derive(PartialEq, Eq)]
 enum NatPart {
-    Num(u128),
+    // 數字段以「去除前導零的數字字串」保存，而非 u128：超過 39 位的數字會撐爆
+    // u128，若用 parse().unwrap_or(0) 會讓所有超長數字全變 0、彼此排序錯亂。
+    // 改存字串後，數值大小 = 先比長度、長度相同再比字典序（見 Ord），可正確
+    // 排序任意長度的數字（如超長時間戳或雜湊檔名），且不需配置整數解析
+    Num(String),
     Text(String),
+}
+
+impl Ord for NatPart {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self, other) {
+            // 去零後：位數多的數值大；位數相同時字典序等同數值序
+            (NatPart::Num(a), NatPart::Num(b)) => a.len().cmp(&b.len()).then_with(|| a.cmp(b)),
+            (NatPart::Text(a), NatPart::Text(b)) => a.cmp(b),
+            // 數字段一律排在文字段之前（沿用原本 enum 變體順序的行為）
+            (NatPart::Num(_), NatPart::Text(_)) => Ordering::Less,
+            (NatPart::Text(_), NatPart::Num(_)) => Ordering::Greater,
+        }
+    }
+}
+impl PartialOrd for NatPart {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 fn natural_key(s: &str) -> Vec<NatPart> {
@@ -4612,7 +4635,9 @@ fn natural_key(s: &str) -> Vec<NatPart> {
 
 fn flush_part(buf: &str, is_num: bool) -> NatPart {
     if is_num {
-        NatPart::Num(buf.parse().unwrap_or(0))
+        // 去除前導零，"007" 與 "7" 視為同值（與原本 parse 成同一整數一致）；
+        // 全零字串去零後為空、長度 0，正確排在所有非零數字之前
+        NatPart::Num(buf.trim_start_matches('0').to_string())
     } else {
         NatPart::Text(buf.to_string())
     }
@@ -5748,4 +5773,46 @@ fn main() -> eframe::Result {
             Ok(Box::new(App::new(cc, initial_files, cjk_font)))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn sorted(names: &[&str]) -> Vec<String> {
+        let mut v: Vec<PathBuf> = names.iter().map(PathBuf::from).collect();
+        natural_sort(&mut v);
+        v.iter().map(|p| p.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn natural_sort_orders_numbers_by_value() {
+        // img2 應排在 img10 前（純字典序會反過來）
+        assert_eq!(
+            sorted(&["img10.jpg", "img2.jpg", "img1.jpg"]),
+            ["img1.jpg", "img2.jpg", "img10.jpg"]
+        );
+    }
+
+    #[test]
+    fn natural_sort_handles_leading_zeros() {
+        // 前導零視為同值，數字段相同時比後續字元
+        assert_eq!(
+            sorted(&["a09.jpg", "a1.jpg", "a10.jpg"]),
+            ["a1.jpg", "a09.jpg", "a10.jpg"]
+        );
+    }
+
+    #[test]
+    fn natural_sort_handles_huge_numbers_without_overflow() {
+        // 超過 u128（39 位）的數字段：舊版 parse().unwrap_or(0) 會全變 0、
+        // 兩者視為相等而亂序；新版以「長度→字典序」比較，仍能正確分辨大小
+        let big_a = format!("f{}.jpg", "9".repeat(45)); // 45 個 9
+        let big_b = format!("f{}.jpg", "1".to_string() + &"0".repeat(45)); // 1 後 45 個 0（更大）
+        assert_eq!(
+            sorted(&[big_b.as_str(), big_a.as_str()]),
+            [big_a, big_b] // 位數少者（45 位的 9…）排前，位數多者（46 位）排後
+        );
+    }
 }
