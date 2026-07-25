@@ -5956,4 +5956,33 @@ mod tests {
         assert_eq!(fmt_video_len(3661.0), "1 時 1 分");
         assert_eq!(fmt_video_len(7325.0), "2 時 2 分");
     }
+
+    #[test]
+    fn ff_path_escape_handles_windows_and_quotes() {
+        // 反斜線→斜線、冒號跳脫（drawtext 用冒號分隔參數）
+        assert_eq!(
+            ff_path_escape(Path::new(r"C:\Windows\Fonts\arial.ttf")),
+            r"C\:/Windows/Fonts/arial.ttf"
+        );
+        // 路徑含單引號（如使用者名 O'Brien，字幕暫存檔就在其目錄下）：
+        // 以 '\'' 跳脫，才不會提前終止 fontfile='…' 的引號導致整條濾鏡失敗
+        assert_eq!(
+            ff_path_escape(Path::new(r"C:\Users\O'Brien\cap.txt")),
+            r"C\:/Users/O'\''Brien/cap.txt"
+        );
+    }
+
+    #[test]
+    fn ff_color_outputs_straight_rgb_with_alpha() {
+        // 不透明白/黑/紅：0xRRGGBB@alpha（三位小數）
+        assert_eq!(ff_color(egui::Color32::WHITE), "0xFFFFFF@1.000");
+        assert_eq!(ff_color(egui::Color32::BLACK), "0x000000@1.000");
+        assert_eq!(ff_color(egui::Color32::from_rgb(255, 0, 0)), "0xFF0000@1.000");
+        // 半透明：取未預乘（straight）值，alpha 反映到 @ 後。用 0/255 的通道
+        // 避免 Color32 預乘儲存的往返捨入誤差（中間值如 128 會變 129）
+        assert_eq!(
+            ff_color(egui::Color32::from_rgba_unmultiplied(255, 0, 0, 128)),
+            "0xFF0000@0.502"
+        );
+    }
 }
