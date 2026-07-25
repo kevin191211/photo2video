@@ -5602,7 +5602,13 @@ fn run_conversion(
     // 編碼前強制輸出為偶數尺寸：某些濾鏡組合（如 zoompan、rotate、overlay）
     // 可能算出奇數高/寬（如 1920x1081），H.264（尤其 libx264）要求 yuv420p
     // 的長寬必須為偶數，否則會以「height not divisible by 2」失敗。
-    // crop 至最接近的偶數（最多裁掉 1 像素，肉眼無感）
+    // crop 至最接近的偶數（最多裁掉 1 像素，肉眼無感）。
+    //
+    // 註：format=yuv420p 會丟掉透明 PNG 的 alpha、保留原始 RGB（不與黑底合成），
+    // 故透明區域顯示其底色而非黑。已評估在此前加 format=rgba,premultiply 把
+    // alpha 對黑底合成——實測對「所有」轉檔多耗約 11%（不分透明與否），而透明
+    // 照片在幻燈片極罕見、且透明像素多為黑（在黑底上本就隱形），成本效益不划算，
+    // 故刻意不做。若日後要支援，應只對「確實含 alpha」的照片有條件套用。
     tail.push_str("crop=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1,format=yuv420p");
 
     // 先把視訊濾鏡定案：有旋轉文字走 filter_complex，否則走 -vf
