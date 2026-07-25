@@ -119,6 +119,27 @@ else
 fi
 rm -rf "$MIX" "$mix_out"
 
+# 混合格式：一個資料夾內同時有 jpg/png/bmp/webp/tif（手機照片＋截圖＋下載圖
+# 很常見）。concat demuxer 要求編碼一致，程式須先把非 PNG 的照片正規化，否則
+# 會靜默丟格（成品少照片）甚至整個失敗。以 6 種格式各一張、fps=2 驗證時長 3.00s。
+FMTDIR="$TMP/fmts"
+rm -rf "$FMTDIR"; mkdir -p "$FMTDIR"
+n=1
+for f in jpg png bmp webp tif tiff; do
+  "$FF" -f lavfi -i "color=red:s=640x480:d=1" -frames:v 1 -y "$FMTDIR/$n.$f" >/dev/null 2>&1
+  n=$((n+1))
+done
+fmt_out="$TMP/fmts.mp4"; rm -f "$fmt_out"
+"$EXE" --cli "$FMTDIR" 2 "$fmt_out" >/dev/null 2>&1
+fmt_res=$("$FF" -i "$fmt_out" 2>&1 | sed -n 's/.*, \([0-9]*x[0-9]*\).*/\1/p' | head -1)
+fmt_dur=$(duration "$fmt_out")
+if [ "$fmt_dur" = "3.00" ] && [ "$fmt_res" = "1920x1080" ]; then
+  echo "✓ 混合格式（jpg/png/bmp/webp/tif/tiff）：6 張都在，時長 ${fmt_dur}s"
+else
+  echo "✗ 混合格式：時長 ${fmt_dur}s（期望 3.00，短少代表有照片被丟格）、解析度 $fmt_res"; FAIL=1
+fi
+rm -rf "$FMTDIR" "$fmt_out"
+
 # 特殊字元路徑：資料夾與檔名含單引號、空格、中文（都是 Windows 合法檔名）。
 # concat 清單以單引號包住每個路徑，escape 沒處理好單引號會讓整條清單解析失敗、
 # 轉檔中止。這條路徑（concat_escape）先前無自動化覆蓋。

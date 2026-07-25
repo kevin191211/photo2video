@@ -5250,6 +5250,60 @@ fn run_conversion(
         }
     }
 
+    // concat demuxer 需要清單內所有照片是同一種「編碼」：不同解析度沒問題，但
+    // 不同「格式」（如 jpg 與 png 混放）會讓 demuxer 依第一張的編碼建立串流，
+    // 之後編碼不符的照片被靜默丟格，成品悄悄少掉照片。個別調色也會把部分照片
+    // 轉成暫存 PNG，與未調色的原始 jpg 混用同樣中招。偵測到混用時，把非 PNG 的
+    // 照片先轉成暫存 PNG（用中性調色＝僅縮放輸出 PNG），讓整份清單編碼一致。
+    // 全部同格式（最常見）則跳過、維持原本速度。
+    let codec_family = |p: &Path| -> u8 {
+        match p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("png") => 0,
+            Some("jpg") | Some("jpeg") => 1,
+            Some("bmp") => 2,
+            Some("webp") => 3,
+            Some("tif") | Some("tiff") => 4,
+            _ => 5,
+        }
+    };
+    let mixed_codecs = src_photos
+        .iter()
+        .map(|p| codec_family(p))
+        .collect::<HashSet<_>>()
+        .len()
+        > 1;
+    if mixed_codecs {
+        send(WorkerMsg::Status("統一照片格式…".into()));
+        // 只轉非 PNG 的（原檔或個別調色暫存圖已是 PNG 就不動）
+        let need_norm: Vec<usize> = (0..src_photos.len())
+            .filter(|&i| codec_family(&src_photos[i]) != 0)
+            .collect();
+        for i in need_norm {
+            if CONVERT_CANCEL.load(Ordering::Relaxed) {
+                for f in &adj_temp {
+                    let _ = std::fs::remove_file(f);
+                }
+                return Err("已取消".into());
+            }
+            let src = src_photos[i].clone();
+            let out = temp_path(&format!("norm_{i}.png"));
+            if let Err(e) = pre_adjust_photo(&src, &Adjustments::default(), res, &out) {
+                let _ = std::fs::remove_file(&out);
+                for f in &adj_temp {
+                    let _ = std::fs::remove_file(f);
+                }
+                return Err(e);
+            }
+            src_photos[i] = out.clone();
+            adj_temp.push(out);
+        }
+    }
+
     send(WorkerMsg::Status("建立照片清單…".into()));
 
     // AVI 容器在低幀率＋音訊下，muxer 會把最後一格多撐一兩個影格週期，使影片時長
