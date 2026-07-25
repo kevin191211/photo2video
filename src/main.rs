@@ -5527,7 +5527,15 @@ fn run_cli(args: &[String]) -> Result<(), String> {
     if photos.is_empty() {
         return Err(format!("資料夾內沒有圖片：{}", dir.display()));
     }
-    println!("共 {} 張照片，fps={fps}", photos.len());
+    // CLI 固定輸出 Full HD；先告知輸出規格（大照片會縮小、直向照片會左右
+    // 補黑邊），避免使用者轉完才發現尺寸不如預期
+    let out_res = Resolution { w: 1920, h: 1080 };
+    println!(
+        "共 {} 張照片，fps={fps}，輸出 {}x{}（Full HD）",
+        photos.len(),
+        out_res.w,
+        out_res.h
+    );
 
     // 副檔名比對不分大小寫：out.WEBM 也要選 VP9，否則會落到預設 mp4(H264)、
     // 被 ffmpeg 依 .WEBM 寫成 H264-in-WebM 這種不相容檔案
@@ -5588,7 +5596,7 @@ fn run_cli(args: &[String]) -> Result<(), String> {
         &photos,
         fps,
         format,
-        Resolution { w: 1920, h: 1080 },
+        out_res,
         &Adjustments::default(),
         &HashMap::new(),
         &no_subs,
