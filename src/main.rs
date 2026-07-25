@@ -1917,7 +1917,7 @@ impl App {
             .and_then(|p| p.file_stem())
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "output".into());
-        let Some(mut output) = rfd::FileDialog::new()
+        let Some(output) = rfd::FileDialog::new()
             .set_title("選擇影片儲存位置")
             .add_filter(format!("{} 影片", ext.to_uppercase()), &[ext])
             .set_file_name(format!("{stem}.{ext}"))
@@ -1926,28 +1926,8 @@ impl App {
             return;
         };
 
-        // 確保輸出副檔名與所選格式一致：對話框允許使用者改掉或拿掉副檔名，
-        // 但無副檔名時 ffmpeg 無法判斷容器會直接失敗，副檔名與格式不符則會
-        // 產生不相容檔案（如 VP9 塞進 mp4）。已正確則不動；是其他影片副檔名
-        // 就替換；無副檔名或非影片副檔名則附加，保留使用者輸入的檔名
-        let known = ["mp4", "mkv", "mov", "avi", "webm"];
-        match output
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-        {
-            Some(e) if e == ext => {}
-            Some(e) if known.contains(&e.as_str()) => {
-                output.set_extension(ext);
-            }
-            _ => {
-                let name = output
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                output.set_file_name(format!("{name}.{ext}"));
-            }
-        }
+        // 確保輸出副檔名與所選格式一致（GUI／CLI 共用邏輯，見 finalize_output_extension）
+        let output = finalize_output_extension(output, ext);
 
         let (tx, rx) = std::sync::mpsc::channel();
         self.rx = Some(rx);
@@ -5807,6 +5787,33 @@ fn run_conversion(
     Ok(())
 }
 
+/// 修正輸出檔副檔名，使其與所選格式（ext）一致。GUI 存檔對話框與命令列都
+/// 允許使用者改掉或拿掉副檔名，但無副檔名時 ffmpeg 無法判斷容器會直接失敗，
+/// 副檔名與格式不符則會產生不相容檔案（如 VP9 塞進 mp4）。規則：已正確（不分
+/// 大小寫）則不動；是其他已知影片副檔名就替換；無副檔名或非影片副檔名則附加，
+/// 保留使用者輸入的檔名。GUI／CLI 共用同一份邏輯，避免日後新增格式時兩處分歧。
+fn finalize_output_extension(mut output: PathBuf, ext: &str) -> PathBuf {
+    let known = ["mp4", "mkv", "mov", "avi", "webm"];
+    match output
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+    {
+        Some(e) if e == ext => {}
+        Some(e) if known.contains(&e.as_str()) => {
+            output.set_extension(ext);
+        }
+        _ => {
+            let name = output
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            output.set_file_name(format!("{name}.{ext}"));
+        }
+    }
+    output
+}
+
 /// 命令列模式：photo2video --cli <照片資料夾> <fps> <輸出檔>
 /// 輸出格式由輸出檔的副檔名決定（mp4/mkv/mov/avi/webm）
 fn run_cli(args: &[String]) -> Result<(), String> {
@@ -5820,7 +5827,7 @@ fn run_cli(args: &[String]) -> Result<(), String> {
     if !(1..=60).contains(&fps) {
         return Err("fps 必須介於 1 到 60".into());
     }
-    let mut output = PathBuf::from(&args[2]);
+    let output = PathBuf::from(&args[2]);
 
     // 先分辨「找不到資料夾」與「資料夾內沒有圖片」：collect_images_in_dir 對
     // 不存在或非資料夾的路徑會靜默回傳空，直接沿用會誤報成「沒有圖片」
@@ -5844,7 +5851,6 @@ fn run_cli(args: &[String]) -> Result<(), String> {
 
     // 副檔名比對不分大小寫：out.WEBM 也要選 VP9，否則會落到預設 mp4(H264)、
     // 被 ffmpeg 依 .WEBM 寫成 H264-in-WebM 這種不相容檔案
-    let known = ["mp4", "mkv", "mov", "avi", "webm"];
     let ext_lc = output
         .extension()
         .and_then(|e| e.to_str())
@@ -5856,22 +5862,8 @@ fn run_cli(args: &[String]) -> Result<(), String> {
         Some("webm") => OutputFormat::Webm,
         _ => OutputFormat::Mp4,
     };
-    // 確保輸出有正確副檔名：無副檔名時 ffmpeg 無法判斷容器會失敗；非影片副檔名
-    // 則補上，保留使用者輸入的檔名（與 GUI 存檔行為一致）
-    let ext = format.ext();
-    match ext_lc.as_deref() {
-        Some(e) if e == ext => {}
-        Some(e) if known.contains(&e) => {
-            output.set_extension(ext);
-        }
-        _ => {
-            let name = output
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            output.set_file_name(format!("{name}.{ext}"));
-        }
-    }
+    // 確保輸出有正確副檔名（GUI／CLI 共用邏輯，見 finalize_output_extension）
+    let output = finalize_output_extension(output, format.ext());
 
     // 只在整數百分比變動時印進度：ffmpeg 每個影格都回報，相鄰影格四捨五入
     // 後常是同一個百分比，不去重會刷出大量重複的「進度 50%」
@@ -6452,6 +6444,33 @@ mod tests {
         // 總長 ≤1 秒不淡出（淡出區間會超過影片）
         assert_eq!(audio_filter_string(100, true, 1.0), "volume=1.000");
         assert_eq!(audio_filter_string(100, true, 0.5), "volume=1.000");
+    }
+
+    #[test]
+    fn finalize_output_extension_all_branches() {
+        let fx = |p: &str, ext: &str| {
+            finalize_output_extension(PathBuf::from(p), ext)
+                .to_string_lossy()
+                .replace('\\', "/")
+        };
+        // 已正確：不動
+        assert_eq!(fx("a/b/out.mp4", "mp4"), "a/b/out.mp4");
+        // 大小寫不同但同格式：視為已正確、不動（保留使用者大寫副檔名）
+        assert_eq!(fx("out.MP4", "mp4"), "out.MP4");
+        assert_eq!(fx("out.WEBM", "webm"), "out.WEBM");
+        // 其他「已知影片副檔名」但格式不符：替換副檔名（GUI 下拉選 WebM、對話框
+        // 打成 .mp4 才會走到——CLI 因格式由副檔名反推，永遠走不到這條分支）
+        assert_eq!(fx("clip.mp4", "webm"), "clip.webm");
+        assert_eq!(fx("clip.MOV", "mp4"), "clip.mp4");
+        // 無副檔名：附加（不能丟給 ffmpeg 沒容器的檔名）
+        assert_eq!(fx("myvideo", "mp4"), "myvideo.mp4");
+        // 非影片副檔名：附加、保留原檔名（不替換，免得吃掉使用者檔名的一部分）
+        assert_eq!(fx("report.2024", "mp4"), "report.2024.mp4");
+        assert_eq!(fx("photo.txt", "mp4"), "photo.txt.mp4");
+        // 目錄含點、檔名無副檔名：只看檔名部分，副檔名正確附加在檔名後
+        assert_eq!(fx("a.b/out", "mkv"), "a.b/out.mkv");
+        // 多重點的檔名：只換最後一段副檔名（set_extension 語意），不影響前面的點
+        assert_eq!(fx("my.video.avi", "mp4"), "my.video.mp4");
     }
 
     #[test]
