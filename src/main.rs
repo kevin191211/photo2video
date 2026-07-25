@@ -6057,4 +6057,35 @@ mod tests {
         assert!(!out.contains("O'/''"), "跳脫順序反了，'\\'' 的反斜線被轉成斜線：{out}");
         assert!(out.contains("相片.jpg"), "非 ASCII 檔名應原樣保留：{out}");
     }
+
+    #[test]
+    fn filter_chain_curves_points_stay_x_sorted() {
+        // ffmpeg curves 濾鏡要求控制點 x 座標遞增，否則整條濾鏡會報錯、轉檔失敗。
+        // 陰影/白色/黑色的任意正負組合都不能違反此不變式。
+        let combos = [
+            (-100, 50, 50),
+            (100, -50, -50),
+            (-50, 0, 100),
+            (0, 100, 0),
+            (-100, 100, 100),
+            (50, -100, 0),
+        ];
+        for (blacks, shadows, whites) in combos {
+            let adj = Adjustments { blacks, shadows, whites, ..Default::default() };
+            let Some(f) = adj.filter_chain(1.0) else { continue };
+            let Some(i) = f.find("curves=all='") else { continue };
+            let rest = &f[i + "curves=all='".len()..];
+            let pts = &rest[..rest.find('\'').expect("curves 應以單引號收尾")];
+            let xs: Vec<f64> = pts
+                .split(' ')
+                .map(|p| p.split('/').next().unwrap().parse().unwrap())
+                .collect();
+            for w in xs.windows(2) {
+                assert!(
+                    w[0] <= w[1],
+                    "curves 控制點 x 未遞增：{pts}（blacks={blacks} shadows={shadows} whites={whites}）"
+                );
+            }
+        }
+    }
 }
