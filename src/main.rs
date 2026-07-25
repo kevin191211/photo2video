@@ -668,6 +668,16 @@ fn restart_app() {
     std::process::exit(0);
 }
 
+/// Windows 字型資料夾。用 %WINDIR% 而非硬編碼 C:\Windows：Windows 裝在
+/// 非 C: 磁碟時（多系統、企業自訂）硬編碼會找不到字型，導致 UI 中文變
+/// 豆腐、字幕功能整個無法使用。WINDIR 未設時才退回 C:\Windows
+fn windows_fonts_dir() -> PathBuf {
+    std::env::var_os("WINDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+        .join("Fonts")
+}
+
 /// 掃描 Windows 字型資料夾中常見且支援中文的字型
 fn detect_fonts() -> Vec<(String, PathBuf)> {
     let candidates: [(&str, &str); 12] = [
@@ -684,7 +694,7 @@ fn detect_fonts() -> Vec<(String, PathBuf)> {
         ("Consolas", "consola.ttf"),
         ("Segoe UI", "segoeui.ttf"),
     ];
-    let fonts_dir = Path::new(r"C:\Windows\Fonts");
+    let fonts_dir = windows_fonts_dir();
     candidates
         .iter()
         .filter_map(|(name, file)| {
@@ -4566,15 +4576,11 @@ fn flush_part(buf: &str, is_num: bool) -> NatPart {
 /// 讀取系統中文字型檔（約 20MB+）；在 main 一開始的背景執行緒呼叫，
 /// 與視窗建立同時進行，啟動時不用再等這段磁碟讀取
 fn load_cjk_font_bytes() -> Option<Vec<u8>> {
-    let candidates = [
-        r"C:\Windows\Fonts\msjh.ttc",    // 微軟正黑體
-        r"C:\Windows\Fonts\msjhbd.ttc",  // 微軟正黑體（粗體）
-        r"C:\Windows\Fonts\mingliu.ttc", // 細明體
-        r"C:\Windows\Fonts\msyh.ttc",    // 微軟雅黑（備援）
-    ];
-    candidates
+    // 檔名相對 %WINDIR%\Fonts（見 windows_fonts_dir），不硬編碼 C: 磁碟
+    let dir = windows_fonts_dir();
+    ["msjh.ttc", "msjhbd.ttc", "mingliu.ttc", "msyh.ttc"]
         .iter()
-        .find_map(|path| std::fs::read(path).ok())
+        .find_map(|file| std::fs::read(dir.join(file)).ok())
 }
 
 fn setup_chinese_fonts(ctx: &egui::Context, bytes: Option<Vec<u8>>) {
