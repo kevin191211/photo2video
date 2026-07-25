@@ -1848,16 +1848,10 @@ impl App {
             .sub_entries
             .into_iter()
             .filter_map(|mut e| {
-                if orig_n == 0 {
-                    return None;
-                }
-                let start = e.start.clamp(1, orig_n);
-                let end = e.end.clamp(start, orig_n);
-                e.start = kept_before[start - 1] + 1;
-                e.end = kept_before[end];
-                if e.end < e.start {
-                    return None; // 整段綁定的照片都遺失了
-                }
+                // 整段綁定的照片都遺失就丟棄；否則平移到過濾後的新編號
+                let (ns, ne) = remap_entry_after_filter(e.start, e.end, orig_n, &kept_before)?;
+                e.start = ns;
+                e.end = ne;
                 e.x = e.x.clamp(0.0, 1.0);
                 e.y = e.y.clamp(0.0, 1.0);
                 e.size = e.size.clamp(8, 300);
@@ -5269,6 +5263,27 @@ fn clamp_subtitle_range(start: usize, end: usize, total: usize) -> Option<(usize
     (s < end).then_some((s, end - 1))
 }
 
+/// 開啟專案時部分照片遺失/被濾除，把一段文字的 1-based 起訖照片編號依「保留
+/// 前綴和」kept_before 重映到過濾後的新編號。kept_before[i] = 原始前 i 張中被
+/// 保留的張數（長度為 orig_n+1）。新起點取「原始起點起、第一張仍存在照片」，
+/// 新終點取「原始終點止、最後一張仍存在照片」；整段綁定的照片都不在了（區間
+/// 內沒有任何保留照片）就回 None。此邏輯須與逐張 remove_photo 的平移結果一致。
+fn remap_entry_after_filter(
+    start: usize,
+    end: usize,
+    orig_n: usize,
+    kept_before: &[usize],
+) -> Option<(usize, usize)> {
+    if orig_n == 0 {
+        return None;
+    }
+    let start = start.clamp(1, orig_n);
+    let end = end.clamp(start, orig_n);
+    let ns = kept_before[start - 1] + 1;
+    let ne = kept_before[end];
+    (ne >= ns).then_some((ns, ne))
+}
+
 /// 若以照片時長比例當緩衝，fps 低時字幕會提早出現/消失（每張 1 秒會早 0.25 秒）。
 /// 相鄰照片區間的字幕區間恰好接續（前段結尾＝後段開頭），不重疊也不留空。
 fn subtitle_enable_window(s: usize, e: usize, eff_dur: f64, out_fps: u32) -> (f64, f64) {
@@ -6605,6 +6620,49 @@ mod tests {
                 assert!(s <= e && e < total, "夾後越界：({start},{end},{total})→({s},{e})");
             }
         }
+    }
+
+    // 由「哪幾張保留」建 kept_before 前綴和（長度 orig_n+1），供下面的測試用。
+    fn kept_before_of(exists: &[bool]) -> Vec<usize> {
+        let mut kb = vec![0usize; exists.len() + 1];
+        for (i, &e) in exists.iter().enumerate() {
+            kb[i + 1] = kb[i] + usize::from(e);
+        }
+        kb
+    }
+
+    #[test]
+    fn remap_entry_after_filter_matches_removals() {
+        // 原始 4 張 [A,B,C,D]，中間的 B 遺失 → 保留 [A,C,D]（新編號 1,2,3）
+        let kb = kept_before_of(&[true, false, true, true]);
+        // 整段 1~4（A-D）→ 去掉中間 B → 1~3（A,C,D）
+        assert_eq!(remap_entry_after_filter(1, 4, 4, &kb), Some((1, 3)));
+        // 只綁 B（遺失那張）→ None
+        assert_eq!(remap_entry_after_filter(2, 2, 4, &kb), None);
+        // 綁 B~C（起點遺失、終點保留）→ 收斂到 C（新編號 2）
+        assert_eq!(remap_entry_after_filter(2, 3, 4, &kb), Some((2, 2)));
+        // 綁 A~B（起點保留、終點遺失）→ 收斂到 A（新編號 1）
+        assert_eq!(remap_entry_after_filter(1, 2, 4, &kb), Some((1, 1)));
+        // 綁 C~D（都保留）→ 新編號 2~3
+        assert_eq!(remap_entry_after_filter(3, 4, 4, &kb), Some((2, 3)));
+
+        // 全部保留：等同不變（僅 1-based 不動）
+        let all = kept_before_of(&[true, true, true]);
+        assert_eq!(remap_entry_after_filter(1, 3, 3, &all), Some((1, 3)));
+        assert_eq!(remap_entry_after_filter(2, 2, 3, &all), Some((2, 2)));
+
+        // 連續多張遺失：[A,_,_,D]，綁中間 2~3（全遺失）→ None；綁 1~4 → A,D=1~2
+        let gap = kept_before_of(&[true, false, false, true]);
+        assert_eq!(remap_entry_after_filter(2, 3, 4, &gap), None);
+        assert_eq!(remap_entry_after_filter(1, 4, 4, &gap), Some((1, 2)));
+
+        // orig_n=0（空專案）：一律 None，不 panic
+        assert_eq!(remap_entry_after_filter(1, 1, 0, &[0]), None);
+
+        // 編號超界（手改專案檔）先夾再映，不越界存取 kept_before
+        let two = kept_before_of(&[true, true]);
+        assert_eq!(remap_entry_after_filter(1, 100, 2, &two), Some((1, 2)));
+        assert_eq!(remap_entry_after_filter(100, 100, 2, &two), Some((2, 2)));
     }
 
     #[test]
