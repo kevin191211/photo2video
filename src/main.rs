@@ -711,7 +711,15 @@ fn fmt_video_len(secs: f64) -> String {
     // 59.96 秒會走到下面以「{:.1}」顯示成「60.0 秒」，而 60.0 秒顯示
     // 「1 分」，邊界不連續
     let total = secs.round() as u64;
-    if total >= 60 {
+    if total >= 3600 {
+        // 超過一小時（數千張照片的幻燈片）用「H 時 M 分」，比「83 分」直覺
+        let (h, m) = (total / 3600, (total % 3600) / 60);
+        if m == 0 {
+            format!("{h} 時")
+        } else {
+            format!("{h} 時 {m} 分")
+        }
+    } else if total >= 60 {
         let (m, s) = (total / 60, total % 60);
         if s == 0 {
             format!("{m} 分")
