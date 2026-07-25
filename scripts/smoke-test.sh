@@ -151,6 +151,23 @@ else
 fi
 rm -rf "$ZERODIR" "$zero_out"
 
+# 只收頂層、不遞迴子資料夾：使用者選資料夾時只取該層照片（子資料夾可能是
+# 縮圖/備份等不想收的內容）。頂層 2 張＋子資料夾 3 張，只應收頂層 2 張。
+SUBDIR="$TMP/toplevel"
+rm -rf "$SUBDIR"; mkdir -p "$SUBDIR/子相簿"
+"$FF" -f lavfi -i color=red:s=640x480:d=1  -frames:v 1 -y "$SUBDIR/a.png" >/dev/null 2>&1
+"$FF" -f lavfi -i color=blue:s=640x480:d=1 -frames:v 1 -y "$SUBDIR/b.png" >/dev/null 2>&1
+for i in 1 2 3; do "$FF" -f lavfi -i color=green:s=640x480:d=1 -frames:v 1 -y "$SUBDIR/子相簿/$i.png" >/dev/null 2>&1; done
+sub_out="$TMP/toplevel.mp4"; rm -f "$sub_out"
+"$EXE" --cli "$SUBDIR" 2 "$sub_out" >/dev/null 2>&1
+sub_dur=$(duration "$sub_out")
+if [ "$sub_dur" = "1.00" ]; then
+  echo "✓ 只收頂層：忽略子資料夾，只轉頂層 2 張（時長 ${sub_dur}s）"
+else
+  echo "✗ 只收頂層：時長 ${sub_dur}s（期望 1.00＝2 張；若為 2.50 代表誤把子資料夾一起收了）"; FAIL=1
+fi
+rm -rf "$SUBDIR" "$sub_out"
+
 # 混合格式：一個資料夾內同時有 jpg/png/bmp/webp/tif（手機照片＋截圖＋下載圖
 # 很常見）。concat demuxer 要求編碼一致，程式須先把非 PNG 的照片正規化，否則
 # 會靜默丟格（成品少照片）甚至整個失敗。以 6 種格式各一張、fps=2 驗證時長 3.00s。
