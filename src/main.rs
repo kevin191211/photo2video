@@ -4741,6 +4741,21 @@ fn concat_escape(p: &Path) -> String {
     abs.to_string_lossy().replace('\\', "/").replace('\'', r"'\''")
 }
 
+/// 組出 concat demuxer 的清單內容：每張照片一行 `file` 加一行 `duration`，最後
+/// 再把最後一張列一次（不帶 duration）。這個「最後一張重複」是 concat demuxer
+/// 的必要慣例——demuxer 只在「下一個 file 出現」時才讓前一段 duration 生效，
+/// 少了這一行，最後一張的 duration 會被忽略、末張幾乎一閃而過。空清單回空字串。
+fn build_concat_list(photos: &[PathBuf], duration: f64) -> String {
+    let mut list = String::new();
+    for p in photos {
+        list.push_str(&format!("file '{}'\nduration {duration}\n", concat_escape(p)));
+    }
+    if let Some(last) = photos.last() {
+        list.push_str(&format!("file '{}'\n", concat_escape(last)));
+    }
+    list
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum H264Encoder {
     Nvenc,
@@ -5473,14 +5488,7 @@ fn run_conversion(
     let total_secs = photos.len() as f64 * eff_dur;
 
     // 用 concat demuxer 列出每張照片與顯示時間（個別調色的照片指向暫存圖）
-    let mut list = String::new();
-    for p in &src_photos {
-        list.push_str(&format!("file '{}'\nduration {duration}\n", concat_escape(p)));
-    }
-    // concat demuxer 的慣例：最後一張要再列一次，最後一段 duration 才會生效
-    if let Some(last) = src_photos.last() {
-        list.push_str(&format!("file '{}'\n", concat_escape(last)));
-    }
+    let list = build_concat_list(&src_photos, duration);
 
     let list_path = temp_path("list.txt");
     if let Err(e) = std::fs::write(&list_path, &list) {
@@ -6200,6 +6208,37 @@ mod tests {
         // 若順序反了（先跳脫單引號再轉斜線），會變成 O'/''Brien
         assert!(!out.contains("O'/''"), "跳脫順序反了，'\\'' 的反斜線被轉成斜線：{out}");
         assert!(out.contains("相片.jpg"), "非 ASCII 檔名應原樣保留：{out}");
+    }
+
+    #[test]
+    fn build_concat_list_repeats_last_and_escapes() {
+        // 空清單：不產生任何內容（也不該有落單的 last 行）
+        assert_eq!(build_concat_list(&[], 0.5), "");
+
+        // 單張：仍要重複列一次（末張 duration 才生效），故出現兩行 file
+        let one = build_concat_list(&[PathBuf::from("/a/p.jpg")], 0.5);
+        assert_eq!(one.matches("file '").count(), 2, "單張應列兩次：{one}");
+        assert_eq!(one.matches("duration ").count(), 1, "單張只該有一行 duration：{one}");
+
+        // 三張：3 行 duration、4 行 file（末張重複），且最後一行不帶 duration
+        let three = build_concat_list(
+            &[PathBuf::from("/a/1.jpg"), PathBuf::from("/a/2.jpg"), PathBuf::from("/a/3.jpg")],
+            0.25,
+        );
+        assert_eq!(three.matches("duration ").count(), 3, "應有 3 行 duration：{three}");
+        assert_eq!(three.matches("file '").count(), 4, "末張重複＝4 行 file：{three}");
+        // 收尾必須是「重複的末張」的 file 行（concat_escape 會絕對化路徑、帶上磁碟
+        // 機代號，故只驗結尾檔名與是否為 file 行，不綁死完整路徑）：末行是 file 行
+        // （以 ' 收尾）而非 duration 行，否則 demuxer 又會吃掉末段時長、末張一閃而過
+        let last_line = three.trim_end().lines().last().unwrap_or("");
+        assert!(
+            last_line.starts_with("file '") && last_line.ends_with("3.jpg'"),
+            "結尾應為重複末張的 file 行：{last_line}"
+        );
+
+        // 逐張都套 concat_escape：含單引號的路徑要被跳脫成 '\''
+        let esc = build_concat_list(&[PathBuf::from("/a/O'Brien.jpg")], 1.0);
+        assert!(esc.contains(r"O'\''Brien.jpg"), "清單未對路徑套跳脫：{esc}");
     }
 
     #[test]
