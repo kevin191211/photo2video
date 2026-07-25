@@ -5886,18 +5886,16 @@ fn run_cli(args: &[String]) -> Result<(), String> {
     );
 
     // 副檔名比對不分大小寫：out.WEBM 也要選 VP9，否則會落到預設 mp4(H264)、
-    // 被 ffmpeg 依 .WEBM 寫成 H264-in-WebM 這種不相容檔案
-    let ext_lc = output
+    // 被 ffmpeg 依 .WEBM 寫成 H264-in-WebM 這種不相容檔案。副檔名→格式的對應
+    // 沿用 OutputFormat::from_ext（與 .p2v 開檔同一份、已有往返測試守護），
+    // 不再另寫一份 match：日後新增輸出格式只要改 OutputFormat，CLI 自動跟上。
+    // 無副檔名或不認得的副檔名一律回退 MP4（H.264）
+    let format = output
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase());
-    let format = match ext_lc.as_deref() {
-        Some("mkv") => OutputFormat::Mkv,
-        Some("mov") => OutputFormat::Mov,
-        Some("avi") => OutputFormat::Avi,
-        Some("webm") => OutputFormat::Webm,
-        _ => OutputFormat::Mp4,
-    };
+        .map(|e| e.to_ascii_lowercase())
+        .and_then(|e| OutputFormat::from_ext(&e))
+        .unwrap_or(OutputFormat::Mp4);
     // 確保輸出有正確副檔名（GUI／CLI 共用邏輯，見 finalize_output_extension）
     let output = finalize_output_extension(output, format.ext());
 
