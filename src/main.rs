@@ -5249,6 +5249,16 @@ struct SubtitleJob {
     entries: Vec<TextJob>,
 }
 
+/// 主視訊濾鏡的基底：先縮放到目標解析度內、套用調色（adjust 已含結尾逗號或
+/// 為空）、最後補黑邊。關鍵是「調色在補邊之前」——黑邊是補邊後才加的純黑，
+/// 不受亮度/曝光等調色影響，否則直向照片的左右黑邊會被一起調亮成灰。
+fn base_scale_pad_vf(w: u32, h: u32, adjust: &str) -> String {
+    format!(
+        "scale={w}:{h}:force_original_aspect_ratio=decrease,{adjust}\
+         pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black"
+    )
+}
+
 /// 字幕（照片區間 s..=e，0-based）的顯示時間區間（秒，enable='between(t,a,b)'）。
 /// 以半個輸出影格為緩衝，準確涵蓋第 s~e 張照片的所有格——動態模式輸出 30fps，
 /// 若以照片時長比例當緩衝，fps 低時字幕會提早出現/消失（每張 1 秒會早 0.25 秒）。
@@ -5512,10 +5522,7 @@ fn run_conversion(
             .map(|c| format!("{c},"))
             .unwrap_or_default()
     };
-    let mut vf = format!(
-        "scale={w}:{h}:force_original_aspect_ratio=decrease,{adjust_mid}\
-         pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black"
-    );
+    let mut vf = base_scale_pad_vf(w, h, &adjust_mid);
 
     // 動態縮放（Ken Burns）：每張照片產生 kb_frames 格緩慢推近/拉遠（奇偶張交替）；
     // 沒有 Ken Burns 但有轉場時，用 fps 濾鏡升頻，讓淡入淡出有足夠格數呈現
@@ -6450,5 +6457,21 @@ mod tests {
         // 涵蓋整段（第 0~e 張）：結尾 = (e+1)*d - buf
         let (_, full_end) = subtitle_enable_window(0, 4, d, fps);
         assert!((full_end - (5.0 * d - buf)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn base_scale_pad_vf_applies_adjust_before_pad() {
+        // 無調色：scale 後直接 pad
+        let plain = base_scale_pad_vf(1920, 1080, "");
+        assert!(plain.starts_with("scale=1920:1080:force_original_aspect_ratio=decrease,"));
+        assert!(plain.contains("pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black"));
+
+        // 有調色：調色濾鏡必須在 pad 之前——否則補出的黑邊會被調亮成灰。
+        let adj = base_scale_pad_vf(1920, 1080, "eq=brightness=0.2000,");
+        let eq_at = adj.find("eq=brightness").expect("應含調色");
+        let pad_at = adj.find("pad=").expect("應含補邊");
+        assert!(eq_at < pad_at, "調色須在補邊之前（否則黑邊被調亮）：{adj}");
+        // 補邊色恆為純黑
+        assert!(adj.contains("color=black"));
     }
 }
