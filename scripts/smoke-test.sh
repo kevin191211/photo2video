@@ -98,6 +98,48 @@ else
 fi
 rm -rf "$MIX" "$mix_out"
 
+# EXIF 方向：手機直拍照片常以「未旋轉像素＋方向標記」儲存，轉檔必須依 EXIF
+# 自動轉正（與縮圖、預覽、原始像素解析度的判斷一致），否則直拍照片會躺著輸出。
+# 需 python3 + Pillow 產生帶 EXIF orientation 的測試圖；沒有就略過這個案例。
+if python -c "import PIL" >/dev/null 2>&1; then
+  EXIFDIR="$TMP/exif"; rm -rf "$EXIFDIR"; mkdir -p "$EXIFDIR"
+  python - "$EXIFDIR" <<'PY'
+from PIL import Image
+import sys
+d = sys.argv[1]
+# 800x200 明顯橫向、亮灰（好與黑邊區分）；orientation=6 表示顯示時要轉成 200x800 直向
+img = Image.new("RGB", (800, 200), (200, 200, 200))
+ex = img.getexif(); ex[0x0112] = 6
+img.save(f"{d}/wide.jpg", exif=ex, quality=95)
+PY
+  exif_out="$TMP/exif.mp4"; rm -f "$exif_out"
+  "$EXE" --cli "$EXIFDIR" 2 "$exif_out" >/dev/null 2>&1
+  exif_frame="$TMP/exif_frame.png"; rm -f "$exif_frame"
+  "$FF" -i "$exif_out" -frames:v 1 -y "$exif_frame" >/dev/null 2>&1
+  # 量出畫面中非黑內容的邊界框：已轉正→直向（高>寬），沒轉正→橫向（寬>高）
+  verdict=$(python - "$exif_frame" <<'PY'
+from PIL import Image
+import sys
+im = Image.open(sys.argv[1]).convert("RGB"); W, H = im.size; px = im.load()
+xs = []; ys = []
+for y in range(0, H, 4):
+    for x in range(0, W, 4):
+        r, g, b = px[x, y]
+        if r + g + b > 150:
+            xs.append(x); ys.append(y)
+print("portrait" if xs and (max(ys) - min(ys)) > (max(xs) - min(xs)) else "landscape")
+PY
+)
+  if [ "$verdict" = portrait ]; then
+    echo "✓ EXIF 方向：orientation=6 直拍照片自動轉正為直向輸出"
+  else
+    echo "✗ EXIF 方向：未依 EXIF 轉正（輸出為 $verdict），直拍照片會躺著"; FAIL=1
+  fi
+  rm -rf "$EXIFDIR" "$exif_out" "$exif_frame"
+else
+  echo "↷ 略過 EXIF 方向測試（環境未安裝 python3 + Pillow）"
+fi
+
 # 錯誤路徑：確認各種不合法輸入都被明確拒絕（非 0 退出碼＋易懂訊息）
 mkdir -p "$TMP/empty"
 error_case "空資料夾"   "沒有圖片"        "$TMP/empty" 2 "$TMP/x.mp4"
