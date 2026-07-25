@@ -47,6 +47,18 @@ case_run() {
   rm -f "$out"
 }
 
+# 錯誤案例：以指定引數執行，期望非 0 退出碼且錯誤訊息含某片段。
+# 用法：error_case "標題" "訊息片段" <cli 引數…>
+error_case() {
+  local label="$1" want="$2"; shift 2
+  local out; out=$("$EXE" --cli "$@" 2>&1); local code=$?
+  if [ "$code" != 0 ] && printf '%s' "$out" | grep -q "$want"; then
+    echo "✓ $label：正確拒絕（含「$want」）"
+  else
+    echo "✗ $label：退出碼 $code、輸出「$out」（期望非 0 且含「$want」）"; FAIL=1
+  fi
+}
+
 # 各容器格式，N 張、fps → 時長 = N/fps
 case_run "MP4 (H.264) fps=2" mp4  2 "$(awk "BEGIN{printf \"%.2f\", $N/2}")"
 case_run "MKV (H.264) fps=2" mkv  2 "$(awk "BEGIN{printf \"%.2f\", $N/2}")"
@@ -66,6 +78,14 @@ else
   echo "✗ 無副檔名輸出：預期補成 .mp4，未產出"; FAIL=1
 fi
 rm -f "$ext_out" "$ext_out.mp4"
+
+# 錯誤路徑：確認各種不合法輸入都被明確拒絕（非 0 退出碼＋易懂訊息）
+mkdir -p "$TMP/empty"
+error_case "空資料夾"   "沒有圖片"        "$TMP/empty" 2 "$TMP/x.mp4"
+error_case "資料夾不存在" "找不到資料夾"    "$TMP/nope_xyz" 2 "$TMP/x.mp4"
+error_case "fps=0"      "介於 1 到 60"    "$IMAGES" 0 "$TMP/x.mp4"
+error_case "fps 非數字"  "必須是正整數"    "$IMAGES" abc "$TMP/x.mp4"
+rmdir "$TMP/empty" 2>/dev/null; rm -f "$TMP/x.mp4"
 
 rmdir "$TMP" 2>/dev/null
 if [ "$FAIL" = 0 ]; then echo "全部通過。"; else echo "有案例失敗。"; exit 1; fi
