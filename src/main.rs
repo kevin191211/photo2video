@@ -3833,6 +3833,12 @@ impl App {
                     {
                         check_now = true;
                     }
+                    ui.add_space(8.0);
+                    // 專案首頁：使用者可從這裡看說明、回報問題、查更新紀錄
+                    ui.hyperlink_to(
+                        egui::RichText::new("🔗 專案首頁 / 回報問題").size(12.0),
+                        format!("https://github.com/{GITHUB_REPO}"),
+                    );
                     ui.add_space(4.0);
                 });
             });
