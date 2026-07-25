@@ -6281,4 +6281,24 @@ mod tests {
         back.ken_burns = !back.ken_burns;
         assert_ne!(serde_json::to_string(&back).unwrap(), json1, "欄位改動未反映在序列化");
     }
+
+    #[test]
+    fn format_and_transition_id_roundtrip() {
+        // .p2v 以字串記錄輸出格式與轉場，開檔用 from_ext/from_id 找回。
+        // 對不上就會靜默把使用者選的格式/轉場重置成預設，故逐一驗證往返一致。
+        for f in OutputFormat::ALL {
+            assert!(
+                OutputFormat::from_ext(f.ext()) == Some(f),
+                "輸出格式 {} 存讀往返失敗",
+                f.ext()
+            );
+        }
+        for t in Transition::ALL {
+            assert!(
+                Transition::from_id(t.id()) == Some(t),
+                "轉場 {} 存讀往返失敗",
+                t.id()
+            );
+        }
+    }
 }
