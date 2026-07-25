@@ -6238,4 +6238,47 @@ mod tests {
             assert!(cw >= 2 && ch >= 2);
         }
     }
+
+    #[test]
+    fn project_file_json_roundtrip_is_lossless_and_stable() {
+        // .p2v 存讀是核心功能，且 has_unsaved_changes 靠「序列化穩定＋能反映
+        // 任何變更」偵測未儲存變更。用涵蓋各欄位型別的非預設值驗證。
+        let pf = ProjectFile {
+            app_version: "9.9.9".into(),
+            photos: vec![PathBuf::from(r"C:\相簿\1.jpg"), PathBuf::from(r"C:\相簿\2.png")],
+            fps: 7,
+            format: "webm".into(),
+            resolution: (0, 0), // 原始像素
+            adj: Adjustments { contrast: 30, temp: -20, clarity: 50, ..Default::default() },
+            adj_overrides: vec![(
+                PathBuf::from(r"C:\相簿\2.png"),
+                Adjustments { exposure: 10, ..Default::default() },
+            )],
+            sub_entries: vec![SubtitleEntry {
+                start: 2,
+                end: 5,
+                text: "測試\n第二行".into(),
+                x: 0.3,
+                y: 0.7,
+                size: 48,
+                rot: 15.0,
+            }],
+            sub_font: "微軟正黑體".into(),
+            sub_outline_w: 3,
+            sub_boxed: true,
+            transition: "fade_black".into(),
+            ken_burns: true,
+            music_path: Some(PathBuf::from(r"C:\music\bg.mp3")),
+            music_volume: 150,
+            music_fade: false,
+            ..ProjectFile::default()
+        };
+        let json1 = serde_json::to_string(&pf).unwrap();
+        // 存→讀→存 完全一致：沒有欄位在往返中遺失，且序列化穩定（無 HashMap 亂序）
+        let mut back: ProjectFile = serde_json::from_str(&json1).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json1, ".p2v 往返有欄位遺失或序列化不穩定");
+        // 任一欄位改動都要反映在序列化，否則 has_unsaved_changes 會漏判未儲存變更
+        back.ken_burns = !back.ken_burns;
+        assert_ne!(serde_json::to_string(&back).unwrap(), json1, "欄位改動未反映在序列化");
+    }
 }
