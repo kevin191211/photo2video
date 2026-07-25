@@ -5195,6 +5195,9 @@ fn run_conversion(
             let eff = adj_overrides.get(&photos[i]).copied().unwrap_or(*adj);
             let out = temp_path(&format!("adj_{i}.png"));
             if let Err(e) = pre_adjust_photo(&photos[i], &eff, res, &out) {
+                // 失敗這張的暫存圖尚未進 adj_temp，得單獨清掉——ffmpeg 失敗
+                // 常已寫出半成品 PNG，不清會殘留到關程式時才由暫存清理處理
+                let _ = std::fs::remove_file(&out);
                 for f in &adj_temp {
                     let _ = std::fs::remove_file(f);
                 }
