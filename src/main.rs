@@ -1009,6 +1009,12 @@ struct App {
     project_saved_at: Option<Instant>,
     /// 目前已套用的視窗標題（避免每幀重送 ViewportCommand）
     applied_title: String,
+    /// 最近一次「乾淨狀態」（存檔／開檔後）的專案內容序列化快照；
+    /// 與目前內容比對即知有無未儲存變更（見 has_unsaved_changes）。
+    /// None＝尚未存過的新專案（有照片就算有未儲存變更）
+    saved_snapshot: Option<String>,
+    /// 使用者已在關閉確認中選擇「直接關閉」，放行後續關閉（避免困住使用者）
+    allow_close: bool,
 }
 
 impl App {
@@ -1097,6 +1103,8 @@ impl App {
             current_project: None,
             project_saved_at: None,
             applied_title: String::new(),
+            saved_snapshot: None,
+            allow_close: false,
         };
         // 啟動時在背景檢查是否有新版本（失敗不影響使用）
         app.spawn_update_check(&cc.egui_ctx);
@@ -1613,6 +1621,24 @@ impl App {
         }
     }
 
+    /// 記下目前內容為「已儲存的乾淨狀態」（存檔／開檔成功後呼叫）
+    fn mark_project_clean(&mut self) {
+        self.saved_snapshot = serde_json::to_string(&self.project_data()).ok();
+    }
+
+    /// 是否有尚未儲存的變更（關閉前確認用）。沒有照片就沒有可失去的內容；
+    /// 否則把目前內容序列化與「乾淨狀態」快照比對，任何設定改動都算變更。
+    /// 尚未存過的新專案（快照為 None）只要有照片就算有變更
+    fn has_unsaved_changes(&self) -> bool {
+        if self.photos.is_empty() {
+            return false;
+        }
+        match (&self.saved_snapshot, serde_json::to_string(&self.project_data()).ok()) {
+            (Some(saved), Some(now)) => *saved != now,
+            _ => true,
+        }
+    }
+
     fn save_project_dialog(&mut self) {
         // 預帶目前專案的檔名，另存時不用重打
         let default_name = self
@@ -1667,6 +1693,7 @@ impl App {
                 self.remember_recent_project(path);
                 self.current_project = Some(path.to_path_buf());
                 self.project_saved_at = Some(Instant::now());
+                self.mark_project_clean(); // 存檔成功＝目前內容即乾淨狀態
             }
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp); // 失敗時不留臨時檔
@@ -1706,6 +1733,8 @@ impl App {
         self.resolution = Resolution { w: 1920, h: 1080 };
         // 新專案不再屬於任何 .p2v：避免 Ctrl+S 把空白狀態覆寫進舊專案檔
         self.current_project = None;
+        // 空白新專案＝乾淨狀態（快照設 None，加照片後才算有未儲存變更）
+        self.saved_snapshot = None;
     }
 
     /// 記到最近專案清單最前面（去重、最多保留 8 筆）並寫入設定檔
@@ -1881,6 +1910,8 @@ impl App {
                 .set_description(lines.join("\n"))
                 .show();
         }
+        // 剛開好的專案內容即乾淨狀態（遺失檔已移除也算，之後有動才算未儲存變更）
+        self.mark_project_clean();
     }
 
     fn start_convert(&mut self, ctx: &egui::Context) {
@@ -3997,6 +4028,31 @@ fn clean_stale_temp_files() {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 關閉視窗前，若有尚未儲存的專案變更就攔下確認，避免辛苦設定的照片、
+        // 調色、文字、音樂一按 X 就無聲無息全丟。轉檔進行中不攔（讓使用者能中止
+        // 離開）。allow_close 一旦設起就永遠放行，確保絕不會困住使用者
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.allow_close
+            && !self.is_working()
+            && self.has_unsaved_changes()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            let close_anyway = rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Warning)
+                .set_title("尚未儲存")
+                .set_description(
+                    "有尚未儲存的專案變更（照片、調色、文字、音樂等）。\n\
+                     確定要不儲存直接關閉嗎？\n\n\
+                     （按「否」回去，可用 Ctrl+S 或工具列「💾 儲存專案」保存）",
+                )
+                .set_buttons(rfd::MessageButtons::YesNo)
+                .show();
+            if close_anyway == rfd::MessageDialogResult::Yes {
+                self.allow_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+
         // 視窗標題顯示目前專案名稱（看得出正在編輯哪個 .p2v）；
         // 只在變動時送指令，不每幀重送
         let desired_title = match &self.current_project {
