@@ -5985,4 +5985,30 @@ mod tests {
             "0xFF0000@0.502"
         );
     }
+
+    #[test]
+    fn drawtext_filter_format_and_scaling() {
+        let font = Path::new("F.ttf");
+        let cap = Path::new("C.txt");
+        let style = SubtitleStyle::default(); // 白字、外框 2、黑框、無底框
+        let s = drawtext_filter(font, cap, &style, 60.0, 1.0, 0.5, 0.85, Some((0.0, 1.5)));
+        // expansion=none 是關鍵：使用者打「50% off」「{重點}」才不會被當變數而掉字/失敗
+        assert!(s.starts_with("drawtext=expansion=none:"), "缺 expansion=none：{s}");
+        assert!(s.contains("fontfile='F.ttf'") && s.contains("textfile='C.txt'"));
+        assert!(s.contains("fontsize=60"));
+        assert!(s.contains("fontcolor=0xFFFFFF@1.000"));
+        assert!(s.contains("borderw=2:bordercolor=0x000000@1.000"));
+        assert!(s.contains("enable='between(t,0.000,1.500)'"));
+        assert!(!s.contains("box=1"), "預設無底框不該有 box=1");
+
+        // 外框粗細隨解析度縮放（outline_scale=0.5 → borderw=1），且至少 1px
+        let s720 = drawtext_filter(font, cap, &style, 40.0, 0.5, 0.5, 0.85, None);
+        assert!(s720.contains("borderw=1:"), "外框未隨解析度縮放：{s720}");
+        assert!(!s720.contains("enable="), "未指定顯示區間不該有 enable");
+
+        // 底框樣式：box=1＋半透明黑底＋內距
+        let boxed = SubtitleStyle { boxed: true, ..SubtitleStyle::default() };
+        let sb = drawtext_filter(font, cap, &boxed, 60.0, 1.0, 0.5, 0.85, None);
+        assert!(sb.contains(":box=1:boxcolor=black@0.4:boxborderw="), "底框參數缺失：{sb}");
+    }
 }
