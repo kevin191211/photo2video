@@ -119,6 +119,24 @@ else
 fi
 rm -rf "$MIX" "$mix_out"
 
+# 0 位元組空檔：下載中斷、雲端同步佔位、存檔失敗常留下 0 位元組的圖片檔。
+# 混進 concat 清單時 demuxer 讀到它就會中止、把其後所有照片一起靜默丟掉，
+# 成品少照片卻回報成功。程式須在收集照片時就排除空檔。
+ZERODIR="$TMP/zero"
+rm -rf "$ZERODIR"; mkdir -p "$ZERODIR"
+"$FF" -f lavfi -i color=red:s=640x480:d=1  -frames:v 1 -y "$ZERODIR/1.png" >/dev/null 2>&1
+: > "$ZERODIR/2.png"   # 0 位元組空檔夾在中間
+"$FF" -f lavfi -i color=blue:s=640x480:d=1 -frames:v 1 -y "$ZERODIR/3.png" >/dev/null 2>&1
+zero_out="$TMP/zero.mp4"; rm -f "$zero_out"
+"$EXE" --cli "$ZERODIR" 2 "$zero_out" >/dev/null 2>&1
+zero_dur=$(duration "$zero_out")
+if [ "$zero_dur" = "1.00" ]; then
+  echo "✓ 0 位元組空檔：被排除，兩張正常照片都保留（時長 ${zero_dur}s）"
+else
+  echo "✗ 0 位元組空檔：時長 ${zero_dur}s（期望 1.00；短少代表空檔害後面照片被丟）"; FAIL=1
+fi
+rm -rf "$ZERODIR" "$zero_out"
+
 # 混合格式：一個資料夾內同時有 jpg/png/bmp/webp/tif（手機照片＋截圖＋下載圖
 # 很常見）。concat demuxer 要求編碼一致，程式須先把非 PNG 的照片正規化，否則
 # 會靜默丟格（成品少照片）甚至整個失敗。以 6 種格式各一張、fps=2 驗證時長 3.00s。

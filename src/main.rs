@@ -1320,7 +1320,7 @@ impl App {
     }
 
     fn add_photos(&mut self, mut files: Vec<PathBuf>) {
-        files.retain(|p| is_image(p));
+        files.retain(|p| is_image(p) && is_nonempty_file(p));
         // 統一轉絕對路徑：以相對路徑啟動（CLI 參數、「開啟方式」）加入的
         // 照片，字面路徑存進專案檔後會隨工作目錄不同而「遺失」；
         // 去重也不受同檔案相對/絕對兩種寫法影響（轉檔的 concat_escape
@@ -1781,7 +1781,9 @@ impl App {
         let exists: Vec<bool> = pf
             .photos
             .iter()
-            .map(|p| p.is_file() && is_image(p))
+            // 0 位元組的照片視同遺失：留著會在轉檔時讓 concat 靜默丟掉其後所有
+            // 照片（見 is_nonempty_file），當作缺檔略過並提示才安全
+            .map(|p| p.is_file() && is_image(p) && is_nonempty_file(p))
             .collect();
         let missing = exists.iter().filter(|e| !**e).count();
         let mut kept_before = vec![0usize; orig_n + 1];
@@ -4552,6 +4554,14 @@ fn is_image(p: &Path) -> bool {
     ext_in(p, IMAGE_EXTS)
 }
 
+/// 檔案存在且非 0 位元組。0 位元組的圖片檔（下載中斷、雲端同步佔位、存檔
+/// 失敗留下的空檔）不是有效圖片，且混進 concat 清單時 demuxer 讀到它就會
+/// 中止、把其後所有照片一起靜默丟掉（成品少照片卻回報成功）。故一律當作
+/// 無效、在加入照片的各入口就排除。
+fn is_nonempty_file(p: &Path) -> bool {
+    std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false)
+}
+
 fn is_audio(p: &Path) -> bool {
     ext_in(p, AUDIO_EXTS)
 }
@@ -4573,7 +4583,9 @@ fn collect_images_in_dir(dir: &Path) -> Vec<PathBuf> {
             // 每個檔案再查一次檔案屬性，大資料夾可省數千次系統呼叫
             if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
                 let p = e.path();
-                if is_image(&p) {
+                // 排除 0 位元組空檔（見 is_nonempty_file）。DirEntry 的 metadata
+                // 在 Windows 列舉時已附帶大小，不需為此多一次系統呼叫
+                if is_image(&p) && e.metadata().map(|m| m.len() > 0).unwrap_or(false) {
                     out.push(p);
                 }
             }
