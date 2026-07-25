@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# 煙霧測試：用 test_images 以 CLI 模式實際轉出影片，驗證核心轉檔沒有回歸。
+# 發版前可跑一次確認輸出的時長／解析度／格式正確。
+#
+# 需求：已建置的 release exe（會自動 cargo build --release）、dist/ffmpeg.exe
+# 用法：bash scripts/smoke-test.sh
+set -u
+
+cd "$(dirname "$0")/.." || exit 1
+
+EXE="./target/release/photo2video.exe"
+FF="./dist/ffmpeg.exe"
+IMAGES="test_images"
+TMP="${TEMP:-/tmp}/p2v_smoke"
+FAIL=0
+
+[ -f "$FF" ] || { echo "✗ 找不到 $FF（驗證需要）"; exit 1; }
+[ -d "$IMAGES" ] || { echo "✗ 找不到 $IMAGES"; exit 1; }
+
+echo "→ 建置 release…"
+# 注意：不能寫成 `cargo build … | tail -1 || …`——管線的退出碼來自 tail
+# （永遠 0），build 真的失敗也偵測不到，會拿舊 exe 給出假通過。用
+# PIPESTATUS 取 cargo 自己的退出碼。
+cargo build --release 2>&1 | tail -1
+[ "${PIPESTATUS[0]}" = 0 ] || { echo "✗ 建置失敗"; exit 1; }
+
+mkdir -p "$TMP"
+N=$(ls "$IMAGES" | wc -l | tr -d ' ')
+
+# 取影片時長（秒，一位小數）
+duration() { "$FF" -i "$1" 2>&1 | sed -n 's/.*Duration: 00:00:0*\([0-9.]*\),.*/\1/p'; }
+
+# 一個案例：格式、fps、期望時長
+case_run() {
+  local label="$1" ext="$2" fps="$3" want="$4"
+  local out="$TMP/smoke.$ext"
+  rm -f "$out"
+  "$EXE" --cli "$IMAGES" "$fps" "$out" >/dev/null 2>&1
+  if [ ! -f "$out" ]; then echo "✗ $label：沒有產出檔案"; FAIL=1; return; fi
+  local got; got=$(duration "$out")
+  local res; res=$("$FF" -i "$out" 2>&1 | sed -n 's/.*, \([0-9]*x[0-9]*\).*/\1/p' | head -1)
+  if [ "$got" = "$want" ] && [ "$res" = "1920x1080" ]; then
+    echo "✓ $label：時長 ${got}s、解析度 $res"
+  else
+    echo "✗ $label：時長 ${got}s（期望 ${want}s）、解析度 $res（期望 1920x1080）"; FAIL=1
+  fi
+  rm -f "$out"
+}
+
+# N 張、fps → 時長 = N/fps
+case_run "MP4 (H.264) fps=2" mp4 2 "$(awk "BEGIN{printf \"%.2f\", $N/2}")"
+case_run "WebM (VP9) fps=3"  webm 3 "$(awk "BEGIN{printf \"%.2f\", $N/3}")"
+
+rmdir "$TMP" 2>/dev/null
+if [ "$FAIL" = 0 ]; then echo "全部通過。"; else echo "有案例失敗。"; exit 1; fi
