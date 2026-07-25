@@ -12,7 +12,7 @@ jobs:
   build-and-release:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Rust 建置快取
         uses: Swatinem/rust-cache@v2
@@ -56,7 +56,7 @@ jobs:
           Copy-Item target/release/photo2video.exe photo2video.exe
 
       - name: 發佈到 GitHub Releases
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: ${{ github.ref_name }}
           files: |
