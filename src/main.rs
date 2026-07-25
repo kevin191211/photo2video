@@ -840,6 +840,8 @@ fn ff_color(c: egui::Color32) -> String {
 
 /// 產生一段 drawtext 濾鏡。fontsize 為實際像素；(x_frac, y_frac) 為文字中心點
 /// 在畫面上的比例位置；enable 為顯示時間區間
+// 參數各有明確語意，拆成結構反而失去可讀性（同 run_conversion 的取捨）
+#[allow(clippy::too_many_arguments)]
 fn drawtext_filter(
     fontfile: &Path,
     textfile: &Path,
