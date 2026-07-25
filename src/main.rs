@@ -6301,4 +6301,20 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn adjustments_values_and_values_mut_same_order() {
+        // values()（讀）與 values_mut()（滑桿寫）必須同欄位順序：對不上的話
+        // 拖某條滑桿會改到另一個調色參數。逐欄寫入唯一值再讀回驗證一致。
+        let mut a = Adjustments::default();
+        for (i, v) in a.values_mut().into_iter().enumerate() {
+            *v = (i as i32 + 1) * 3; // 3,6,9,… 各欄位唯一
+        }
+        for (i, &v) in a.values().iter().enumerate() {
+            assert_eq!(v, (i as i32 + 1) * 3, "values/values_mut 第 {i} 欄順序不一致");
+        }
+        // 且與 is_neutral 一致：任一欄非 0 就不是中性
+        assert!(!a.is_neutral());
+        assert!(Adjustments::default().is_neutral());
+    }
 }
