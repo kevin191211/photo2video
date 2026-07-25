@@ -707,8 +707,11 @@ fn detect_fonts() -> Vec<(String, PathBuf)> {
 /// 把秒數格式化為易讀的影片長度（給底欄顯示預計輸出長度用）。
 /// 一分鐘以上顯示「M 分 S 秒」，短片顯示一位小數，才看得出每秒張數的差別
 fn fmt_video_len(secs: f64) -> String {
-    if secs >= 60.0 {
-        let total = secs.round() as u64;
+    // 用四捨五入到整數秒判斷是否切到「分」：直接比 secs>=60 的話，
+    // 59.96 秒會走到下面以「{:.1}」顯示成「60.0 秒」，而 60.0 秒顯示
+    // 「1 分」，邊界不連續
+    let total = secs.round() as u64;
+    if total >= 60 {
         let (m, s) = (total / 60, total % 60);
         if s == 0 {
             format!("{m} 分")
