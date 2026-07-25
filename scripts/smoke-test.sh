@@ -102,6 +102,18 @@ else
 fi
 rm -f "$ext_out" "$ext_out.mp4"
 
+# 大寫副檔名須不分大小寫辨識格式：OUT.WEBM 要選 VP9，否則會落到預設
+# mp4(H264)、被 ffmpeg 依 .WEBM 寫成 H264-in-WebM 這種不相容檔案。
+up_out="$TMP/UP.WEBM"; rm -f "$up_out"
+"$EXE" --cli "$IMAGES" 3 "$up_out" >/dev/null 2>&1
+up_codec=$("$FF" -i "$up_out" 2>&1 | sed -n 's/.*Video: \([a-z0-9]*\).*/\1/p' | head -1)
+if [ "$up_codec" = "vp9" ]; then
+  echo "✓ 大寫副檔名 .WEBM：正確選用 VP9 編碼"
+else
+  echo "✗ 大寫副檔名 .WEBM：編碼為 $up_codec（期望 vp9；大小寫辨識失敗會產生不相容檔）"; FAIL=1
+fi
+rm -f "$up_out"
+
 # 混合尺寸縮放補邊：橫向／直向／小圖／4K 都應等比例縮放置中、補黑邊成 1920x1080。
 # （其餘案例都用同尺寸的 test_images，這條 scale/pad 路徑靠這裡覆蓋。）
 MIX="$TMP/mixed"
