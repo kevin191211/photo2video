@@ -267,6 +267,42 @@ PY
     echo "✗ 自然排序：影片內照片順序錯誤（可能退回字典序）"; FAIL=1
   fi
   rm -rf "$ORDDIR" "$ord_out" "$ord_fr"
+
+  # EXIF 方向 × 混合格式：EXIF 直拍照片被混合格式正規化（轉成暫存 PNG）時，
+  # 正規化那步（pre_adjust_photo）也必須依 EXIF 轉正，否則直拍照片會躺著。
+  # 這條路徑串起「EXIF 自動轉正」與「混合格式正規化」兩個功能的交互作用。
+  EXMIX="$TMP/exmix"; rm -rf "$EXMIX"; mkdir -p "$EXMIX"
+  python - "$EXMIX" <<'PY'
+from PIL import Image
+import sys
+img = Image.new("RGB", (800, 200), (200, 200, 200))   # 橫向、亮灰
+ex = img.getexif(); ex[0x0112] = 6                     # 顯示應轉成直向
+img.save(f"{sys.argv[1]}/1.jpg", exif=ex, quality=95)  # jpg：混合格式時會被正規化
+PY
+  "$FF" -f lavfi -i color=red:s=640x480:d=1 -frames:v 1 -c:v png -y "$EXMIX/2.png" >/dev/null 2>&1
+  exmix_out="$TMP/exmix.mp4"; rm -f "$exmix_out"
+  "$EXE" --cli "$EXMIX" 1 "$exmix_out" >/dev/null 2>&1   # fps=1 好逐格抽
+  exmix_fr="$TMP/exmix_fr"; rm -rf "$exmix_fr"; mkdir -p "$exmix_fr"
+  "$FF" -v error -i "$exmix_out" -vf fps=1 "$exmix_fr/%02d.png" >/dev/null 2>&1
+  exmix_res=$(PYTHONIOENCODING=utf-8 python - "$exmix_fr" <<'PY'
+import sys, glob, os
+from PIL import Image
+files = sorted(glob.glob(os.path.join(sys.argv[1], "*.png")))
+im = Image.open(files[0]).convert("RGB"); W, H = im.size; px = im.load()  # 第 1 張＝EXIF jpg
+xs = []; ys = []
+for y in range(0, H, 4):
+    for x in range(0, W, 4):
+        r, g, b = px[x, y]
+        if r + g + b > 150: xs.append(x); ys.append(y)
+print("portrait" if xs and (max(ys)-min(ys)) > (max(xs)-min(xs)) else "landscape")
+PY
+)
+  if [ "$exmix_res" = portrait ]; then
+    echo "✓ EXIF × 混合格式：直拍照片經正規化仍正確轉正為直向"
+  else
+    echo "✗ EXIF × 混合格式：正規化後 EXIF 方向遺失（輸出 $exmix_res）"; FAIL=1
+  fi
+  rm -rf "$EXMIX" "$exmix_out" "$exmix_fr"
 else
   echo "↷ 略過 EXIF 方向與排序順序測試（環境未安裝 python3 + Pillow）"
 fi
