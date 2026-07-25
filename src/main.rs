@@ -2158,6 +2158,25 @@ impl App {
     /// App::drop：尚未寫入的 fps 設定（變動後延遲 800ms 才寫檔）要在這裡
     /// 先補寫，否則重啟瞬間剛調過的 fps 會靜默遺失
     fn restart_for_update(&mut self) {
+        // 重啟等同關閉：有未儲存的專案變更先確認，否則更新一重啟就把辛苦
+        // 設定的照片/調色/文字/音樂沖掉（與關閉視窗的保護一致）
+        if self.has_unsaved_changes() {
+            let restart_now = rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Warning)
+                .set_title("重新啟動以完成更新")
+                .set_description(
+                    "有尚未儲存的專案變更，重新啟動後會遺失。\n\
+                     現在就重新啟動嗎？\n\n\
+                     （按「否」可先用 Ctrl+S 儲存，再從底部「重新啟動完成更新」重啟）",
+                )
+                .set_buttons(rfd::MessageButtons::YesNo)
+                .show();
+            if restart_now != rfd::MessageDialogResult::Yes {
+                // 延後重啟：維持 ReadyToRestart，讓「重新啟動」按鈕還在
+                self.update_status = UpdateStatus::ReadyToRestart;
+                return;
+            }
+        }
         if self.fps_pending_save.take().is_some() {
             save_fps(self.fps);
         }
