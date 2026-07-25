@@ -47,9 +47,25 @@ case_run() {
   rm -f "$out"
 }
 
-# N 張、fps → 時長 = N/fps
-case_run "MP4 (H.264) fps=2" mp4 2 "$(awk "BEGIN{printf \"%.2f\", $N/2}")"
-case_run "WebM (VP9) fps=3"  webm 3 "$(awk "BEGIN{printf \"%.2f\", $N/3}")"
+# 各容器格式，N 張、fps → 時長 = N/fps
+case_run "MP4 (H.264) fps=2" mp4  2 "$(awk "BEGIN{printf \"%.2f\", $N/2}")"
+case_run "MKV (H.264) fps=2" mkv  2 "$(awk "BEGIN{printf \"%.2f\", $N/2}")"
+case_run "MOV (H.264) fps=2" mov  2 "$(awk "BEGIN{printf \"%.2f\", $N/2}")"
+case_run "AVI (H.264) fps=2" avi  2 "$(awk "BEGIN{printf \"%.2f\", $N/2}")"
+case_run "WebM (VP9)  fps=3" webm 3 "$(awk "BEGIN{printf \"%.2f\", $N/3}")"
+# 極端 fps 邊界
+case_run "MP4 fps=1（慢）" mp4 1 "$(awk "BEGIN{printf \"%.2f\", $N/1}")"
+
+# 副檔名處理：輸出無副檔名時應自動補成所選格式（預設 mp4）
+ext_out="$TMP/smoke_noext"
+rm -f "$ext_out" "$ext_out.mp4"
+"$EXE" --cli "$IMAGES" 2 "$ext_out" >/dev/null 2>&1
+if [ -f "$ext_out.mp4" ]; then
+  echo "✓ 無副檔名輸出：自動補成 .mp4"
+else
+  echo "✗ 無副檔名輸出：預期補成 .mp4，未產出"; FAIL=1
+fi
+rm -f "$ext_out" "$ext_out.mp4"
 
 rmdir "$TMP" 2>/dev/null
 if [ "$FAIL" = 0 ]; then echo "全部通過。"; else echo "有案例失敗。"; exit 1; fi
