@@ -1277,6 +1277,20 @@ impl App {
         matches!(self.state, ConvertState::Working { .. })
     }
 
+    /// 預估輸出影片總長度（秒），與 run_conversion 的 total_secs 一致。
+    /// Ken Burns 會把每張時長對齊到 30fps 的整數格，fps 無法整除 30 時
+    /// 與純幻燈片（張數÷fps）有落差，估算須比照，否則顯示的長度與成品不符
+    fn estimated_video_secs(&self) -> f64 {
+        let fps = self.fps.max(1) as f64;
+        let eff_dur = if self.ken_burns {
+            let d = ((OUT_FPS as f64 / fps).round() as i64).max(1);
+            d as f64 / OUT_FPS as f64
+        } else {
+            1.0 / fps
+        };
+        self.photos.len() as f64 * eff_dur
+    }
+
     fn add_photos(&mut self, mut files: Vec<PathBuf>) {
         files.retain(|p| is_image(p));
         // 統一轉絕對路徑：以相對路徑啟動（CLI 參數、「開啟方式」）加入的
@@ -2492,11 +2506,12 @@ impl App {
                                     ui.selectable_value(&mut self.resolution, r, r.label());
                                 }
                             });
-                        // 預計影片長度＝照片張數÷每秒張數。讓使用者一眼知道成品多長，
-                        // 好搭配背景音樂或抓節奏，不必等轉完才發現太長／太短
+                        // 預計影片長度。讓使用者一眼知道成品多長，好搭配背景音樂
+                        // 或抓節奏，不必等轉完才發現太長／太短。與成品一致地考慮
+                        // Ken Burns 的時長對齊（見 estimated_video_secs）
                         if !self.photos.is_empty() {
                             ui.add_space(12.0);
-                            let secs = self.photos.len() as f64 / self.fps.max(1) as f64;
+                            let secs = self.estimated_video_secs();
                             ui.label(
                                 egui::RichText::new(format!(
                                     "≈ {} 影片",
@@ -3154,16 +3169,8 @@ impl App {
                 }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // 與實際輸出時長一致：Ken Burns 會把每張時長對齊到 30fps 的整數格
-                // （見 run_conversion 的 eff_dur），fps 無法整除 30 時直接用 張數/fps
-                // 會與成品有落差
-                let eff_dur = if self.ken_burns {
-                    let d = ((OUT_FPS as f64 / self.fps as f64).round() as i64).max(1);
-                    d as f64 / OUT_FPS as f64
-                } else {
-                    1.0 / self.fps as f64
-                };
-                let secs = self.photos.len() as f64 * eff_dur;
+                // 與實際輸出時長一致（Ken Burns 的對齊見 estimated_video_secs）
+                let secs = self.estimated_video_secs();
                 egui::Frame::default()
                     .fill(theme::CARD)
                     .corner_radius(12)
