@@ -1278,14 +1278,12 @@ impl App {
                 h = h.max(ph);
             }
         }
-        // 沒照片或全讀不到就退回 Full HD；編碼要求偶數尺寸
+        // 沒照片或全讀不到就退回 Full HD；否則夾進 H.264 編碼上限（見 cap_native_dims）
         let r = if w == 0 || h == 0 {
             Resolution { w: 1920, h: 1080 }
         } else {
-            Resolution {
-                w: w.max(2) & !1,
-                h: h.max(2) & !1,
-            }
+            let (cw, ch) = cap_native_dims(w, h);
+            Resolution { w: cw, h: ch }
         };
         self.native_res_cache = Some(r);
         r
@@ -4928,6 +4926,25 @@ fn preview_canvas(res: Resolution) -> (u32, u32) {
     (pw, ph)
 }
 
+/// 把「原始像素」的最大寬高夾進 H.264 編碼上限，回傳偶數尺寸。
+/// H.264 限制：單邊 ≤16384，且總像素 ≤16384×8192（實測 20000×15000、
+/// 16384×16384 都會以「Picture size invalid」失敗）。超過就等比例縮到剛好
+/// 符合——超寬全景拼接圖、高 DPI 大圖掃描選「原始像素」時才不會轉檔直接
+/// 失敗，成品仍是極高解析；一般照片（≤8K）遠在範圍內、原樣輸出。
+fn cap_native_dims(w: u32, h: u32) -> (u32, u32) {
+    const MAX_DIM: f64 = 16384.0;
+    const MAX_PIXELS: f64 = 16384.0 * 8192.0;
+    let (wf, hf) = (w as f64, h as f64);
+    let scale = (MAX_DIM / wf)
+        .min(MAX_DIM / hf)
+        .min((MAX_PIXELS / (wf * hf)).sqrt())
+        .min(1.0);
+    (
+        ((wf * scale) as u32).max(2) & !1,
+        ((hf * scale) as u32).max(2) & !1,
+    )
+}
+
 /// 在背景為指定照片預先建置預覽底圖（已存在、建置中或 ffmpeg 未就緒則跳過）。
 /// 停留在一張照片時先把鄰近照片準備好，切換過去直接命中快取
 fn prefetch_preview_base(photo: PathBuf, pw: u32, ph: u32) {
@@ -6116,5 +6133,34 @@ mod tests {
         // 截斷保留的內容（不含提示）其估算編碼長度不超過預算
         let kept = t.split('\n').next().unwrap_or("");
         assert!(kept.chars().map(|c| c.len_utf8() * 3).sum::<usize>() <= 90, "超出預算：{kept}");
+    }
+
+    #[test]
+    fn cap_native_dims_stays_within_h264_limits() {
+        // 一般照片（≤8K）原樣輸出、只取偶數
+        assert_eq!(cap_native_dims(4000, 3000), (4000, 3000));
+        assert_eq!(cap_native_dims(7680, 4320), (7680, 4320));
+        // 奇數尺寸取偶數
+        assert_eq!(cap_native_dims(4001, 3001), (4000, 3000));
+
+        // 各種超限情況：夾後都必須在 H.264 上限內（單邊 ≤16384、總像素 ≤134M）
+        for (w, h) in [
+            (20000, 3000),   // 超寬全景
+            (3000, 20000),   // 超高直幅
+            (20000, 20000),  // 超大方形掃描
+            (17000, 17000),
+            (16384, 16384),  // 剛好超總像素上限
+            (100000, 2000),  // 極端寬
+        ] {
+            let (cw, ch) = cap_native_dims(w, h);
+            assert!(cw <= 16384 && ch <= 16384, "單邊超限：{cw}x{ch}（來源 {w}x{h}）");
+            assert!(
+                cw as u64 * ch as u64 <= 16384 * 8192,
+                "總像素超限：{cw}x{ch}={}（來源 {w}x{h}）",
+                cw as u64 * ch as u64
+            );
+            assert!(cw % 2 == 0 && ch % 2 == 0, "非偶數尺寸：{cw}x{ch}");
+            assert!(cw >= 2 && ch >= 2);
+        }
     }
 }
