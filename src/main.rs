@@ -5238,7 +5238,13 @@ fn run_conversion(
     }
 
     let list_path = temp_path("list.txt");
-    std::fs::write(&list_path, &list).map_err(|e| format!("無法寫入暫存清單：{e}"))?;
+    if let Err(e) = std::fs::write(&list_path, &list) {
+        // 中途失敗以 ? 直接返回會跳過函式末尾的清理，殘留個別調色暫存圖
+        for f in &adj_temp {
+            let _ = std::fs::remove_file(f);
+        }
+        return Err(format!("無法寫入暫存清單：{e}"));
+    }
 
     let (w, h) = (res.w, res.h);
     // 先縮放到目標解析度再調色（大照片可省下數倍運算），最後補邊，
@@ -5287,7 +5293,17 @@ fn run_conversion(
                 continue;
             }
             let cap_path = temp_path(&format!("cap_{k}.txt"));
-            std::fs::write(&cap_path, text).map_err(|e| format!("無法寫入字幕暫存檔：{e}"))?;
+            if let Err(e) = std::fs::write(&cap_path, text) {
+                // 同上：中途失敗清掉此前建立的清單、字幕與個別調色暫存檔
+                let _ = std::fs::remove_file(&list_path);
+                for f in &caption_files {
+                    let _ = std::fs::remove_file(f);
+                }
+                for f in &adj_temp {
+                    let _ = std::fs::remove_file(f);
+                }
+                return Err(format!("無法寫入字幕暫存檔：{e}"));
+            }
             let enable = (en.s as f64 * d - buf, (en.e as f64 + 1.0) * d - buf);
             let fontsize = en.size as f64 * h as f64 / 1080.0;
             ops.push((en, cap_path.clone(), enable, fontsize));
