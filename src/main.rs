@@ -1680,8 +1680,11 @@ impl App {
         };
         // 原子寫入：先寫臨時檔再 rename 覆蓋。直接覆寫既有專案檔時若寫到
         // 一半崩潰/斷電，會損壞使用者辛苦設定的整個專案（照片、調色、文字、
-        // 音樂全丟）。先寫 .tmp 成功才置換，既有專案檔在意外時仍完好
-        let tmp = path.with_extension(format!("{PROJECT_EXT}.tmp"));
+        // 音樂全丟）。先寫 .tmp 成功才置換，既有專案檔在意外時仍完好。
+        // 臨時檔名帶行程 ID（比照 update_config、temp_path）：兩個視窗同時把
+        // 同一個專案存檔時，才不會共用同一個 .tmp——共用會讓其中一個視窗跳出
+        // 假的「儲存失敗」，甚至讓 rename 搬到另一個視窗覆寫到一半的內容
+        let tmp = path.with_extension(format!("{PROJECT_EXT}.{}.tmp", std::process::id()));
         let result = std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, path));
         match result {
             Ok(()) => {
