@@ -5278,12 +5278,19 @@ fn run_conversion(
         .len()
         > 1;
     if mixed_codecs {
-        send(WorkerMsg::Status("統一照片格式…".into()));
         // 只轉非 PNG 的（原檔或個別調色暫存圖已是 PNG 就不動）
         let need_norm: Vec<usize> = (0..src_photos.len())
             .filter(|&i| codec_family(&src_photos[i]) != 0)
             .collect();
-        for i in need_norm {
+        let norm_total = need_norm.len();
+        for (k, i) in need_norm.into_iter().enumerate() {
+            // 大量照片時逐張回報進度，避免只顯示一個靜止的「統一照片格式…」
+            // 讓使用者以為卡住（與上方個別調色迴圈一致）
+            send(WorkerMsg::Status(format!(
+                "統一照片格式…（{}/{}）",
+                k + 1,
+                norm_total
+            )));
             if CONVERT_CANCEL.load(Ordering::Relaxed) {
                 for f in &adj_temp {
                     let _ = std::fs::remove_file(f);
