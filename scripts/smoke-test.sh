@@ -297,6 +297,40 @@ PY
   fi
   rm -rf "$ORDDIR" "$ord_out" "$ord_fr"
 
+  # 色階（full-range）保留：JPEG 多為 full-range（0~255）。轉檔若把它壓成
+  # limited-range（16~235）或標錯 range 旗標，純黑會發灰、純白會變暗——照片
+  # 明顯褪色。以左黑右白的 JPEG 轉檔後驗證黑仍是 0、白仍是 255。
+  RNGDIR="$TMP/range"; rm -rf "$RNGDIR"; mkdir -p "$RNGDIR"
+  python - "$RNGDIR" <<'PY'
+from PIL import Image
+import sys
+img = Image.new("RGB", (640, 480), (0, 0, 0))
+for y in range(480):
+    for x in range(320, 640):
+        img.putpixel((x, y), (255, 255, 255))
+img.save(f"{sys.argv[1]}/1.jpg", quality=98)
+img.save(f"{sys.argv[1]}/2.jpg", quality=98)
+PY
+  rng_out="$TMP/range.mp4"; rm -f "$rng_out"
+  "$EXE" --cli "$RNGDIR" 2 "$rng_out" >/dev/null 2>&1
+  rng_frame="$TMP/range_frame.png"; rm -f "$rng_frame"
+  "$FF" -v error -i "$rng_out" -frames:v 1 -y "$rng_frame" >/dev/null 2>&1
+  rng_res=$(PYTHONIOENCODING=utf-8 python - "$rng_frame" <<'PY'
+from PIL import Image
+import sys
+im = Image.open(sys.argv[1]).convert("RGB"); W, H = im.size
+black = im.getpixel((W // 2 - 300, H // 2))
+white = im.getpixel((W // 2 + 300, H // 2))
+print("ok" if black[0] < 20 and white[0] > 235 else f"bad(黑={black[0]},白={white[0]})")
+PY
+)
+  if [ "$rng_res" = ok ]; then
+    echo "✓ 色階保留：full-range JPEG 的純黑(0)/純白(255)未被壓縮或標錯"
+  else
+    echo "✗ 色階：$rng_res（黑發灰或白變暗＝range 被壓成 limited 或旗標錯）"; FAIL=1
+  fi
+  rm -rf "$RNGDIR" "$rng_out" "$rng_frame"
+
   # EXIF 方向 × 混合格式：EXIF 直拍照片被混合格式正規化（轉成暫存 PNG）時，
   # 正規化那步（pre_adjust_photo）也必須依 EXIF 轉正，否則直拍照片會躺著。
   # 這條路徑串起「EXIF 自動轉正」與「混合格式正規化」兩個功能的交互作用。
