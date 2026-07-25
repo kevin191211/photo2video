@@ -5573,6 +5573,12 @@ fn run_conversion(
             cmd.args(["-af", af]);
             if matches!(format, OutputFormat::Webm) {
                 cmd.args(["-c:a", "libopus", "-b:a", "128k"]);
+            } else if matches!(format, OutputFormat::Avi) {
+                // AVI 容器對 AAC 的支援是非標準的：ffmpeg 塞得進去，但 Windows
+                // Media Player 等常見播放器常放不出這種 AAC 音軌——影片畫面正常、
+                // 背景音樂卻整個沒聲音。MP3 才是 AVI 的標準音訊編碼，相容性最好，
+                // 故 AVI 改用 libmp3lame（其餘容器維持 AAC）
+                cmd.args(["-c:a", "libmp3lame", "-b:a", "192k"]);
             } else {
                 cmd.args(["-c:a", "aac", "-b:a", "192k"]);
             }
