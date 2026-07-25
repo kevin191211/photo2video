@@ -5841,4 +5841,23 @@ mod tests {
         assert_eq!(parse_version("abc"), None);
         assert_eq!(parse_version(""), None);
     }
+
+    #[test]
+    fn fmt_video_len_seconds_minutes_hours() {
+        // 一分鐘內：一位小數的秒
+        assert_eq!(fmt_video_len(0.0), "0.0 秒");
+        assert_eq!(fmt_video_len(3.0), "3.0 秒");
+        assert_eq!(fmt_video_len(59.4), "59.4 秒");
+        // 四捨五入到整數秒判斷分界，避免出現「60.0 秒」的不連續
+        assert_eq!(fmt_video_len(59.96), "1 分");
+        // 分鐘級
+        assert_eq!(fmt_video_len(60.0), "1 分");
+        assert_eq!(fmt_video_len(90.0), "1 分 30 秒");
+        assert_eq!(fmt_video_len(119.0), "1 分 59 秒");
+        assert_eq!(fmt_video_len(120.0), "2 分");
+        // 一小時以上用「H 時 M 分」，不足一分的秒捨去
+        assert_eq!(fmt_video_len(3600.0), "1 時");
+        assert_eq!(fmt_video_len(3661.0), "1 時 1 分");
+        assert_eq!(fmt_video_len(7325.0), "2 時 2 分");
+    }
 }
