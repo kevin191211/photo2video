@@ -2519,11 +2519,19 @@ impl App {
                                 ))
                                 .color(theme::ACCENT),
                             )
-                            .on_hover_text(format!(
-                                "依 {} 張照片、每秒 {} 張估算的影片總長度",
-                                self.photos.len(),
-                                self.fps
-                            ));
+                            .on_hover_text({
+                                let mut h = format!(
+                                    "依 {} 張照片、每秒 {} 張估算的影片總長度",
+                                    self.photos.len(),
+                                    self.fps
+                                );
+                                // KB 時長度不是單純張數÷fps（見 estimated_video_secs），
+                                // 補一句避免使用者心算對不上而困惑
+                                if self.ken_burns {
+                                    h.push_str("；動態縮放會把每張對齊到 30fps，長度略有調整");
+                                }
+                                h
+                            });
                         }
                     });
 
