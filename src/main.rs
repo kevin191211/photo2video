@@ -3493,8 +3493,22 @@ impl App {
                                 ui.close_menu();
                             }
                             if ui.button("清空全部").clicked() {
-                                clear_all = true;
                                 ui.close_menu();
+                                // 與工具列「開新專案」一致：清空全部照片會連同各段
+                                // 文字與個別調色一次移除、無法復原，先確認再執行，
+                                // 避免右鍵選單誤點就把整批工作清掉
+                                let ok = rfd::MessageDialog::new()
+                                    .set_level(rfd::MessageLevel::Warning)
+                                    .set_title("清空全部")
+                                    .set_description(
+                                        "將移除所有照片，連同各段文字與個別調色。\n\
+                                         此動作無法復原（尚未儲存的變更會遺失）。",
+                                    )
+                                    .set_buttons(rfd::MessageButtons::OkCancel)
+                                    .show();
+                                if ok == rfd::MessageDialogResult::Ok {
+                                    clear_all = true;
+                                }
                             }
                         });
                         if working {
