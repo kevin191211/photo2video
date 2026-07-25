@@ -1956,11 +1956,9 @@ impl App {
                 .iter()
                 .filter(|e| !e.text.trim().is_empty())
                 .filter_map(|e| {
-                    let s = e.start.max(1) - 1;
-                    let end = e.end.min(total);
-                    (s < end).then(|| TextJob {
+                    clamp_subtitle_range(e.start, e.end, total).map(|(s, end)| TextJob {
                         s,
-                        e: end - 1,
+                        e: end,
                         text: e.text.clone(),
                         x: e.x,
                         y: e.y,
@@ -5256,6 +5254,16 @@ fn base_scale_pad_vf(w: u32, h: u32, adjust: &str) -> String {
 
 /// 字幕（照片區間 s..=e，0-based）的顯示時間區間（秒，enable='between(t,a,b)'）。
 /// 以半個輸出影格為緩衝，準確涵蓋第 s~e 張照片的所有格——動態模式輸出 30fps，
+/// 把一段文字的 1-based 起訖照片編號夾到現有照片範圍，回傳 0-based、含端點的
+/// (s, e)。使用者可能把「第 5～10 張」設好後又把照片刪到只剩 3 張，或編號超出
+/// 目前張數；此時整段落在範圍外就回傳 None（該段不輸出），部分超出則夾到有效
+/// 範圍。start 以 max(1) 防呆（UI 理應 ≥1）、total=0（無照片）時必回 None。
+fn clamp_subtitle_range(start: usize, end: usize, total: usize) -> Option<(usize, usize)> {
+    let s = start.max(1) - 1;
+    let end = end.min(total);
+    (s < end).then_some((s, end - 1))
+}
+
 /// 若以照片時長比例當緩衝，fps 低時字幕會提早出現/消失（每張 1 秒會早 0.25 秒）。
 /// 相鄰照片區間的字幕區間恰好接續（前段結尾＝後段開頭），不重疊也不留空。
 fn subtitle_enable_window(s: usize, e: usize, eff_dur: f64, out_fps: u32) -> (f64, f64) {
@@ -6568,6 +6576,30 @@ mod tests {
         // 涵蓋整段（第 0~e 張）：結尾 = (e+1)*d - buf
         let (_, full_end) = subtitle_enable_window(0, 4, d, fps);
         assert!((full_end - (5.0 * d - buf)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn clamp_subtitle_range_bounds_and_drops() {
+        // 正常：第 2～3 張（1-based）→ 0-based (1, 2)
+        assert_eq!(clamp_subtitle_range(2, 3, 3), Some((1, 2)));
+        // 單張、落在最後一張：第 3～3 張、共 3 張 → (2, 2)
+        assert_eq!(clamp_subtitle_range(3, 3, 3), Some((2, 2)));
+        // 起點防呆：start=0 視為第 1 張 → (0, 0)
+        assert_eq!(clamp_subtitle_range(0, 1, 5), Some((0, 0)));
+        // 終點超出：第 2～100 張、只有 3 張 → 夾到 (1, 2)
+        assert_eq!(clamp_subtitle_range(2, 100, 3), Some((1, 2)));
+        // 整段超出範圍（照片刪到剩不足）：第 5～10 張、只有 3 張 → None（不輸出）
+        assert_eq!(clamp_subtitle_range(5, 10, 3), None);
+        // 剛好超出一張：第 3～3 張、只有 2 張 → None
+        assert_eq!(clamp_subtitle_range(3, 3, 2), None);
+        // 無照片（total=0）：一律 None，不會 panic 或回傳負索引
+        assert_eq!(clamp_subtitle_range(1, 1, 0), None);
+        // 回傳的 e 一定 < total 且 s ≤ e（供後續 enable window 使用不越界）
+        for (start, end, total) in [(1, 1, 1), (1, 5, 3), (2, 2, 4), (1, 100, 10)] {
+            if let Some((s, e)) = clamp_subtitle_range(start, end, total) {
+                assert!(s <= e && e < total, "夾後越界：({start},{end},{total})→({s},{e})");
+            }
+        }
     }
 
     #[test]
