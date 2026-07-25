@@ -6236,6 +6236,25 @@ mod tests {
     }
 
     #[test]
+    fn filter_chain_curves_coordinates() {
+        // 鎖定曲線「形狀」（y 座標係數）——排序測試只保證 x 遞增，改錯 y 係數
+        // 會讓提黑/壓黑/陰影/提白的強度偏差卻不會報錯。實測方向已確認正確。
+        let curve = |a: Adjustments| a.filter_chain(1.0).unwrap();
+        // 提黑 +50：抬高輸出黑點到 50/100*0.15=0.075
+        assert!(curve(Adjustments { blacks: 50, ..Default::default() })
+            .contains("curves=all='0.0000/0.0750 1.0000/1.0000'"));
+        // 壓黑 -50：輸入黑點右移到 50/100*0.12=0.06
+        assert!(curve(Adjustments { blacks: -50, ..Default::default() })
+            .contains("curves=all='0.0000/0.0000 0.0600/0.0000 1.0000/1.0000'"));
+        // 陰影 +50：中間調 0.25 抬到 0.25+50/100*0.15=0.325
+        assert!(curve(Adjustments { shadows: 50, ..Default::default() })
+            .contains("curves=all='0.0000/0.0000 0.2500/0.3250 1.0000/1.0000'"));
+        // 提白 +50：輸入白點左移到 1-50/100*0.15=0.925
+        assert!(curve(Adjustments { whites: 50, ..Default::default() })
+            .contains("curves=all='0.0000/0.0000 0.9250/1.0000 1.0000/1.0000'"));
+    }
+
+    #[test]
     fn urlencode_percent_encodes_correctly() {
         // 未保留字元原樣保留
         assert_eq!(urlencode("abc123-_.~"), "abc123-_.~");
