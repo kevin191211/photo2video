@@ -4776,15 +4776,25 @@ fn open_in_explorer(path: &Path) {
     }
 }
 
-/// 用系統預設程式開啟檔案（轉檔完成後直接播放影片用）
+/// 用系統預設程式開啟檔案（轉檔完成後直接播放影片用）。
+/// 檔案已被移動/刪除時退回開啟所在資料夾（與 open_in_explorer 一致），
+/// 不然把不存在的路徑丟給 explorer 會開錯地方（如跳出「我的文件」）
 #[cfg(windows)]
 fn open_file(path: &Path) {
-    // explorer <檔案> 會以副檔名關聯的預設程式開啟（影片即播放器）
-    let _ = std::process::Command::new("explorer").arg(path).spawn();
+    if path.exists() {
+        // explorer <檔案> 會以副檔名關聯的預設程式開啟（影片即播放器）
+        let _ = std::process::Command::new("explorer").arg(path).spawn();
+    } else {
+        open_in_explorer(path);
+    }
 }
 #[cfg(not(windows))]
 fn open_file(path: &Path) {
-    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    if path.exists() {
+        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    } else {
+        open_in_explorer(path);
+    }
 }
 
 /// 序列化「檢查＋下載」：首次使用時預覽與轉檔可能同時走到這裡，
