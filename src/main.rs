@@ -5450,10 +5450,20 @@ fn run_conversion(
         let status = status.map_err(|e| format!("FFmpeg 執行失敗：{e}"))?;
         if !status.success() {
             let detail = error_log.join("\n");
+            // 輸出檔被鎖（常見於重轉一個正在播放器裡開著的舊成品）時，ffmpeg
+            // 只回「Permission denied / Access is denied」，使用者難以會意；
+            // 補一句提示要關閉佔用該檔的程式
+            let locked = detail.contains("Permission denied")
+                || detail.contains("Access is denied");
+            let hint = if locked {
+                "\n（輸出檔可能正在播放器等程式中開啟，請關閉後再試）"
+            } else {
+                ""
+            };
             return Err(if detail.is_empty() {
                 "FFmpeg 轉換失敗".into()
             } else {
-                format!("FFmpeg 轉換失敗：{detail}")
+                format!("FFmpeg 轉換失敗：{detail}{hint}")
             });
         }
         Ok(())
