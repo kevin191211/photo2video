@@ -6159,6 +6159,34 @@ mod tests {
             .filter_chain(2.0)
             .unwrap();
         assert!(s2.contains("luma_msize_x=23:luma_msize_y=23"), "{s2}");
+
+        // 色調 +100 → colorbalance gm = -100/100*0.3 = -0.3（負＝偏洋紅）
+        let ti = Adjustments { tint: 100, ..Default::default() }
+            .filter_chain(1.0)
+            .unwrap();
+        assert!(ti.contains("colorbalance=gm=-0.3000"), "{ti}");
+
+        // 曝光 +100 → exposure = 100/100*3 = 3.0 EV
+        let ex = Adjustments { exposure: 100, ..Default::default() }
+            .filter_chain(1.0)
+            .unwrap();
+        assert!(ex.contains("exposure=exposure=3.000"), "{ex}");
+
+        // 鮮豔度 +100 → vibrance intensity = 100/100*2 = 2.0
+        let vi = Adjustments { vibrance: 100, ..Default::default() }
+            .filter_chain(1.0)
+            .unwrap();
+        assert!(vi.contains("vibrance=intensity=2.0000"), "{vi}");
+
+        // 飽和度：+100 → eq saturation 2.0；-100 → 夾到 0（灰階，不會變負）
+        let sp = Adjustments { saturation: 100, ..Default::default() }
+            .filter_chain(1.0)
+            .unwrap();
+        assert!(sp.contains(":saturation=2.0000"), "{sp}");
+        let sn = Adjustments { saturation: -100, ..Default::default() }
+            .filter_chain(1.0)
+            .unwrap();
+        assert!(sn.contains(":saturation=0.0000"), "{sn}");
     }
 
     #[test]
