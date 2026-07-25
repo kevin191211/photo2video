@@ -70,8 +70,10 @@ case_run "MKV (H.264) fps=2" mkv  2 "$(awk "BEGIN{printf \"%.2f\", $N/2}")"
 case_run "MOV (H.264) fps=2" mov  2 "$(awk "BEGIN{printf \"%.2f\", $N/2}")"
 case_run "AVI (H.264) fps=2" avi  2 "$(awk "BEGIN{printf \"%.2f\", $N/2}")"
 case_run "WebM (VP9)  fps=3" webm 3 "$(awk "BEGIN{printf \"%.2f\", $N/3}")"
-# 極端 fps 邊界
-case_run "MP4 fps=1（慢）" mp4 1 "$(awk "BEGIN{printf \"%.2f\", $N/1}")"
+# 極端 fps 邊界：最慢（每張 1 秒）與最快（每張 1/60 秒，考驗 concat 清單對
+# 極小 duration 的精度；不足一秒也順帶考驗 duration() 解析）
+case_run "MP4 fps=1（慢）"  mp4 1  "$(awk "BEGIN{printf \"%.2f\", $N/1}")"
+case_run "MP4 fps=60（快）" mp4 60 "$(awk "BEGIN{printf \"%.2f\", $N/60}")"
 
 # 單張照片：concat demuxer「最後一張要再列一次」的慣例在 N=1 時是唯一輸入
 # 又是結尾張，最容易出邊界問題；且時長不足一秒，順帶驗證 duration() 的解析。
@@ -157,6 +159,24 @@ else
   echo "✗ 混合格式：時長 ${fmt_dur}s（期望 3.00，短少代表有照片被丟格）、解析度 $fmt_res"; FAIL=1
 fi
 rm -rf "$FMTDIR" "$fmt_out"
+
+# 副檔名與實際內容不符：使用者常把 png 改名成 .jpg。若只看副檔名判斷格式會漏
+# 掉這種混用、照樣丟格，故格式偵測須依檔頭實際內容。三張都叫 .jpg 但內容為
+# jpeg/png/jpeg，應被正規化、3 張全保留（fps=2 → 1.50s）。
+LIEDIR="$TMP/extlie"
+rm -rf "$LIEDIR"; mkdir -p "$LIEDIR"
+"$FF" -f lavfi -i color=red:s=640x480:d=1   -frames:v 1 -c:v mjpeg -y "$LIEDIR/1.jpg" >/dev/null 2>&1
+"$FF" -f lavfi -i color=green:s=640x480:d=1 -frames:v 1 -c:v png   -y "$LIEDIR/2.jpg" >/dev/null 2>&1
+"$FF" -f lavfi -i color=blue:s=640x480:d=1  -frames:v 1 -c:v mjpeg -y "$LIEDIR/3.jpg" >/dev/null 2>&1
+lie_out="$TMP/extlie.mp4"; rm -f "$lie_out"
+"$EXE" --cli "$LIEDIR" 2 "$lie_out" >/dev/null 2>&1
+lie_dur=$(duration "$lie_out")
+if [ "$lie_dur" = "1.50" ]; then
+  echo "✓ 副檔名不符實際內容（png 改名 .jpg）：依內容正規化，3 張全保留（${lie_dur}s）"
+else
+  echo "✗ 副檔名不符實際內容：時長 ${lie_dur}s（期望 1.50；短少代表偵測被副檔名騙過而丟格）"; FAIL=1
+fi
+rm -rf "$LIEDIR" "$lie_out"
 
 # 特殊字元路徑：資料夾與檔名含單引號、空格、中文（都是 Windows 合法檔名）。
 # concat 清單以單引號包住每個路徑，escape 沒處理好單引號會讓整條清單解析失敗、

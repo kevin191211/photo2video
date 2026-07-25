@@ -5278,31 +5278,38 @@ fn run_conversion(
     // 轉成暫存 PNG，與未調色的原始 jpg 混用同樣中招。偵測到混用時，把非 PNG 的
     // 照片先轉成暫存 PNG（用中性調色＝僅縮放輸出 PNG），讓整份清單編碼一致。
     // 全部同格式（最常見）則跳過、維持原本速度。
+    //
+    // 判斷依「檔頭魔術位元組」＝實際內容，而非副檔名：使用者常把 png 改名成
+    // .jpg，只看副檔名會誤判成同格式而不正規化，但 demuxer 看的是實際內容、
+    // 照樣丟格。0=PNG（含個別調色/正規化暫存圖），其餘為各種需要轉換的格式。
     let codec_family = |p: &Path| -> u8 {
-        match p
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("png") => 0,
-            Some("jpg") | Some("jpeg") => 1,
-            Some("bmp") => 2,
-            Some("webp") => 3,
-            Some("tif") | Some("tiff") => 4,
-            _ => 5,
+        use std::io::Read;
+        let mut buf = [0u8; 12];
+        let n = std::fs::File::open(p)
+            .and_then(|mut f| f.read(&mut buf))
+            .unwrap_or(0);
+        let b = &buf[..n];
+        if b.starts_with(&[0x89, b'P', b'N', b'G']) {
+            0 // PNG
+        } else if b.starts_with(&[0xFF, 0xD8, 0xFF]) {
+            1 // JPEG
+        } else if b.starts_with(b"BM") {
+            2 // BMP
+        } else if b.len() >= 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP" {
+            3 // WebP
+        } else if b.starts_with(b"II*\0") || b.starts_with(b"MM\0*") {
+            4 // TIFF
+        } else {
+            5 // 不認得的內容：當獨立一類，混到時一併嘗試正規化
         }
     };
-    let mixed_codecs = src_photos
-        .iter()
-        .map(|p| codec_family(p))
-        .collect::<HashSet<_>>()
-        .len()
-        > 1;
+    // 一次算好每張的實際格式，混用判斷與逐張跳過共用，避免重讀檔頭
+    let families: Vec<u8> = src_photos.iter().map(|p| codec_family(p)).collect();
+    let mixed_codecs = families.iter().collect::<HashSet<_>>().len() > 1;
     if mixed_codecs {
         // 只轉非 PNG 的（原檔或個別調色暫存圖已是 PNG 就不動）
         let need_norm: Vec<usize> = (0..src_photos.len())
-            .filter(|&i| codec_family(&src_photos[i]) != 0)
+            .filter(|&i| families[i] != 0)
             .collect();
         let norm_total = need_norm.len();
         for (k, i) in need_norm.into_iter().enumerate() {
