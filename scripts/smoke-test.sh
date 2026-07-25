@@ -27,8 +27,13 @@ cargo build --release 2>&1 | tail -1
 mkdir -p "$TMP"
 N=$(ls "$IMAGES" | wc -l | tr -d ' ')
 
-# 取影片時長（秒，一位小數）
-duration() { "$FF" -i "$1" 2>&1 | sed -n 's/.*Duration: 00:00:0*\([0-9.]*\),.*/\1/p'; }
+# 取影片時長（秒，兩位小數）。解析完整 HH:MM:SS.ss 再換算成秒：
+# 不能像舊版用 `00:00:0*` 硬吃前導零——它會把「00.50」的整數位 0 也吃掉、
+# 回傳「.50」而非「0.50」，任何不足一秒的影片（如單張照片）都會誤判失敗。
+duration() {
+  local d; d=$("$FF" -i "$1" 2>&1 | sed -n 's/.*Duration: \([0-9:.]*\),.*/\1/p')
+  awk -F: 'NF==3{printf "%.2f", $1*3600+$2*60+$3}' <<<"$d"
+}
 
 # 一個案例：格式、fps、期望時長
 case_run() {
@@ -67,6 +72,22 @@ case_run "AVI (H.264) fps=2" avi  2 "$(awk "BEGIN{printf \"%.2f\", $N/2}")"
 case_run "WebM (VP9)  fps=3" webm 3 "$(awk "BEGIN{printf \"%.2f\", $N/3}")"
 # 極端 fps 邊界
 case_run "MP4 fps=1（慢）" mp4 1 "$(awk "BEGIN{printf \"%.2f\", $N/1}")"
+
+# 單張照片：concat demuxer「最後一張要再列一次」的慣例在 N=1 時是唯一輸入
+# 又是結尾張，最容易出邊界問題；且時長不足一秒，順帶驗證 duration() 的解析。
+SINGLE="$TMP/single"
+rm -rf "$SINGLE"; mkdir -p "$SINGLE"
+"$FF" -f lavfi -i color=purple:s=1000x800:d=1 -frames:v 1 -y "$SINGLE/only.png" >/dev/null 2>&1
+single_out="$TMP/single.mp4"; rm -f "$single_out"
+"$EXE" --cli "$SINGLE" 2 "$single_out" >/dev/null 2>&1   # 1 張 / fps 2 → 0.50s
+single_res=$("$FF" -i "$single_out" 2>&1 | sed -n 's/.*, \([0-9]*x[0-9]*\).*/\1/p' | head -1)
+single_dur=$(duration "$single_out")
+if [ "$single_dur" = "0.50" ] && [ "$single_res" = "1920x1080" ]; then
+  echo "✓ 單張照片 fps=2：時長 ${single_dur}s、解析度 $single_res"
+else
+  echo "✗ 單張照片 fps=2：時長 ${single_dur}s（期望 0.50）、解析度 $single_res（期望 1920x1080）"; FAIL=1
+fi
+rm -rf "$SINGLE" "$single_out"
 
 # 副檔名處理：輸出無副檔名時應自動補成所選格式（預設 mp4）
 ext_out="$TMP/smoke_noext"
