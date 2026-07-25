@@ -432,7 +432,11 @@ impl Default for ProjectFile {
 /// 解析 "v1.2.3" 或 "1.2.3" 為可比較的版本號
 fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
     let s = s.trim().trim_start_matches(['v', 'V']);
-    let mut it = s.split('.');
+    // 去掉 semver 的預發布（-rc1）與組建（+build）後綴，只取核心的 X.Y.Z：
+    // 否則帶後綴的 tag 會讓 patch 段（如「0-rc1」）解析失敗、parse_version
+    // 回 None，使整個更新檢查靜默失效——所有舊版使用者都收不到該次更新通知
+    let core = s.split(['-', '+']).next().unwrap_or(s);
+    let mut it = core.split('.');
     let major = it.next()?.parse().ok()?;
     let minor = it.next()?.parse().ok()?;
     let patch = it.next().unwrap_or("0").parse().ok()?;
@@ -5814,5 +5818,27 @@ mod tests {
             sorted(&[big_b.as_str(), big_a.as_str()]),
             [big_a, big_b] // 位數少者（45 位的 9…）排前，位數多者（46 位）排後
         );
+    }
+
+    #[test]
+    fn parse_version_basic_and_ordering() {
+        assert_eq!(parse_version("v0.8.6"), Some((0, 8, 6)));
+        assert_eq!(parse_version("0.8"), Some((0, 8, 0))); // 缺 patch 補 0
+        // 10 > 9：數值比較，非字典序
+        assert!(parse_version("0.8.10") > parse_version("0.8.9"));
+    }
+
+    #[test]
+    fn parse_version_strips_prerelease_and_build_suffix() {
+        // 帶 semver 後綴的 tag 也要能解析出核心版本，否則更新檢查會靜默失效
+        assert_eq!(parse_version("v0.9.0-rc1"), Some((0, 9, 0)));
+        assert_eq!(parse_version("0.9.0+build.7"), Some((0, 9, 0)));
+        assert_eq!(parse_version("v1.2.3-beta.2+meta"), Some((1, 2, 3)));
+    }
+
+    #[test]
+    fn parse_version_rejects_garbage() {
+        assert_eq!(parse_version("abc"), None);
+        assert_eq!(parse_version(""), None);
     }
 }
