@@ -79,6 +79,25 @@ else
 fi
 rm -f "$ext_out" "$ext_out.mp4"
 
+# 混合尺寸縮放補邊：橫向／直向／小圖／4K 都應等比例縮放置中、補黑邊成 1920x1080。
+# （其餘案例都用同尺寸的 test_images，這條 scale/pad 路徑靠這裡覆蓋。）
+MIX="$TMP/mixed"
+rm -rf "$MIX"; mkdir -p "$MIX"
+"$FF" -f lavfi -i color=red:s=1920x1080:d=1    -frames:v 1 -y "$MIX/1_landscape.png" >/dev/null 2>&1
+"$FF" -f lavfi -i color=blue:s=1080x1920:d=1   -frames:v 1 -y "$MIX/2_portrait.png"  >/dev/null 2>&1
+"$FF" -f lavfi -i color=green:s=400x300:d=1    -frames:v 1 -y "$MIX/3_small.png"      >/dev/null 2>&1
+"$FF" -f lavfi -i color=yellow:s=3840x2160:d=1 -frames:v 1 -y "$MIX/4_4k.png"         >/dev/null 2>&1
+mix_out="$TMP/mixed.mp4"; rm -f "$mix_out"
+"$EXE" --cli "$MIX" 2 "$mix_out" >/dev/null 2>&1
+mix_res=$("$FF" -i "$mix_out" 2>&1 | sed -n 's/.*, \([0-9]*x[0-9]*\).*/\1/p' | head -1)
+mix_dur=$(duration "$mix_out")
+if [ "$mix_res" = "1920x1080" ] && [ "$mix_dur" = "2.00" ]; then
+  echo "✓ 混合尺寸（橫/直/小/4K）：都輸出 1920x1080、時長 ${mix_dur}s"
+else
+  echo "✗ 混合尺寸：解析度 $mix_res（期望 1920x1080）、時長 ${mix_dur}s（期望 2.00）"; FAIL=1
+fi
+rm -rf "$MIX" "$mix_out"
+
 # 錯誤路徑：確認各種不合法輸入都被明確拒絕（非 0 退出碼＋易懂訊息）
 mkdir -p "$TMP/empty"
 error_case "空資料夾"   "沒有圖片"        "$TMP/empty" 2 "$TMP/x.mp4"
