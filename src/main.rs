@@ -5249,6 +5249,15 @@ struct SubtitleJob {
     entries: Vec<TextJob>,
 }
 
+/// 字幕（照片區間 s..=e，0-based）的顯示時間區間（秒，enable='between(t,a,b)'）。
+/// 以半個輸出影格為緩衝，準確涵蓋第 s~e 張照片的所有格——動態模式輸出 30fps，
+/// 若以照片時長比例當緩衝，fps 低時字幕會提早出現/消失（每張 1 秒會早 0.25 秒）。
+/// 相鄰照片區間的字幕區間恰好接續（前段結尾＝後段開頭），不重疊也不留空。
+fn subtitle_enable_window(s: usize, e: usize, eff_dur: f64, out_fps: u32) -> (f64, f64) {
+    let buf = 0.5 / out_fps as f64;
+    (s as f64 * eff_dur - buf, (e as f64 + 1.0) * eff_dur - buf)
+}
+
 /// 每張照片的實際顯示秒數與 Ken Burns 的每張格數。純幻燈片為 1/fps、格數 0；
 /// Ken Burns 用 zoompan 以整數格計時，須把 1/fps 對齊到 OUT_FPS 的整數格
 /// （fps 無法整除 30 時會有落差）。估算長度與實際轉檔共用此函式，兩者才一致。
@@ -5528,11 +5537,6 @@ fn run_conversion(
     // (該段文字, 字幕檔, 顯示區間, 字級像素)
     let mut ops: Vec<(&TextJob, PathBuf, (f64, f64), f64)> = Vec::new();
     if subs.font.is_some() {
-        let d = eff_dur;
-        // 以半個「輸出影格」為緩衝，準確涵蓋第 s ~ e 張照片的所有格；
-        // 動態模式輸出為 30fps，若以照片時長的比例當緩衝，
-        // fps 低時字幕會提早出現/消失（如每張 1 秒會早 0.25 秒）
-        let buf = 0.5 / out_fps as f64;
         for (k, en) in subs.entries.iter().enumerate() {
             let text = en.text.trim_end();
             if text.is_empty() {
@@ -5550,7 +5554,7 @@ fn run_conversion(
                 }
                 return Err(format!("無法寫入字幕暫存檔：{e}"));
             }
-            let enable = (en.s as f64 * d - buf, (en.e as f64 + 1.0) * d - buf);
+            let enable = subtitle_enable_window(en.s, en.e, eff_dur, out_fps);
             let fontsize = en.size as f64 * h as f64 / 1080.0;
             ops.push((en, cap_path.clone(), enable, fontsize));
             caption_files.push(cap_path);
@@ -6426,5 +6430,25 @@ mod tests {
         }
         // fps=0 也不 panic（除以零）：夾到 1
         assert_eq!(photo_frame_timing(0, false), (1.0, 0));
+    }
+
+    #[test]
+    fn subtitle_enable_window_covers_range_and_is_contiguous() {
+        let d = 0.5; // eff_dur（fps=2）
+        let fps = 30;
+        let buf = 0.5 / fps as f64;
+        // 單張（第 2 張，index 1）：涵蓋 [1*d, 2*d) ± 緩衝
+        let (a, b) = subtitle_enable_window(1, 1, d, fps);
+        assert!((a - (1.0 * d - buf)).abs() < 1e-9);
+        assert!((b - (2.0 * d - buf)).abs() < 1e-9);
+        // 第一張 index 0：開頭為負（-buf），between(t,-buf,..) 讓 t=0 起就顯示
+        assert!(subtitle_enable_window(0, 0, d, fps).0 < 0.0);
+        // 關鍵：相鄰區間接續不重疊——A=照片0~1、B=照片2~3，A 結尾＝B 開頭
+        let (_, a_end) = subtitle_enable_window(0, 1, d, fps);
+        let (b_start, _) = subtitle_enable_window(2, 3, d, fps);
+        assert!((a_end - b_start).abs() < 1e-9, "相鄰字幕區間未接續：{a_end} vs {b_start}");
+        // 涵蓋整段（第 0~e 張）：結尾 = (e+1)*d - buf
+        let (_, full_end) = subtitle_enable_window(0, 4, d, fps);
+        assert!((full_end - (5.0 * d - buf)).abs() < 1e-9);
     }
 }
