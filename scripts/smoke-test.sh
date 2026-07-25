@@ -366,6 +366,40 @@ PY
     echo "✗ EXIF × 混合格式：正規化後 EXIF 方向遺失（輸出 $exmix_res）"; FAIL=1
   fi
   rm -rf "$EXMIX" "$exmix_out" "$exmix_fr"
+
+  # EXIF 方向＝3（180°）：180° 旋轉「不」交換寬高，橫向照片轉正後仍是橫向。
+  # 上面已驗 orientation=6（90°→換成直向）；這裡補「不換寬高」那條路徑，
+  # 防止日後把 180° 誤當成需要交換寬高（會把橫向照片壓成直向）。
+  EX180="$TMP/ex180"; rm -rf "$EX180"; mkdir -p "$EX180"
+  python - "$EX180" <<'PY'
+from PIL import Image
+import sys
+img = Image.new("RGB", (800, 200), (200, 200, 200))   # 橫向、亮灰
+ex = img.getexif(); ex[0x0112] = 3                     # 180°：轉正後仍應是橫向
+img.save(f"{sys.argv[1]}/1.jpg", exif=ex, quality=95)
+PY
+  ex180_out="$TMP/ex180.mp4"; rm -f "$ex180_out"
+  "$EXE" --cli "$EX180" 2 "$ex180_out" >/dev/null 2>&1
+  ex180_fr="$TMP/ex180_fr.png"; rm -f "$ex180_fr"
+  "$FF" -v error -i "$ex180_out" -frames:v 1 -y "$ex180_fr" >/dev/null 2>&1
+  ex180_res=$(PYTHONIOENCODING=utf-8 python - "$ex180_fr" <<'PY'
+import sys
+from PIL import Image
+im = Image.open(sys.argv[1]).convert("RGB"); W, H = im.size; px = im.load()
+xs = []; ys = []
+for y in range(0, H, 4):
+    for x in range(0, W, 4):
+        r, g, b = px[x, y]
+        if r + g + b > 150: xs.append(x); ys.append(y)
+print("landscape" if xs and (max(xs)-min(xs)) > (max(ys)-min(ys)) else "portrait")
+PY
+)
+  if [ "$ex180_res" = landscape ]; then
+    echo "✓ EXIF 方向＝3（180°）：橫向照片轉正後仍為橫向（未誤交換寬高）"
+  else
+    echo "✗ EXIF 方向＝3：橫向照片被壓成 $ex180_res（180° 誤當成需交換寬高）"; FAIL=1
+  fi
+  rm -rf "$EX180" "$ex180_out" "$ex180_fr"
 else
   echo "↷ 略過 EXIF 方向與排序順序測試（環境未安裝 python3 + Pillow）"
 fi
