@@ -364,6 +364,9 @@ struct OutputFx {
 /// 專案檔副檔名（內容為 JSON）
 const PROJECT_EXT: &str = "p2v";
 
+/// 「最近的專案」清單保留的最大筆數（載入與寫入共用同一上限）
+const RECENT_PROJECTS_MAX: usize = 8;
+
 /// 專案檔內容：照片清單與所有編輯設定。
 /// 與 App 狀態分離的獨立結構，欄位盡量用穩定的表示法
 /// （字型存名稱而非索引、格式/轉場存字串），並全部給預設值，
@@ -567,7 +570,7 @@ fn save_fps(fps: u32) {
 
 /// 最近開啟/儲存的專案檔路徑（新的在前）
 fn load_recent_projects() -> Vec<PathBuf> {
-    load_config()
+    let mut list: Vec<PathBuf> = load_config()
         .get("recent_projects")
         .and_then(|v| v.as_array())
         .map(|arr| {
@@ -575,7 +578,10 @@ fn load_recent_projects() -> Vec<PathBuf> {
                 .filter_map(|v| v.as_str().map(PathBuf::from))
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // 與寫入時同一上限：config 若被手改/損壞塞入大量條目，載入也不會超載
+    list.truncate(RECENT_PROJECTS_MAX);
+    list
 }
 
 fn save_recent_projects(list: &[PathBuf]) {
@@ -1704,7 +1710,7 @@ impl App {
         // 不同（D:\a.p2v 與 d:\a.p2v）在清單重複出現
         self.recent_projects.retain(|p| !same_path_ci(p, path));
         self.recent_projects.insert(0, path.to_path_buf());
-        self.recent_projects.truncate(8);
+        self.recent_projects.truncate(RECENT_PROJECTS_MAX);
         save_recent_projects(&self.recent_projects);
     }
 
