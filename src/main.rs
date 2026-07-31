@@ -4607,8 +4607,18 @@ fn ext_in(p: &Path, exts: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+/// macOS 的 AppleDouble 附屬檔（檔名前綴 "._"）。從 Mac 把照片複製到隨身碟、
+/// 網路磁碟機或壓縮成 zip 時，每張 IMG.jpg 旁邊都會多出一個 ._IMG.jpg——裡面
+/// 存的是中繼資料與資源分支，不是圖片。它副檔名同樣是 .jpg、大小也非 0，只看
+/// 副檔名就會照單全收：縮圖整批「無法讀取」、預覽與轉檔則被 ffmpeg 判成
+/// 「No JPEG data found in image」而直接失敗。故在加入照片的各入口一律排除。
+fn is_apple_double(p: &Path) -> bool {
+    p.file_name()
+        .is_some_and(|n| n.to_string_lossy().starts_with("._"))
+}
+
 fn is_image(p: &Path) -> bool {
-    ext_in(p, IMAGE_EXTS)
+    ext_in(p, IMAGE_EXTS) && !is_apple_double(p)
 }
 
 /// 檔案存在且非 0 位元組。0 位元組的圖片檔（下載中斷、雲端同步佔位、存檔
@@ -4620,7 +4630,9 @@ fn is_nonempty_file(p: &Path) -> bool {
 }
 
 fn is_audio(p: &Path) -> bool {
-    ext_in(p, AUDIO_EXTS)
+    // 音樂同樣要擋 AppleDouble（見 is_apple_double）：._song.mp3 不是音訊，
+    // 設成背景音樂只會讓轉檔在混音那步失敗
+    ext_in(p, AUDIO_EXTS) && !is_apple_double(p)
 }
 
 fn is_project_file(p: &Path) -> bool {
@@ -5274,7 +5286,9 @@ fn base_scale_pad_vf(w: u32, h: u32, adjust: &str) -> String {
 fn clamp_subtitle_range(start: usize, end: usize, total: usize) -> Option<(usize, usize)> {
     let s = start.max(1) - 1;
     let end = end.min(total);
-    (s < end).then_some((s, end - 1))
+    // 用 then（惰性）而非 then_some：後者的參數會先算出來，total=0 時
+    // end - 1 在 debug 版直接溢位 panic（release 版雖然 wrap 後被丟棄）
+    (s < end).then(|| (s, end - 1))
 }
 
 /// 開啟專案時部分照片遺失/被濾除，把一段文字的 1-based 起訖照片編號依「保留
@@ -6050,6 +6064,19 @@ mod tests {
         let mut v: Vec<PathBuf> = names.iter().map(PathBuf::from).collect();
         natural_sort(&mut v);
         v.iter().map(|p| p.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn is_image_rejects_apple_double_sidecars() {
+        // 從 Mac 複製過來的資料夾裡，每張照片旁都有一個 ._ 開頭的附屬檔：
+        // 副檔名一樣是 .jpg 但內容不是圖片，收進來會讓縮圖與預覽整批失敗
+        assert!(!is_image(Path::new(r"D:\photos\._A9301898.jpg")));
+        assert!(!is_image(Path::new("._IMG_0001.PNG")));
+        assert!(!is_audio(Path::new("._song.mp3")));
+        // 只擋 "._" 前綴，正常檔名（含以單一點開頭的隱藏檔）不受影響
+        assert!(is_image(Path::new(r"D:\photos\A9301898.jpg")));
+        assert!(is_image(Path::new(".hidden.jpg")));
+        assert!(is_image(Path::new("my._weird.jpg")));
     }
 
     #[test]
