@@ -18,6 +18,35 @@ use image::{Rgb, RgbImage};
 /// 縮圖估計不影響品質，卻讓大圖處理維持在一秒內。
 const WORK_LONG_EDGE: u32 = 640;
 
+/// 只在畫面某個區塊去煙時的作用範圍。
+/// 用相對座標（0~1）而非像素，預覽縮圖與原尺寸才會框到同一塊。
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Region {
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+}
+
+impl Region {
+    /// 夾回 0~1 並確保 x0 < x1、y0 < y1（框選可能從右下往左上拉）
+    fn normalized(self) -> Self {
+        let (x0, x1) = (self.x0.min(self.x1), self.x0.max(self.x1));
+        let (y0, y1) = (self.y0.min(self.y1), self.y0.max(self.y1));
+        Self {
+            x0: x0.clamp(0.0, 1.0),
+            y0: y0.clamp(0.0, 1.0),
+            x1: x1.clamp(0.0, 1.0),
+            y1: y1.clamp(0.0, 1.0),
+        }
+    }
+
+    /// 框太細會退化成一條線，視為沒有框選
+    fn is_usable(&self) -> bool {
+        self.x1 - self.x0 > 0.01 && self.y1 - self.y0 > 0.01
+    }
+}
+
 /// 去煙參數
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct SmokeParams {
@@ -27,6 +56,16 @@ pub struct SmokeParams {
     pub detail: i32,
     /// 殘霧壓制 0~100：對扣完的暗部再壓一次黑點，讓夜空回到純黑
     pub black: i32,
+    /// 只去除這個區塊裡的煙霧；None＝整張照片
+    pub region: Option<Region>,
+    /// 區塊邊緣的羽化寬度 0~100（相對於區塊短邊的比例）。
+    /// 邊界硬切會在畫面上留下一條看得出來的接縫
+    pub feather: i32,
+    /// 保護色（sRGB）：與它相近的像素不去煙，用來留住不想被扣掉的顏色；
+    /// None＝不做顏色保護
+    pub protect: Option<[u8; 3]>,
+    /// 保護色的容許範圍 0~100：越大則越多相近的顏色一起被保護
+    pub tolerance: i32,
 }
 
 impl Default for SmokeParams {
@@ -35,6 +74,10 @@ impl Default for SmokeParams {
             strength: 80,
             detail: 60,
             black: 30,
+            region: None,
+            feather: 25,
+            protect: None,
+            tolerance: 30,
         }
     }
 }
@@ -44,6 +87,12 @@ impl SmokeParams {
         self.strength = self.strength.clamp(0, 100);
         self.detail = self.detail.clamp(0, 100);
         self.black = self.black.clamp(0, 100);
+        self.feather = self.feather.clamp(0, 100);
+        self.tolerance = self.tolerance.clamp(0, 100);
+        self.region = self
+            .region
+            .map(Region::normalized)
+            .filter(Region::is_usable);
         self
     }
 
@@ -353,6 +402,125 @@ pub fn debug_smoke_layer(img: &RgbImage, params: SmokeParams) -> (RgbImage, [f32
     (out, a)
 }
 
+/// 區塊遮罩：框內為 1、框外為 0，邊界以羽化寬度平滑過渡。
+/// 沒有框選時整張都是 1。
+struct RegionMask {
+    /// 像素座標的框線位置與羽化寬度；None＝整張都要處理
+    bounds: Option<([f32; 4], f32)>,
+}
+
+impl RegionMask {
+    fn new(region: Option<Region>, feather: i32, fw: usize, fh: usize) -> Self {
+        let Some(r) = region else {
+            return Self { bounds: None };
+        };
+        let (fwf, fhf) = (fw as f32, fh as f32);
+        let px = [r.x0 * fwf, r.y0 * fhf, r.x1 * fwf, r.y1 * fhf];
+        // 羽化寬度以框的短邊為基準，框拉得再小也不會被過渡帶整個吃掉
+        let short = (px[2] - px[0]).min(px[3] - px[1]).max(1.0);
+        let f = (short * feather as f32 / 100.0 * 0.5).max(0.5);
+        Self {
+            bounds: Some((px, f)),
+        }
+    }
+
+    /// 單軸的過渡權重：[lo, hi] 內為 1，往外 f 個像素平滑降到 0
+    fn axis(v: f32, lo: f32, hi: f32, f: f32) -> f32 {
+        let d = if v < lo {
+            (v - (lo - f)) / f
+        } else if v > hi {
+            ((hi + f) - v) / f
+        } else {
+            return 1.0;
+        };
+        let t = d.clamp(0.0, 1.0);
+        // smoothstep：線性過渡在羽化帶兩端會留下看得見的折線
+        t * t * (3.0 - 2.0 * t)
+    }
+
+    fn at(&self, x: usize, y: usize) -> f32 {
+        let Some((b, f)) = self.bounds else {
+            return 1.0;
+        };
+        // 取像素中心，框線落在像素邊界時兩側才對稱
+        let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+        Self::axis(px, b[0], b[2], f) * Self::axis(py, b[1], b[3], f)
+    }
+}
+
+/// 顏色保護：和指定顏色夠接近的像素不去煙，
+/// 相當於 Photoshop 依「顏色範圍」建出來的遮色片。
+struct ColorProtect {
+    /// 保護色與容許距離的內外界；None＝不保護任何顏色
+    key: Option<([f32; 3], f32, f32)>,
+}
+
+impl ColorProtect {
+    fn new(protect: Option<[u8; 3]>, tolerance: i32) -> Self {
+        let key = protect.map(|c| {
+            let rgb = [
+                c[0] as f32 / 255.0,
+                c[1] as f32 / 255.0,
+                c[2] as f32 / 255.0,
+            ];
+            // 距離在 sRGB 空間量（與眼睛看到的「顏色像不像」較接近，
+            // 也和 Photoshop 的顏色範圍一致）；最大距離為 √3，正規化到 0~1
+            let t1 = tolerance as f32 / 100.0 * 0.9;
+            (rgb, t1 * 0.6, t1)
+        });
+        Self { key }
+    }
+
+    /// 回傳這個像素「要去煙的比例」：完全命中保護色為 0，離得夠遠為 1
+    fn at(&self, src: &Rgb<u8>) -> f32 {
+        let Some((key, t0, t1)) = self.key else {
+            return 1.0;
+        };
+        let d = (0..3)
+            .map(|c| {
+                let v = src[c] as f32 / 255.0 - key[c];
+                v * v
+            })
+            .sum::<f32>()
+            .sqrt()
+            / 3f32.sqrt();
+        if d <= t0 {
+            return 0.0;
+        }
+        if d >= t1 || t1 <= t0 {
+            return 1.0;
+        }
+        // 邊界平滑，避免保護區外圍出現鋸齒狀的硬邊
+        let t = (d - t0) / (t1 - t0);
+        t * t * (3.0 - 2.0 * t)
+    }
+}
+
+/// 遮色片預覽：把「不會去煙」的區域疊上紅色，
+/// 讓使用者看得到框選範圍與顏色保護實際蓋住哪裡（比照 Photoshop 的快速遮色片）
+pub fn mask_overlay(img: &RgbImage, params: SmokeParams) -> RgbImage {
+    let p = params.clamped();
+    let (fw, fh) = (img.width() as usize, img.height() as usize);
+    let mask = RegionMask::new(p.region, p.feather, fw, fh);
+    let protect = ColorProtect::new(p.protect, p.tolerance);
+    let mut out = img.clone();
+    for y in 0..fh {
+        for x in 0..fw {
+            let px = out.get_pixel_mut(x as u32, y as u32);
+            let covered = 1.0 - mask.at(x, y) * protect.at(px);
+            if covered <= 0.0 {
+                continue;
+            }
+            let a = covered * 0.55;
+            const RED: [f32; 3] = [220.0, 40.0, 60.0];
+            for c in 0..3 {
+                px[c] = (px[c] as f32 * (1.0 - a) + RED[c] * a).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    out
+}
+
 /// 移除照片中的煙霧，保留煙火細節
 pub fn remove_smoke(img: &RgbImage, params: SmokeParams) -> RgbImage {
     let p = params.clamped();
@@ -370,10 +538,20 @@ pub fn remove_smoke(img: &RgbImage, params: SmokeParams) -> RgbImage {
     // 係數放大到 1.6 倍才能在強度 100 時把煙霧完全扣乾淨
     let k = p.strength as f32 / 100.0 * 1.6;
     let blk = p.black as f32 / 100.0;
+    let mask = RegionMask::new(p.region, p.feather, fw, fh);
+    let protect = ColorProtect::new(p.protect, p.tolerance);
     let mut out = RgbImage::new(fw as u32, fh as u32);
     for y in 0..fh {
         for x in 0..fw {
             let src = img.get_pixel(x as u32, y as u32);
+            // 框選範圍外、或命中保護色的像素完全不動，
+            // 省下整段運算也保證原樣輸出
+            let w = mask.at(x, y) * protect.at(src);
+            if w <= 0.0 {
+                out.put_pixel(x as u32, y as u32, *src);
+                continue;
+            }
+            let k = k * w;
             let i = [
                 lut[src[0] as usize],
                 lut[src[1] as usize],
@@ -417,7 +595,9 @@ pub fn remove_smoke(img: &RgbImage, params: SmokeParams) -> RgbImage {
                     }
                 }
             }
-            // 殘霧壓制：以亮度做黑點壓縮，等比縮放三通道以免偏色
+            // 殘霧壓制：以亮度做黑點壓縮，等比縮放三通道以免偏色。
+            // 一樣乘上遮罩，羽化帶才不會因為壓黑而出現一圈暗邊
+            let blk = blk * w;
             if blk > 0.0 {
                 let y_lin = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
                 if y_lin > 0.0 {
@@ -456,9 +636,15 @@ mod tests {
             strength: 500,
             detail: -20,
             black: 999,
+            feather: -5,
+            tolerance: 400,
+            ..Default::default()
         }
         .clamped();
-        assert_eq!((p.strength, p.detail, p.black), (100, 0, 100));
+        assert_eq!(
+            (p.strength, p.detail, p.black, p.feather, p.tolerance),
+            (100, 0, 100, 0, 100)
+        );
     }
 
     #[test]
@@ -499,6 +685,7 @@ mod tests {
                 strength: 100,
                 detail: 60,
                 black: 0,
+                ..Default::default()
             },
         );
         let brightest = out.pixels().map(|p| p.0.iter().copied().max().unwrap()).max();
@@ -531,6 +718,99 @@ mod tests {
             let out = remove_smoke(&img, SmokeParams::default());
             assert_eq!((out.width(), out.height()), (w, h));
         }
+    }
+
+    /// 框選範圍外的像素必須原封不動
+    #[test]
+    fn region_leaves_the_outside_untouched() {
+        let img = solid(80, 80, [120, 100, 170]);
+        let p = SmokeParams {
+            strength: 100,
+            feather: 0,
+            region: Some(Region {
+                x0: 0.5,
+                y0: 0.0,
+                x1: 1.0,
+                y1: 1.0,
+            }),
+            ..Default::default()
+        };
+        let out = remove_smoke(&img, p);
+        // 最左側完全在框外，右側在框內且已被扣掉
+        assert_eq!(out.get_pixel(2, 40).0, [120, 100, 170], "框外被動到了");
+        assert!(out.get_pixel(78, 40).0[2] < 170, "框內沒有去煙");
+    }
+
+    /// 從右下往左上拉出來的框也要正規化成同一塊
+    #[test]
+    fn region_is_normalized_whichever_way_it_is_dragged() {
+        let forward = Region {
+            x0: 0.2,
+            y0: 0.3,
+            x1: 0.8,
+            y1: 0.9,
+        };
+        let backward = Region {
+            x0: 0.8,
+            y0: 0.9,
+            x1: 0.2,
+            y1: 0.3,
+        };
+        assert_eq!(forward.normalized(), backward.normalized());
+    }
+
+    /// 退化成一條線的框視為沒框選（整張處理），不是完全不處理
+    #[test]
+    fn degenerate_region_falls_back_to_whole_image() {
+        let p = SmokeParams {
+            region: Some(Region {
+                x0: 0.5,
+                y0: 0.2,
+                x1: 0.5005,
+                y1: 0.9,
+            }),
+            ..Default::default()
+        }
+        .clamped();
+        assert!(p.region.is_none());
+    }
+
+    /// 命中保護色的像素不該被去煙
+    #[test]
+    fn protected_colour_survives() {
+        // 紫煙背景中放一塊要保住的青色
+        let keep = [40, 200, 210];
+        let mut img = solid(80, 80, [120, 100, 170]);
+        for y in 20..60 {
+            for x in 20..60 {
+                img.put_pixel(x, y, Rgb(keep));
+            }
+        }
+        let p = SmokeParams {
+            strength: 100,
+            protect: Some(keep),
+            tolerance: 20,
+            ..Default::default()
+        };
+        let out = remove_smoke(&img, p);
+        assert_eq!(out.get_pixel(40, 40).0, keep, "保護色被扣掉了");
+        // 保護色以外的煙霧照樣要被扣掉
+        assert!(out.get_pixel(2, 2).0[2] < 170, "保護色以外沒有去煙");
+    }
+
+    /// 容差 0 時只有幾乎完全同色才受保護，不會整張都不處理
+    #[test]
+    fn zero_tolerance_barely_protects_anything() {
+        let img = solid(64, 64, [120, 100, 170]);
+        let p = SmokeParams {
+            strength: 100,
+            protect: Some([40, 200, 210]),
+            tolerance: 0,
+            ..Default::default()
+        };
+        let out = remove_smoke(&img, p);
+        let brightest = out.pixels().map(|p| p.0.iter().copied().max().unwrap()).max();
+        assert_eq!(brightest, Some(0), "與保護色差很遠卻沒被去煙");
     }
 
     /// 滑動極值濾波要與暴力法一致

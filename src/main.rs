@@ -980,6 +980,12 @@ struct SmokeTool {
     error: Option<String>,
     /// 最近一次成功另存的檔案與時間（視窗內短暫顯示提示）
     saved: Option<(PathBuf, Instant)>,
+    /// 正在拖曳框選的起點（影像的相對座標 0~1）；放開滑鼠才寫進 params
+    drag_from: Option<egui::Pos2>,
+    /// 吸色模式：下一次在照片上點擊要取為保護色
+    picking: bool,
+    /// 預覽改顯示遮色片（紅色蓋住的地方不會被去煙）
+    show_mask: bool,
 }
 
 impl Default for SmokeTool {
@@ -996,6 +1002,9 @@ impl Default for SmokeTool {
             busy: SmokeBusy::Idle,
             error: None,
             saved: None,
+            drag_from: None,
+            picking: false,
+            show_mask: false,
         }
     }
 }
@@ -4040,12 +4049,17 @@ impl App {
             return;
         };
         let params = self.smoke.params;
+        let mask = self.smoke.show_mask;
         self.smoke.busy = SmokeBusy::Rendering;
         let (tx, rx) = std::sync::mpsc::channel();
         self.smoke.rx = Some(rx);
         let ctx = ctx.clone();
         thread::spawn(move || {
-            let out = dehaze::remove_smoke(&base, params);
+            let out = if mask {
+                dehaze::mask_overlay(&base, params)
+            } else {
+                dehaze::remove_smoke(&base, params)
+            };
             let _ = tx.send(SmokeMsg::Preview(params, out));
             ctx.request_repaint();
         });
@@ -4143,6 +4157,84 @@ impl App {
         }
     }
 
+    /// 預覽圖上的框選與吸色互動；`img` 為照片實際畫出來的矩形
+    fn ui_smoke_canvas_interaction(
+        &mut self,
+        ui: &mut egui::Ui,
+        resp: &egui::Response,
+        img: egui::Rect,
+    ) {
+        // 畫面座標→照片的相對座標（0~1）：照片是等比置中的，
+        // 用相對座標存才能同時套用在預覽縮圖與原尺寸照片上
+        let to_norm = |p: egui::Pos2| {
+            egui::pos2(
+                ((p.x - img.left()) / img.width()).clamp(0.0, 1.0),
+                ((p.y - img.top()) / img.height()).clamp(0.0, 1.0),
+            )
+        };
+        let to_screen = |p: egui::Pos2| {
+            egui::pos2(img.left() + p.x * img.width(), img.top() + p.y * img.height())
+        };
+
+        if self.smoke.picking {
+            // 吸色模式：點一下取該點顏色，取完就離開吸色模式
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            if resp.clicked() {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    if img.contains(p) {
+                        if let Some(c) = self.smoke_color_at(to_norm(p)) {
+                            self.smoke.params.protect = Some(c);
+                        }
+                    }
+                }
+                self.smoke.picking = false;
+            }
+        } else {
+            // 框選：拖曳過程只畫框，放開才寫進參數觸發重算
+            if resp.drag_started() {
+                self.smoke.drag_from = resp
+                    .interact_pointer_pos()
+                    .filter(|p| img.contains(*p))
+                    .map(to_norm);
+            }
+            if let (Some(from), Some(now)) = (
+                self.smoke.drag_from,
+                resp.interact_pointer_pos().map(to_norm),
+            ) {
+                let sel = egui::Rect::from_two_pos(to_screen(from), to_screen(now));
+                paint_selection(ui, img, sel);
+                if resp.drag_stopped() {
+                    self.smoke.params.region = Some(dehaze::Region {
+                        x0: from.x,
+                        y0: from.y,
+                        x1: now.x,
+                        y1: now.y,
+                    });
+                    self.smoke.drag_from = None;
+                }
+            }
+        }
+
+        // 已設定的框：沒有在拖曳時持續顯示，讓使用者知道範圍在哪
+        if self.smoke.drag_from.is_none() {
+            if let Some(r) = self.smoke.params.region {
+                let sel = egui::Rect::from_two_pos(
+                    to_screen(egui::pos2(r.x0, r.y0)),
+                    to_screen(egui::pos2(r.x1, r.y1)),
+                );
+                paint_selection(ui, img, sel);
+            }
+        }
+    }
+
+    /// 取預覽底圖上某個相對座標的顏色
+    fn smoke_color_at(&self, p: egui::Pos2) -> Option<[u8; 3]> {
+        let base = self.smoke.base.as_ref()?;
+        let x = ((p.x * base.width() as f32) as u32).min(base.width().saturating_sub(1));
+        let y = ((p.y * base.height() as f32) as u32).min(base.height().saturating_sub(1));
+        Some(base.get_pixel(x, y).0)
+    }
+
     /// 「去煙霧」工具視窗：單張照片去除煙火的煙霧、保留煙火細節
     fn ui_smoke_window(&mut self, ctx: &egui::Context) {
         if !self.smoke.open {
@@ -4215,18 +4307,27 @@ impl App {
                     return;
                 }
 
-                // 底部控制列（三條滑桿＋說明＋按鈕）的高度先扣掉，其餘留給預覽。
-                // 再夾一次上限：Window 內的 available_height 不一定有界，
+                // 底部控制列的高度先扣掉，其餘留給預覽。再夾一次上限：
+                // Window 內的 available_height 不一定有界，
                 // 只靠相減會讓預覽把控制列推出視窗
-                let ctrl_h = 178.0;
+                let has_region = self.smoke.params.region.is_some();
+                let has_protect = self.smoke.params.protect.is_some();
+                let ctrl_h =
+                    206.0 + if has_region { 31.0 } else { 0.0 } + if has_protect { 31.0 } else { 0.0 };
                 let img_h = (ui.available_height() - ctrl_h).clamp(160.0, img_max_h);
-                let (rect, _) = ui.allocate_exact_size(
+                // 影像區要接收拖曳（框選）與點擊（吸取保護色）
+                let (rect, resp) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), img_h),
-                    egui::Sense::hover(),
+                    egui::Sense::click_and_drag(),
                 );
                 ui.painter().rect_filled(rect, 8.0, theme::CARD);
                 // 尚未算出結果前先顯示原圖，不要留一塊空白
-                let tex = self.smoke.tex_after.as_ref().or(self.smoke.tex_before.as_ref());
+                let tex = self
+                    .smoke
+                    .tex_after
+                    .as_ref()
+                    .or(self.smoke.tex_before.as_ref())
+                    .cloned();
                 if let Some(tex) = tex {
                     let r = fit_rect(tex.size_vec2(), rect.shrink(6.0));
                     ui.painter().image(
@@ -4235,6 +4336,7 @@ impl App {
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                         egui::Color32::WHITE,
                     );
+                    self.ui_smoke_canvas_interaction(ui, &resp, r);
                 }
                 ui.add_space(8.0);
 
@@ -4243,6 +4345,12 @@ impl App {
                     slider_row(ui, &mut p.strength, 0, 100, "去除");
                     slider_row(ui, &mut p.detail, 0, 100, "細節");
                     slider_row(ui, &mut p.black, 0, 100, "壓黑");
+                    if p.region.is_some() {
+                        slider_row(ui, &mut p.feather, 0, 100, "羽化");
+                    }
+                    if p.protect.is_some() {
+                        slider_row(ui, &mut p.tolerance, 0, 100, "容差");
+                    }
                     if p != self.smoke.params {
                         self.smoke.params = p;
                     }
@@ -4254,7 +4362,58 @@ impl App {
                     .size(11.0)
                     .color(theme::TEXT_WEAK),
                 );
-                ui.add_space(8.0);
+                ui.add_space(6.0);
+
+                // 範圍控制：框選區塊、吸取保護色、遮色片預覽
+                ui.horizontal_wrapped(|ui| {
+                    let picking = self.smoke.picking;
+                    if ui
+                        .selectable_label(picking, "🎨 吸取保護色")
+                        .on_hover_text("點一下再到照片上點選顏色，與它相近的區域就不會被去煙")
+                        .clicked()
+                    {
+                        self.smoke.picking = !picking;
+                    }
+                    if let Some(c) = self.smoke.params.protect {
+                        let (sw, _) = ui.allocate_exact_size(
+                            egui::vec2(20.0, 16.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().rect_filled(
+                            sw,
+                            3.0,
+                            egui::Color32::from_rgb(c[0], c[1], c[2]),
+                        );
+                        if ui.small_button("✕ 清除保護色").clicked() {
+                            self.smoke.params.protect = None;
+                        }
+                    }
+                    ui.separator();
+                    if self.smoke.params.region.is_some() {
+                        if ui.small_button("✕ 清除框選").clicked() {
+                            self.smoke.params.region = None;
+                        }
+                    } else {
+                        ui.label(
+                            egui::RichText::new("在照片上拖曳可框出只去煙的區塊")
+                                .size(11.0)
+                                .color(theme::TEXT_WEAK),
+                        );
+                    }
+                    ui.separator();
+                    let mut show_mask = self.smoke.show_mask;
+                    if ui
+                        .selectable_label(show_mask, "◧ 顯示遮色片")
+                        .on_hover_text("紅色蓋住的地方不會被去煙")
+                        .clicked()
+                    {
+                        show_mask = !show_mask;
+                        self.smoke.show_mask = show_mask;
+                        // 遮色片與成品是兩種畫面，切換後要重畫
+                        self.smoke.applied = None;
+                    }
+                });
+                ui.add_space(6.0);
 
                 ui.horizontal(|ui| {
                     if ui.small_button("↺ 重設").clicked() {
@@ -4872,6 +5031,36 @@ fn slider_row(ui: &mut egui::Ui, value: &mut i32, min: i32, max: i32, label: &st
             );
         });
     });
+}
+
+/// 畫出去煙的框選範圍：框外壓暗、框線用強調色，一眼看得出哪塊會被處理
+fn paint_selection(ui: &mut egui::Ui, img: egui::Rect, sel: egui::Rect) {
+    let sel = sel.intersect(img);
+    let p = ui.painter();
+    let dim = egui::Color32::from_black_alpha(110);
+    // 框外的四塊（上、下、左、右）分開塗，中間維持原樣
+    for r in [
+        egui::Rect::from_min_max(img.left_top(), egui::pos2(img.right(), sel.top())),
+        egui::Rect::from_min_max(egui::pos2(img.left(), sel.bottom()), img.right_bottom()),
+        egui::Rect::from_min_max(
+            egui::pos2(img.left(), sel.top()),
+            egui::pos2(sel.left(), sel.bottom()),
+        ),
+        egui::Rect::from_min_max(
+            egui::pos2(sel.right(), sel.top()),
+            egui::pos2(img.right(), sel.bottom()),
+        ),
+    ] {
+        if r.is_positive() {
+            p.rect_filled(r, 0.0, dim);
+        }
+    }
+    p.rect_stroke(
+        sel,
+        0.0,
+        egui::Stroke::new(1.4, theme::ACCENT),
+        egui::StrokeKind::Middle,
+    );
 }
 
 /// 把 RGB 影像上傳成 egui 材質
