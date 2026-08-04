@@ -13,6 +13,9 @@ use eframe::egui;
 use ffmpeg_sidecar::command::FfmpegCommand;
 use ffmpeg_sidecar::event::FfmpegEvent;
 
+mod dehaze;
+use dehaze::SmokeParams;
+
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "bmp", "webp", "tif", "tiff"];
 const AUDIO_EXTS: &[&str] = &["mp3", "wav", "m4a", "aac", "flac", "ogg", "opus", "wma"];
 
@@ -940,6 +943,63 @@ enum Thumb {
     Failed,
 }
 
+/// 去煙工具預覽用的最大邊長。煙霧層一律在固定的工作解析度估計，
+/// 所以這裡的縮圖只影響細節銳利度，預覽與實際輸出的去煙程度一致。
+const SMOKE_PREVIEW_MAX: u32 = 1600;
+
+/// 去煙工具背景執行緒的回報
+enum SmokeMsg {
+    Loaded(Result<image::RgbImage, String>),
+    /// 預覽算完；附上當時的參數，用來判斷是否已是最新
+    Preview(SmokeParams, image::RgbImage),
+    Saved(Result<PathBuf, String>),
+}
+
+/// 去煙工具目前在背景做的事（同時間只會有一件）
+#[derive(PartialEq, Clone, Copy)]
+enum SmokeBusy {
+    Idle,
+    Loading,
+    Rendering,
+    Saving,
+}
+
+/// 「去煙霧」工具視窗：單張照片去除煙火煙霧後另存新檔，與影片專案互不相干
+struct SmokeTool {
+    open: bool,
+    src: Option<PathBuf>,
+    /// 預覽底圖（原圖等比縮到 SMOKE_PREVIEW_MAX）
+    base: Option<Arc<image::RgbImage>>,
+    params: SmokeParams,
+    /// tex_after 目前反映的參數；與 params 不同就重算
+    applied: Option<SmokeParams>,
+    tex_before: Option<egui::TextureHandle>,
+    tex_after: Option<egui::TextureHandle>,
+    rx: Option<Receiver<SmokeMsg>>,
+    busy: SmokeBusy,
+    error: Option<String>,
+    /// 最近一次成功另存的檔案與時間（視窗內短暫顯示提示）
+    saved: Option<(PathBuf, Instant)>,
+}
+
+impl Default for SmokeTool {
+    fn default() -> Self {
+        Self {
+            open: false,
+            src: None,
+            base: None,
+            params: SmokeParams::default(),
+            applied: None,
+            tex_before: None,
+            tex_after: None,
+            rx: None,
+            busy: SmokeBusy::Idle,
+            error: None,
+            saved: None,
+        }
+    }
+}
+
 struct App {
     photos: Vec<PathBuf>,
     fps: u32,
@@ -1017,6 +1077,8 @@ struct App {
     saved_snapshot: Option<String>,
     /// 使用者已在關閉確認中選擇「直接關閉」，放行後續關閉（避免困住使用者）
     allow_close: bool,
+    /// 「去煙霧」單張照片工具的狀態
+    smoke: SmokeTool,
 }
 
 impl App {
@@ -1107,6 +1169,7 @@ impl App {
             applied_title: String::new(),
             saved_snapshot: None,
             allow_close: false,
+            smoke: SmokeTool::default(),
         };
         // 啟動時在背景檢查是否有新版本（失敗不影響使用）
         app.spawn_update_check(&cc.egui_ctx);
@@ -3133,6 +3196,18 @@ impl App {
         {
             self.open_project_dialog();
         }
+        child.add_space(4.0);
+        if child
+            .add(egui::Button::new(
+                egui::RichText::new("💨  去煙霧（單張照片）…")
+                    .size(12.5)
+                    .color(theme::TEXT_WEAK),
+            ))
+            .on_hover_text("去掉煙火照片裡的煙霧、保留煙火線條，處理後另存新檔")
+            .clicked()
+        {
+            self.smoke.open = true;
+        }
         // 最近的專案：點檔名直接開啟，不用再走檔案對話框。
         // 不在這裡檢查檔案是否存在（每幀摸磁碟太浪費），
         // 開啟失敗時 load_project 會提示並將它從清單移除
@@ -3222,6 +3297,14 @@ impl App {
                     .clicked()
                 {
                     self.save_project_dialog();
+                }
+                ui.separator();
+                if ui
+                    .button("💨  去煙霧")
+                    .on_hover_text("單張照片工具：去掉煙火的煙霧、保留煙火線條，處理後另存新檔")
+                    .clicked()
+                {
+                    self.smoke.open = true;
                 }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3907,6 +3990,312 @@ impl App {
         }
     }
 
+    // ---------- 去煙霧工具 ----------
+
+    /// 選一張照片載入去煙工具（在背景解碼並縮成預覽底圖）
+    fn smoke_pick_photo(&mut self, ctx: &egui::Context) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("照片", IMAGE_EXTS)
+            .set_title("選擇要去煙霧的照片")
+            .pick_file()
+        else {
+            return;
+        };
+        self.smoke.src = Some(path.clone());
+        self.smoke.base = None;
+        self.smoke.tex_before = None;
+        self.smoke.tex_after = None;
+        self.smoke.applied = None;
+        self.smoke.error = None;
+        self.smoke.saved = None;
+        self.smoke.busy = SmokeBusy::Loading;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.smoke.rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let r = image::open(&path)
+                .map_err(|e| format!("無法讀取這張照片：{e}"))
+                .map(|img| {
+                    let img = img.to_rgb8();
+                    let long = img.width().max(img.height());
+                    if long <= SMOKE_PREVIEW_MAX {
+                        return img;
+                    }
+                    let s = SMOKE_PREVIEW_MAX as f32 / long as f32;
+                    image::imageops::resize(
+                        &img,
+                        ((img.width() as f32 * s).round() as u32).max(1),
+                        ((img.height() as f32 * s).round() as u32).max(1),
+                        image::imageops::FilterType::Triangle,
+                    )
+                });
+            let _ = tx.send(SmokeMsg::Loaded(r));
+            ctx.request_repaint();
+        });
+    }
+
+    /// 以目前參數重算預覽
+    fn spawn_smoke_render(&mut self, ctx: &egui::Context) {
+        let Some(base) = self.smoke.base.clone() else {
+            return;
+        };
+        let params = self.smoke.params;
+        self.smoke.busy = SmokeBusy::Rendering;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.smoke.rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let out = dehaze::remove_smoke(&base, params);
+            let _ = tx.send(SmokeMsg::Preview(params, out));
+            ctx.request_repaint();
+        });
+    }
+
+    /// 對原尺寸照片套用去煙並另存新檔
+    fn smoke_save_as(&mut self, ctx: &egui::Context) {
+        let Some(src) = self.smoke.src.clone() else {
+            return;
+        };
+        // 預設檔名沿用原檔名加後綴，副檔名統一為 jpg（照片輸出的通用格式）
+        let stem = src
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "photo".into());
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("另存去煙霧的照片")
+            .set_file_name(format!("{stem}_去煙.jpg"))
+            .add_filter("JPEG 照片", &["jpg", "jpeg"])
+            .add_filter("PNG 照片", &["png"]);
+        if let Some(dir) = src.parent() {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(out) = dialog.save_file() else {
+            return;
+        };
+        // 對話框可能回傳沒有副檔名的路徑（使用者自行輸入），補上 jpg 才存得出去
+        let out = if out.extension().is_none() {
+            out.with_extension("jpg")
+        } else {
+            out
+        };
+        let params = self.smoke.params;
+        self.smoke.busy = SmokeBusy::Saving;
+        self.smoke.error = None;
+        self.smoke.saved = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.smoke.rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            // 另存時重讀原檔跑完整解析度，不是把預覽縮圖放大
+            let r = image::open(&src)
+                .map_err(|e| format!("無法讀取原始照片：{e}"))
+                .and_then(|img| {
+                    let done = dehaze::remove_smoke(&img.to_rgb8(), params);
+                    done.save(&out)
+                        .map_err(|e| format!("存檔失敗：{e}"))
+                        .map(|_| out)
+                });
+            let _ = tx.send(SmokeMsg::Saved(r));
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_smoke(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.smoke.rx {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    self.smoke.rx = None;
+                    self.smoke.busy = SmokeBusy::Idle;
+                    match msg {
+                        SmokeMsg::Loaded(Ok(img)) => {
+                            self.smoke.tex_before = Some(load_rgb_texture(ctx, "smoke_before", &img));
+                            self.smoke.base = Some(Arc::new(img));
+                            // applied 為 None，下面的重算判斷會立刻排一次預覽
+                        }
+                        SmokeMsg::Loaded(Err(e)) => {
+                            self.smoke.src = None;
+                            self.smoke.error = Some(e);
+                        }
+                        SmokeMsg::Preview(params, img) => {
+                            self.smoke.tex_after = Some(load_rgb_texture(ctx, "smoke_after", &img));
+                            self.smoke.applied = Some(params);
+                        }
+                        SmokeMsg::Saved(Ok(p)) => self.smoke.saved = Some((p, Instant::now())),
+                        SmokeMsg::Saved(Err(e)) => self.smoke.error = Some(e),
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // 執行緒沒回結果就結束：清掉等待狀態，否則工具永遠卡在忙碌中
+                    self.smoke.rx = None;
+                    self.smoke.busy = SmokeBusy::Idle;
+                    self.smoke.error = Some("去煙處理異常中斷".into());
+                }
+            }
+        }
+        // 參數變動且沒有工作在跑就重算；同時間最多一個，拖動滑桿時自然限流
+        if self.smoke.open
+            && self.smoke.busy == SmokeBusy::Idle
+            && self.smoke.base.is_some()
+            && self.smoke.applied != Some(self.smoke.params)
+        {
+            self.spawn_smoke_render(ctx);
+        }
+    }
+
+    /// 「去煙霧」工具視窗：單張照片去除煙火的煙霧、保留煙火細節
+    fn ui_smoke_window(&mut self, ctx: &egui::Context) {
+        if !self.smoke.open {
+            return;
+        }
+        let mut open = self.smoke.open;
+        let mut pick = false;
+        let mut save = false;
+        let mut reset = false;
+        egui::Window::new("💨  去煙霧")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([880.0, 660.0])
+            .min_width(560.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                let busy = self.smoke.busy;
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(busy == SmokeBusy::Idle, egui::Button::new("🖼  選擇照片"))
+                        .clicked()
+                    {
+                        pick = true;
+                    }
+                    if let Some(src) = &self.smoke.src {
+                        ui.label(
+                            egui::RichText::new(
+                                src.file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default(),
+                            )
+                            .size(12.0)
+                            .color(theme::TEXT_WEAK),
+                        );
+                    }
+                });
+                ui.add_space(8.0);
+
+                if let Some(e) = &self.smoke.error {
+                    ui.label(egui::RichText::new(format!("✖ {e}")).size(12.0).color(theme::ERROR));
+                    ui.add_space(6.0);
+                }
+
+                if self.smoke.base.is_none() {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(40.0);
+                        ui.label(egui::RichText::new("💨").size(40.0));
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(if busy == SmokeBusy::Loading {
+                                "照片載入中…"
+                            } else {
+                                "選一張煙火照片，把煙霧散去、只留下煙火的線條"
+                            })
+                            .size(13.0)
+                            .color(theme::TEXT_WEAK),
+                        );
+                        ui.add_space(40.0);
+                    });
+                    return;
+                }
+
+                // 底部控制列的高度先扣掉，其餘留給預覽
+                let ctrl_h = 132.0;
+                let img_h = (ui.available_height() - ctrl_h).max(140.0);
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), img_h),
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(rect, 8.0, theme::CARD);
+                // 尚未算出結果前先顯示原圖，不要留一塊空白
+                let tex = self.smoke.tex_after.as_ref().or(self.smoke.tex_before.as_ref());
+                if let Some(tex) = tex {
+                    let r = fit_rect(tex.size_vec2(), rect.shrink(6.0));
+                    ui.painter().image(
+                        tex.id(),
+                        r,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                }
+                ui.add_space(8.0);
+
+                ui.add_enabled_ui(busy != SmokeBusy::Saving, |ui| {
+                    let mut p = self.smoke.params;
+                    slider_row(ui, &mut p.strength, 0, 100, "去除");
+                    slider_row(ui, &mut p.detail, 0, 100, "細節");
+                    slider_row(ui, &mut p.black, 0, 100, "壓黑");
+                    if p != self.smoke.params {
+                        self.smoke.params = p;
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "去除＝煙霧扣掉多少 · 細節＝煙火線條的保留程度 · 壓黑＝把殘留的薄霧壓回夜色",
+                    )
+                    .size(11.0)
+                    .color(theme::TEXT_WEAK),
+                );
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    if ui.small_button("↺ 重設").clicked() {
+                        reset = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let label = if busy == SmokeBusy::Saving {
+                            "儲存中…"
+                        } else {
+                            "💾  另存新檔"
+                        };
+                        if primary_button(ui, label, busy == SmokeBusy::Idle).clicked() {
+                            save = true;
+                        }
+                        if busy == SmokeBusy::Rendering {
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new("處理中…").size(11.5).color(theme::TEXT_WEAK),
+                            );
+                        }
+                        // 存檔完成的提示只留幾秒，不長期佔著版面
+                        if let Some((p, at)) = &self.smoke.saved {
+                            if at.elapsed() < Duration::from_secs(8) {
+                                ui.add_space(8.0);
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "✔ 已存為 {}",
+                                        p.file_name()
+                                            .map(|n| n.to_string_lossy().into_owned())
+                                            .unwrap_or_default()
+                                    ))
+                                    .size(11.5)
+                                    .color(theme::SUCCESS),
+                                );
+                                ctx.request_repaint_after(Duration::from_secs(1));
+                            }
+                        }
+                    });
+                });
+            });
+        self.smoke.open = open;
+        if pick {
+            self.smoke_pick_photo(ctx);
+        }
+        if reset {
+            self.smoke.params = SmokeParams::default();
+        }
+        if save {
+            self.smoke_save_as(ctx);
+        }
+    }
+
     /// 拖曳檔案進視窗時的全螢幕提示。
     /// 轉檔中放開的檔案會被忽略（update 有 !is_working 守門）：這裡不能
     /// 直接不畫——拖著檔案毫無反應、放開又默默消失，看起來像程式壞掉；
@@ -4086,6 +4475,7 @@ impl eframe::App for App {
         self.poll_worker();
         self.poll_preview(ctx);
         self.poll_thumbs(ctx);
+        self.poll_smoke(ctx);
 
         // 支援直接拖曳檔案/資料夾進視窗
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -4163,6 +4553,7 @@ impl eframe::App for App {
         self.ui_side_panel(ctx);
         self.ui_central(ctx);
         self.ui_about_window(ctx);
+        self.ui_smoke_window(ctx);
         self.ui_drop_overlay(ctx);
     }
 }
@@ -4470,6 +4861,17 @@ fn slider_row(ui: &mut egui::Ui, value: &mut i32, min: i32, max: i32, label: &st
             );
         });
     });
+}
+
+/// 把 RGB 影像上傳成 egui 材質
+fn load_rgb_texture(
+    ctx: &egui::Context,
+    name: &str,
+    img: &image::RgbImage,
+) -> egui::TextureHandle {
+    let size = [img.width() as usize, img.height() as usize];
+    let color = egui::ColorImage::from_rgb(size, img.as_raw());
+    ctx.load_texture(name, color, Default::default())
 }
 
 /// 把 tex_size 等比縮放置中放進 bounds
