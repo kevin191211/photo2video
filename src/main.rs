@@ -4152,13 +4152,22 @@ impl App {
         let mut pick = false;
         let mut save = false;
         let mut reset = false;
+        // 尺寸依螢幕換算並設上限：預覽圖若照 available_height 展開，
+        // 視窗會被撐到螢幕外、底下的滑桿與另存按鈕就看不到了
+        let screen = ctx.screen_rect();
+        let win_w = (screen.width() * 0.72).clamp(640.0, 1180.0);
+        let img_max_h = (screen.height() * 0.60).max(200.0);
         egui::Window::new("💨  去煙霧")
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
-            .default_size([880.0, 660.0])
+            .default_width(win_w)
             .min_width(560.0)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .max_height(screen.height() * 0.92)
+            // pivot + default_pos 只決定「開啟時置中」，之後仍可自由拖動；
+            // 用 anchor 會把視窗永久釘死在畫面中央
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(screen.center())
             .show(ctx, |ui| {
                 let busy = self.smoke.busy;
                 ui.horizontal(|ui| {
@@ -4206,9 +4215,11 @@ impl App {
                     return;
                 }
 
-                // 底部控制列的高度先扣掉，其餘留給預覽
-                let ctrl_h = 132.0;
-                let img_h = (ui.available_height() - ctrl_h).max(140.0);
+                // 底部控制列（三條滑桿＋說明＋按鈕）的高度先扣掉，其餘留給預覽。
+                // 再夾一次上限：Window 內的 available_height 不一定有界，
+                // 只靠相減會讓預覽把控制列推出視窗
+                let ctrl_h = 178.0;
+                let img_h = (ui.available_height() - ctrl_h).clamp(160.0, img_max_h);
                 let (rect, _) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), img_h),
                     egui::Sense::hover(),
