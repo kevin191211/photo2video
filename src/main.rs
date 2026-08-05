@@ -949,10 +949,14 @@ const SMOKE_PREVIEW_MAX: u32 = 1600;
 
 /// 去煙工具背景執行緒的回報
 enum SmokeMsg {
-    Loaded(Result<image::RgbImage, String>),
+    /// 預覽底圖載好了；附上照片路徑，切張切太快時用來丟棄過期結果
+    Loaded(PathBuf, Result<image::RgbImage, String>),
     /// 預覽算完；附上當時的參數，用來判斷是否已是最新
     Preview(SmokeParams, image::RgbImage),
-    Saved(Result<PathBuf, String>),
+    /// 批次輸出的進度（已完成張數）
+    SaveProgress(usize),
+    /// 批次輸出結束：成功張數與各張的錯誤訊息
+    SaveDone(usize, Vec<String>),
 }
 
 /// 去煙工具目前在背景做的事（同時間只會有一件）
@@ -964,23 +968,34 @@ enum SmokeBusy {
     Saving,
 }
 
-/// 「去煙霧」工具視窗：單張照片去除煙火煙霧後另存新檔，與影片專案互不相干
+/// 「去煙霧」工具視窗：照片去除煙火煙霧後另存新檔，與影片專案互不相干
 struct SmokeTool {
     open: bool,
-    src: Option<PathBuf>,
-    /// 預覽底圖（原圖等比縮到 SMOKE_PREVIEW_MAX）
+    /// 待處理的照片；可一次選多張，逐張切換預覽
+    photos: Vec<PathBuf>,
+    /// 目前預覽的是第幾張
+    cur: usize,
+    /// 預覽底圖（目前這張的原圖等比縮到 SMOKE_PREVIEW_MAX）
     base: Option<Arc<image::RgbImage>>,
+    /// 共用參數：沒有個別設定的照片都套這組
     params: SmokeParams,
-    /// tex_after 目前反映的參數；與 params 不同就重算
+    /// 個別照片的參數覆寫；沒有覆寫的沿用 params
+    overrides: HashMap<PathBuf, SmokeParams>,
+    /// 開著時滑桿與框選只改目前這張（寫進 overrides），否則改共用參數
+    per_photo: bool,
+    /// tex_after 目前反映的參數；與目前這張的有效參數不同就重算
     applied: Option<SmokeParams>,
     tex_before: Option<egui::TextureHandle>,
     tex_after: Option<egui::TextureHandle>,
     rx: Option<Receiver<SmokeMsg>>,
     busy: SmokeBusy,
     error: Option<String>,
-    /// 最近一次成功另存的檔案與時間（視窗內短暫顯示提示）
-    saved: Option<(PathBuf, Instant)>,
-    /// 正在拖曳框選的起點（影像的相對座標 0~1）；放開滑鼠才寫進 params
+    /// 批次輸出的進度（已完成張數）與取消旗標
+    save_done: usize,
+    save_cancel: Arc<AtomicBool>,
+    /// 最近一次批次輸出的結果與時間（視窗內短暫顯示提示）
+    saved: Option<(String, Instant)>,
+    /// 正在拖曳框選的起點（影像的相對座標 0~1）；放開滑鼠才寫進參數
     drag_from: Option<egui::Pos2>,
     /// 吸色模式：下一次在照片上點擊要取為保護色
     picking: bool,
@@ -992,20 +1007,55 @@ impl Default for SmokeTool {
     fn default() -> Self {
         Self {
             open: false,
-            src: None,
+            photos: Vec::new(),
+            cur: 0,
             base: None,
             params: SmokeParams::default(),
+            overrides: HashMap::new(),
+            per_photo: false,
             applied: None,
             tex_before: None,
             tex_after: None,
             rx: None,
             busy: SmokeBusy::Idle,
             error: None,
+            save_done: 0,
+            save_cancel: Arc::new(AtomicBool::new(false)),
             saved: None,
             drag_from: None,
             picking: false,
             show_mask: false,
         }
+    }
+}
+
+impl SmokeTool {
+    /// 目前預覽的照片
+    fn current(&self) -> Option<&PathBuf> {
+        self.photos.get(self.cur)
+    }
+
+    /// 某張照片實際要套用的參數：有個別設定就用它，否則用共用參數
+    fn params_for(&self, p: &Path) -> SmokeParams {
+        self.overrides.get(p).copied().unwrap_or(self.params)
+    }
+
+    /// 目前這張的有效參數
+    fn effective(&self) -> SmokeParams {
+        self.current()
+            .map(|p| self.params_for(p))
+            .unwrap_or(self.params)
+    }
+
+    /// 寫回參數：依「只調這張」決定寫進覆寫還是共用
+    fn set_params(&mut self, v: SmokeParams) {
+        if self.per_photo {
+            if let Some(p) = self.current().cloned() {
+                self.overrides.insert(p, v);
+                return;
+            }
+        }
+        self.params = v;
     }
 }
 
@@ -4002,21 +4052,38 @@ impl App {
     // ---------- 去煙霧工具 ----------
 
     /// 選一張照片載入去煙工具（在背景解碼並縮成預覽底圖）
+    /// 選照片（可多選）載入去煙工具
     fn smoke_pick_photo(&mut self, ctx: &egui::Context) {
-        let Some(path) = rfd::FileDialog::new()
+        let Some(paths) = rfd::FileDialog::new()
             .add_filter("照片", IMAGE_EXTS)
-            .set_title("選擇要去煙霧的照片")
-            .pick_file()
+            .set_title("選擇要去煙霧的照片（可多選）")
+            .pick_files()
         else {
             return;
         };
-        self.smoke.src = Some(path.clone());
+        let paths: Vec<PathBuf> = paths.into_iter().filter(|p| is_image(p)).collect();
+        if paths.is_empty() {
+            return;
+        }
+        // 換一批照片＝重來：舊的個別設定對應不到新照片，留著只會困惑
+        self.smoke.photos = paths;
+        self.smoke.cur = 0;
+        self.smoke.overrides.clear();
+        self.smoke.error = None;
+        self.smoke.saved = None;
+        self.smoke_load_current(ctx);
+    }
+
+    /// 載入目前這張的預覽底圖
+    fn smoke_load_current(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.smoke.current().cloned() else {
+            return;
+        };
         self.smoke.base = None;
         self.smoke.tex_before = None;
         self.smoke.tex_after = None;
         self.smoke.applied = None;
-        self.smoke.error = None;
-        self.smoke.saved = None;
+        self.smoke.drag_from = None;
         self.smoke.busy = SmokeBusy::Loading;
         let (tx, rx) = std::sync::mpsc::channel();
         self.smoke.rx = Some(rx);
@@ -4038,9 +4105,18 @@ impl App {
                         image::imageops::FilterType::Triangle,
                     )
                 });
-            let _ = tx.send(SmokeMsg::Loaded(r));
+            let _ = tx.send(SmokeMsg::Loaded(path, r));
             ctx.request_repaint();
         });
+    }
+
+    /// 切換到第 i 張
+    fn smoke_select(&mut self, i: usize, ctx: &egui::Context) {
+        if i >= self.smoke.photos.len() || i == self.smoke.cur {
+            return;
+        }
+        self.smoke.cur = i;
+        self.smoke_load_current(ctx);
     }
 
     /// 以目前參數重算預覽
@@ -4048,7 +4124,7 @@ impl App {
         let Some(base) = self.smoke.base.clone() else {
             return;
         };
-        let params = self.smoke.params;
+        let params = self.smoke.effective();
         let mask = self.smoke.show_mask;
         self.smoke.busy = SmokeBusy::Rendering;
         let (tx, rx) = std::sync::mpsc::channel();
@@ -4065,34 +4141,28 @@ impl App {
         });
     }
 
-    /// 對原尺寸照片套用去煙並另存新檔
-    fn smoke_save_as(&mut self, ctx: &egui::Context) {
-        let Some(src) = self.smoke.src.clone() else {
+    /// 對每張照片以各自的有效參數去煙，全部存進指定資料夾
+    fn smoke_save_all(&mut self, ctx: &egui::Context) {
+        if self.smoke.photos.is_empty() {
             return;
-        };
-        // 預設檔名沿用原檔名加後綴，副檔名統一為 jpg（照片輸出的通用格式）
-        let stem = src
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "photo".into());
-        let mut dialog = rfd::FileDialog::new()
-            .set_title("另存去煙霧的照片")
-            .set_file_name(format!("{stem}_去煙.jpg"))
-            .add_filter("JPEG 照片", &["jpg", "jpeg"])
-            .add_filter("PNG 照片", &["png"]);
-        if let Some(dir) = src.parent() {
+        }
+        let mut dialog = rfd::FileDialog::new().set_title("選擇要存放去煙照片的資料夾");
+        if let Some(dir) = self.smoke.current().and_then(|p| p.parent()) {
             dialog = dialog.set_directory(dir);
         }
-        let Some(out) = dialog.save_file() else {
+        let Some(out_dir) = dialog.pick_folder() else {
             return;
         };
-        // 對話框可能回傳沒有副檔名的路徑（使用者自行輸入），補上 jpg 才存得出去
-        let out = if out.extension().is_none() {
-            out.with_extension("jpg")
-        } else {
-            out
-        };
-        let params = self.smoke.params;
+        // 每張照片連同它自己的參數一起交給背景執行緒
+        let jobs: Vec<(PathBuf, SmokeParams)> = self
+            .smoke
+            .photos
+            .iter()
+            .map(|p| (p.clone(), self.smoke.params_for(p)))
+            .collect();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.smoke.save_cancel = cancel.clone();
+        self.smoke.save_done = 0;
         self.smoke.busy = SmokeBusy::Saving;
         self.smoke.error = None;
         self.smoke.saved = None;
@@ -4100,50 +4170,104 @@ impl App {
         self.smoke.rx = Some(rx);
         let ctx = ctx.clone();
         thread::spawn(move || {
-            // 另存時重讀原檔跑完整解析度，不是把預覽縮圖放大
-            let r = image::open(&src)
-                .map_err(|e| format!("無法讀取原始照片：{e}"))
-                .and_then(|img| {
-                    let done = dehaze::remove_smoke(&img.to_rgb8(), params);
-                    done.save(&out)
-                        .map_err(|e| format!("存檔失敗：{e}"))
-                        .map(|_| out)
-                });
-            let _ = tx.send(SmokeMsg::Saved(r));
+            let mut ok = 0usize;
+            let mut errs: Vec<String> = Vec::new();
+            for (src, params) in jobs {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                let name = src
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let stem = src
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "photo".into());
+                let out = out_dir.join(format!("{stem}_去煙.jpg"));
+                // 輸出到來源資料夾時，別讓成品覆蓋掉同名的原始照片
+                let out = if same_path_ci(&out, &src) {
+                    out_dir.join(format!("{stem}_去煙(1).jpg"))
+                } else {
+                    out
+                };
+                // 重讀原檔跑完整解析度，不是把預覽縮圖放大
+                let r = image::open(&src)
+                    .map_err(|e| format!("{name}：無法讀取（{e}）")
+                    )
+                    .and_then(|img| {
+                        let done = dehaze::remove_smoke(&img.to_rgb8(), params);
+                        done.save(&out).map_err(|e| format!("{name}：存檔失敗（{e}）"))
+                    });
+                match r {
+                    Ok(()) => ok += 1,
+                    Err(e) => errs.push(e),
+                }
+                let _ = tx.send(SmokeMsg::SaveProgress(ok + errs.len()));
+                ctx.request_repaint();
+            }
+            let _ = tx.send(SmokeMsg::SaveDone(ok, errs));
             ctx.request_repaint();
         });
     }
 
     fn poll_smoke(&mut self, ctx: &egui::Context) {
-        if let Some(rx) = &self.smoke.rx {
-            match rx.try_recv() {
-                Ok(msg) => {
-                    self.smoke.rx = None;
-                    self.smoke.busy = SmokeBusy::Idle;
-                    match msg {
-                        SmokeMsg::Loaded(Ok(img)) => {
-                            self.smoke.tex_before = Some(load_rgb_texture(ctx, "smoke_before", &img));
-                            self.smoke.base = Some(Arc::new(img));
-                            // applied 為 None，下面的重算判斷會立刻排一次預覽
-                        }
-                        SmokeMsg::Loaded(Err(e)) => {
-                            self.smoke.src = None;
-                            self.smoke.error = Some(e);
+        if self.smoke.rx.is_some() {
+            loop {
+                let Some(rx) = &self.smoke.rx else { break };
+                match rx.try_recv() {
+                    Ok(msg) => match msg {
+                        SmokeMsg::Loaded(path, res) => {
+                            self.smoke.rx = None;
+                            self.smoke.busy = SmokeBusy::Idle;
+                            // 連續切張時舊的結果可能後到，只認目前這張的
+                            if self.smoke.current() != Some(&path) {
+                                continue;
+                            }
+                            match res {
+                                Ok(img) => {
+                                    self.smoke.tex_before =
+                                        Some(load_rgb_texture(ctx, "smoke_before", &img));
+                                    self.smoke.base = Some(Arc::new(img));
+                                    // applied 為 None，下面的重算判斷會立刻排一次預覽
+                                }
+                                Err(e) => self.smoke.error = Some(e),
+                            }
                         }
                         SmokeMsg::Preview(params, img) => {
-                            self.smoke.tex_after = Some(load_rgb_texture(ctx, "smoke_after", &img));
+                            self.smoke.rx = None;
+                            self.smoke.busy = SmokeBusy::Idle;
+                            self.smoke.tex_after =
+                                Some(load_rgb_texture(ctx, "smoke_after", &img));
                             self.smoke.applied = Some(params);
                         }
-                        SmokeMsg::Saved(Ok(p)) => self.smoke.saved = Some((p, Instant::now())),
-                        SmokeMsg::Saved(Err(e)) => self.smoke.error = Some(e),
+                        // 批次輸出中：只更新進度，通道要留著繼續收
+                        SmokeMsg::SaveProgress(n) => self.smoke.save_done = n,
+                        SmokeMsg::SaveDone(ok, errs) => {
+                            self.smoke.rx = None;
+                            self.smoke.busy = SmokeBusy::Idle;
+                            self.smoke.saved =
+                                Some((format!("已完成 {ok} 張"), Instant::now()));
+                            if !errs.is_empty() {
+                                // 只列前幾筆，其餘用數量帶過，免得訊息長到蓋住畫面
+                                let shown: Vec<String> = errs.iter().take(3).cloned().collect();
+                                let more = errs.len().saturating_sub(shown.len());
+                                let mut m = format!("{} 張失敗：{}", errs.len(), shown.join("；"));
+                                if more > 0 {
+                                    m.push_str(&format!("…等另外 {more} 張"));
+                                }
+                                self.smoke.error = Some(m);
+                            }
+                        }
+                    },
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // 執行緒沒回結果就結束：清掉等待狀態，否則工具永遠卡在忙碌中
+                        self.smoke.rx = None;
+                        self.smoke.busy = SmokeBusy::Idle;
+                        self.smoke.error = Some("去煙處理異常中斷".into());
+                        break;
                     }
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    // 執行緒沒回結果就結束：清掉等待狀態，否則工具永遠卡在忙碌中
-                    self.smoke.rx = None;
-                    self.smoke.busy = SmokeBusy::Idle;
-                    self.smoke.error = Some("去煙處理異常中斷".into());
                 }
             }
         }
@@ -4151,7 +4275,7 @@ impl App {
         if self.smoke.open
             && self.smoke.busy == SmokeBusy::Idle
             && self.smoke.base.is_some()
-            && self.smoke.applied != Some(self.smoke.params)
+            && self.smoke.applied != Some(self.smoke.effective())
         {
             self.spawn_smoke_render(ctx);
         }
@@ -4183,7 +4307,9 @@ impl App {
                 if let Some(p) = resp.interact_pointer_pos() {
                     if img.contains(p) {
                         if let Some(c) = self.smoke_color_at(to_norm(p)) {
-                            self.smoke.params.protect = Some(c);
+                            let mut v = self.smoke.effective();
+                            v.protect = Some(c);
+                            self.smoke.set_params(v);
                         }
                     }
                 }
@@ -4204,12 +4330,14 @@ impl App {
                 let sel = egui::Rect::from_two_pos(to_screen(from), to_screen(now));
                 paint_selection(ui, img, sel);
                 if resp.drag_stopped() {
-                    self.smoke.params.region = Some(dehaze::Region {
+                    let mut v = self.smoke.effective();
+                    v.region = Some(dehaze::Region {
                         x0: from.x,
                         y0: from.y,
                         x1: now.x,
                         y1: now.y,
                     });
+                    self.smoke.set_params(v);
                     self.smoke.drag_from = None;
                 }
             }
@@ -4217,7 +4345,7 @@ impl App {
 
         // 已設定的框：沒有在拖曳時持續顯示，讓使用者知道範圍在哪
         if self.smoke.drag_from.is_none() {
-            if let Some(r) = self.smoke.params.region {
+            if let Some(r) = self.smoke.effective().region {
                 let sel = egui::Rect::from_two_pos(
                     to_screen(egui::pos2(r.x0, r.y0)),
                     to_screen(egui::pos2(r.x1, r.y1)),
@@ -4244,6 +4372,7 @@ impl App {
         let mut pick = false;
         let mut save = false;
         let mut reset = false;
+        let mut goto: Option<usize> = None;
         // 尺寸依螢幕換算並設上限：預覽圖若照 available_height 展開，
         // 視窗會被撐到螢幕外、底下的滑桿與另存按鈕就看不到了
         let screen = ctx.screen_rect();
@@ -4262,14 +4391,39 @@ impl App {
             .default_pos(screen.center())
             .show(ctx, |ui| {
                 let busy = self.smoke.busy;
+                let total = self.smoke.photos.len();
+                let cur = self.smoke.cur;
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(busy == SmokeBusy::Idle, egui::Button::new("🖼  選擇照片"))
+                        .on_hover_text("可一次選多張，用同一組設定處理")
                         .clicked()
                     {
                         pick = true;
                     }
-                    if let Some(src) = &self.smoke.src {
+                    if total > 1 {
+                        ui.separator();
+                        // 多張時逐張切換確認效果（← → 方向鍵同樣可以切）
+                        let can = busy == SmokeBusy::Idle || busy == SmokeBusy::Loading;
+                        if ui
+                            .add_enabled(can && cur > 0, egui::Button::new("◀"))
+                            .clicked()
+                        {
+                            goto = Some(cur - 1);
+                        }
+                        ui.label(
+                            egui::RichText::new(format!("{} / {}", cur + 1, total))
+                                .size(12.0)
+                                .color(theme::TEXT),
+                        );
+                        if ui
+                            .add_enabled(can && cur + 1 < total, egui::Button::new("▶"))
+                            .clicked()
+                        {
+                            goto = Some(cur + 1);
+                        }
+                    }
+                    if let Some(src) = self.smoke.current() {
                         ui.label(
                             egui::RichText::new(
                                 src.file_name()
@@ -4278,6 +4432,19 @@ impl App {
                             )
                             .size(12.0)
                             .color(theme::TEXT_WEAK),
+                        );
+                    }
+                    // 這張有個別設定時明講，否則使用者會以為滑桿沒反應
+                    if self
+                        .smoke
+                        .current()
+                        .map(|p| self.smoke.overrides.contains_key(p))
+                        .unwrap_or(false)
+                    {
+                        ui.label(
+                            egui::RichText::new("🎨 個別設定")
+                                .size(11.0)
+                                .color(theme::ACCENT),
                         );
                     }
                 });
@@ -4297,7 +4464,7 @@ impl App {
                             egui::RichText::new(if busy == SmokeBusy::Loading {
                                 "照片載入中…"
                             } else {
-                                "選一張煙火照片，把煙霧散去、只留下煙火的線條"
+                                "選煙火照片（可多選），把煙霧散去、只留下煙火的線條"
                             })
                             .size(13.0)
                             .color(theme::TEXT_WEAK),
@@ -4310,8 +4477,9 @@ impl App {
                 // 底部控制列的高度先扣掉，其餘留給預覽。再夾一次上限：
                 // Window 內的 available_height 不一定有界，
                 // 只靠相減會讓預覽把控制列推出視窗
-                let has_region = self.smoke.params.region.is_some();
-                let has_protect = self.smoke.params.protect.is_some();
+                let eff = self.smoke.effective();
+                let has_region = eff.region.is_some();
+                let has_protect = eff.protect.is_some();
                 let ctrl_h =
                     206.0 + if has_region { 31.0 } else { 0.0 } + if has_protect { 31.0 } else { 0.0 };
                 let img_h = (ui.available_height() - ctrl_h).clamp(160.0, img_max_h);
@@ -4341,7 +4509,7 @@ impl App {
                 ui.add_space(8.0);
 
                 ui.add_enabled_ui(busy != SmokeBusy::Saving, |ui| {
-                    let mut p = self.smoke.params;
+                    let mut p = eff;
                     slider_row(ui, &mut p.strength, 0, 100, "去除");
                     slider_row(ui, &mut p.detail, 0, 100, "細節");
                     slider_row(ui, &mut p.black, 0, 100, "壓黑");
@@ -4351,8 +4519,8 @@ impl App {
                     if p.protect.is_some() {
                         slider_row(ui, &mut p.tolerance, 0, 100, "容差");
                     }
-                    if p != self.smoke.params {
-                        self.smoke.params = p;
+                    if p != eff {
+                        self.smoke.set_params(p);
                     }
                 });
                 ui.label(
@@ -4364,6 +4532,42 @@ impl App {
                 );
                 ui.add_space(6.0);
 
+                // 多張時的套用範圍：預設一起調，需要時只調目前這張
+                if total > 1 {
+                    ui.horizontal_wrapped(|ui| {
+                        let mut per = self.smoke.per_photo;
+                        if ui
+                            .checkbox(&mut per, "只調整這張")
+                            .on_hover_text("不勾＝改動套用到全部照片；勾起來只改目前這張")
+                            .changed()
+                        {
+                            self.smoke.per_photo = per;
+                        }
+                        if self
+                            .smoke
+                            .current()
+                            .map(|p| self.smoke.overrides.contains_key(p))
+                            .unwrap_or(false)
+                            && ui
+                                .small_button("↩ 這張改回共用設定")
+                                .clicked()
+                        {
+                            if let Some(p) = self.smoke.current().cloned() {
+                                self.smoke.overrides.remove(&p);
+                            }
+                        }
+                        let n = self.smoke.overrides.len();
+                        if n > 0 {
+                            ui.label(
+                                egui::RichText::new(format!("（{n} 張有個別設定）"))
+                                    .size(11.0)
+                                    .color(theme::TEXT_WEAK),
+                            );
+                        }
+                    });
+                    ui.add_space(6.0);
+                }
+
                 // 範圍控制：框選區塊、吸取保護色、遮色片預覽
                 ui.horizontal_wrapped(|ui| {
                     let picking = self.smoke.picking;
@@ -4374,7 +4578,7 @@ impl App {
                     {
                         self.smoke.picking = !picking;
                     }
-                    if let Some(c) = self.smoke.params.protect {
+                    if let Some(c) = eff.protect {
                         let (sw, _) = ui.allocate_exact_size(
                             egui::vec2(20.0, 16.0),
                             egui::Sense::hover(),
@@ -4385,13 +4589,17 @@ impl App {
                             egui::Color32::from_rgb(c[0], c[1], c[2]),
                         );
                         if ui.small_button("✕ 清除保護色").clicked() {
-                            self.smoke.params.protect = None;
+                            let mut v = eff;
+                            v.protect = None;
+                            self.smoke.set_params(v);
                         }
                     }
                     ui.separator();
-                    if self.smoke.params.region.is_some() {
+                    if eff.region.is_some() {
                         if ui.small_button("✕ 清除框選").clicked() {
-                            self.smoke.params.region = None;
+                            let mut v = eff;
+                            v.region = None;
+                            self.smoke.set_params(v);
                         }
                     } else {
                         ui.label(
@@ -4420,13 +4628,24 @@ impl App {
                         reset = true;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let label = if busy == SmokeBusy::Saving {
-                            "儲存中…"
+                        let saving = busy == SmokeBusy::Saving;
+                        let label = if saving {
+                            format!("儲存中… {}/{}", self.smoke.save_done, total)
+                        } else if total > 1 {
+                            format!("💾  全部另存（{total} 張）")
                         } else {
-                            "💾  另存新檔"
+                            "💾  另存新檔".to_string()
                         };
-                        if primary_button(ui, label, busy == SmokeBusy::Idle).clicked() {
+                        if primary_button(ui, &label, busy == SmokeBusy::Idle).clicked() {
                             save = true;
+                        }
+                        // 批次可能要跑上一陣子，給個中止的出口
+                        if saving {
+                            ui.add_space(6.0);
+                            if ui.small_button("✕ 取消").clicked() {
+                                self.smoke.save_cancel.store(true, Ordering::Relaxed);
+                            }
+                            ctx.request_repaint_after(Duration::from_millis(200));
                         }
                         if busy == SmokeBusy::Rendering {
                             ui.add_space(8.0);
@@ -4435,18 +4654,13 @@ impl App {
                             );
                         }
                         // 存檔完成的提示只留幾秒，不長期佔著版面
-                        if let Some((p, at)) = &self.smoke.saved {
+                        if let Some((msg, at)) = &self.smoke.saved {
                             if at.elapsed() < Duration::from_secs(8) {
                                 ui.add_space(8.0);
                                 ui.label(
-                                    egui::RichText::new(format!(
-                                        "✔ 已存為 {}",
-                                        p.file_name()
-                                            .map(|n| n.to_string_lossy().into_owned())
-                                            .unwrap_or_default()
-                                    ))
-                                    .size(11.5)
-                                    .color(theme::SUCCESS),
+                                    egui::RichText::new(format!("✔ {msg}"))
+                                        .size(11.5)
+                                        .color(theme::SUCCESS),
                                 );
                                 ctx.request_repaint_after(Duration::from_secs(1));
                             }
@@ -4455,14 +4669,32 @@ impl App {
                 });
             });
         self.smoke.open = open;
+        // 方向鍵切換照片（滑桿等元件有焦點時不搶，否則調整滑桿會跳張）
+        if goto.is_none()
+            && self.smoke.open
+            && self.smoke.photos.len() > 1
+            && self.smoke.busy == SmokeBusy::Idle
+            && ctx.memory(|m| m.focused().is_none())
+        {
+            let (cur, total) = (self.smoke.cur, self.smoke.photos.len());
+            if cur + 1 < total && ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                goto = Some(cur + 1);
+            } else if cur > 0 && ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+                goto = Some(cur - 1);
+            }
+        }
         if pick {
             self.smoke_pick_photo(ctx);
         }
+        if let Some(i) = goto {
+            self.smoke_select(i, ctx);
+        }
         if reset {
-            self.smoke.params = SmokeParams::default();
+            // 重設只還原目前編輯的那一份，不動到別張的個別設定
+            self.smoke.set_params(SmokeParams::default());
         }
         if save {
-            self.smoke_save_as(ctx);
+            self.smoke_save_all(ctx);
         }
     }
 
@@ -4705,8 +4937,9 @@ impl eframe::App for App {
             }
         }
 
-        // 左右方向鍵切換預覽（輸入框有焦點時不動作）
-        if !self.photos.is_empty() && ctx.memory(|m| m.focused().is_none()) {
+        // 左右方向鍵切換預覽（輸入框有焦點、或去煙視窗開著時不動作——
+        // 那邊的方向鍵是切換要去煙的照片）
+        if !self.photos.is_empty() && !self.smoke.open && ctx.memory(|m| m.focused().is_none()) {
             let cur = self.preview_selected.unwrap_or(0);
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) && cur + 1 < self.photos.len()
             {
