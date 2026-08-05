@@ -1001,6 +1001,12 @@ struct SmokeTool {
     picking: bool,
     /// 預覽改顯示遮色片（紅色蓋住的地方不會被去煙）
     show_mask: bool,
+    /// 縮圖列的貼圖快取。與主畫面的 thumbs 分開：那邊會依可視範圍
+    /// 淘汰、清空，共用會互相把對方的縮圖清掉
+    thumbs: HashMap<PathBuf, Thumb>,
+    thumb_rx: Option<Receiver<(PathBuf, Option<(u32, u32, Vec<u8>)>)>>,
+    /// 縮圖列要捲到目前這張（切張後才捲一次）
+    scroll_to_cur: bool,
 }
 
 impl Default for SmokeTool {
@@ -1025,6 +1031,9 @@ impl Default for SmokeTool {
             drag_from: None,
             picking: false,
             show_mask: false,
+            thumbs: HashMap::new(),
+            thumb_rx: None,
+            scroll_to_cur: false,
         }
     }
 }
@@ -4069,9 +4078,36 @@ impl App {
         self.smoke.photos = paths;
         self.smoke.cur = 0;
         self.smoke.overrides.clear();
+        self.smoke.thumbs.clear();
         self.smoke.error = None;
         self.smoke.saved = None;
         self.smoke_load_current(ctx);
+        self.spawn_smoke_thumbs(ctx);
+    }
+
+    /// 背景把整批照片的縮圖解碼出來餵給縮圖列。
+    /// 去煙一次處理的張數有限，直接全部排進去，不做可視範圍的按需載入
+    fn spawn_smoke_thumbs(&mut self, ctx: &egui::Context) {
+        let paths = self.smoke.photos.clone();
+        if paths.len() < 2 {
+            return;
+        }
+        for p in &paths {
+            self.smoke.thumbs.insert(p.clone(), Thumb::Loading);
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.smoke.thumb_rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            for p in paths {
+                let r = decode_thumbnail(&p);
+                // 收端關掉（使用者又換了一批）就不用再解碼下去
+                if tx.send((p, r)).is_err() {
+                    return;
+                }
+                ctx.request_repaint();
+            }
+        });
     }
 
     /// 載入目前這張的預覽底圖
@@ -4116,6 +4152,7 @@ impl App {
             return;
         }
         self.smoke.cur = i;
+        self.smoke.scroll_to_cur = true;
         self.smoke_load_current(ctx);
     }
 
@@ -4212,6 +4249,44 @@ impl App {
     }
 
     fn poll_smoke(&mut self, ctx: &egui::Context) {
+        // 縮圖：一幀最多上傳幾張，避免整批同時上傳造成掉幀
+        if self.smoke.thumb_rx.is_some() {
+            const MAX_UPLOADS_PER_FRAME: usize = 8;
+            let mut uploaded = 0;
+            while uploaded < MAX_UPLOADS_PER_FRAME {
+                let Some(rx) = &self.smoke.thumb_rx else { break };
+                match rx.try_recv() {
+                    Ok((path, res)) => {
+                        // 已換過一批照片時，遲到的結果直接丟掉
+                        if !matches!(self.smoke.thumbs.get(&path), Some(Thumb::Loading)) {
+                            continue;
+                        }
+                        let state = match res {
+                            Some((w, h, rgb)) => {
+                                uploaded += 1;
+                                let img =
+                                    egui::ColorImage::from_rgb([w as usize, h as usize], &rgb);
+                                Thumb::Ready(ctx.load_texture(
+                                    format!("smoke_thumb:{}", path.display()),
+                                    img,
+                                    Default::default(),
+                                ))
+                            }
+                            None => Thumb::Failed,
+                        };
+                        self.smoke.thumbs.insert(path, state);
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.smoke.thumb_rx = None;
+                        break;
+                    }
+                }
+            }
+            if uploaded == MAX_UPLOADS_PER_FRAME {
+                ctx.request_repaint();
+            }
+        }
         if self.smoke.rx.is_some() {
             loop {
                 let Some(rx) = &self.smoke.rx else { break };
@@ -4403,25 +4478,11 @@ impl App {
                     }
                     if total > 1 {
                         ui.separator();
-                        // 多張時逐張切換確認效果（← → 方向鍵同樣可以切）
-                        let can = busy == SmokeBusy::Idle || busy == SmokeBusy::Loading;
-                        if ui
-                            .add_enabled(can && cur > 0, egui::Button::new("◀"))
-                            .clicked()
-                        {
-                            goto = Some(cur - 1);
-                        }
                         ui.label(
                             egui::RichText::new(format!("{} / {}", cur + 1, total))
                                 .size(12.0)
                                 .color(theme::TEXT),
                         );
-                        if ui
-                            .add_enabled(can && cur + 1 < total, egui::Button::new("▶"))
-                            .clicked()
-                        {
-                            goto = Some(cur + 1);
-                        }
                     }
                     if let Some(src) = self.smoke.current() {
                         ui.label(
@@ -4480,8 +4541,11 @@ impl App {
                 let eff = self.smoke.effective();
                 let has_region = eff.region.is_some();
                 let has_protect = eff.protect.is_some();
-                let ctrl_h =
-                    206.0 + if has_region { 31.0 } else { 0.0 } + if has_protect { 31.0 } else { 0.0 };
+                let film_h = if total > 1 { 100.0 } else { 0.0 };
+                let ctrl_h = 206.0
+                    + film_h
+                    + if has_region { 31.0 } else { 0.0 }
+                    + if has_protect { 31.0 } else { 0.0 };
                 let img_h = (ui.available_height() - ctrl_h).clamp(160.0, img_max_h);
                 // 影像區要接收拖曳（框選）與點擊（吸取保護色）
                 let (rect, resp) = ui.allocate_exact_size(
@@ -4507,6 +4571,45 @@ impl App {
                     self.ui_smoke_canvas_interaction(ui, &resp, r);
                 }
                 ui.add_space(8.0);
+
+                // 縮圖列：跟主畫面一樣點縮圖切換，有個別設定的標 🎨
+                if total > 1 {
+                    let scroll_to = self.smoke.scroll_to_cur;
+                    self.smoke.scroll_to_cur = false;
+                    egui::ScrollArea::horizontal()
+                        .id_salt("smoke_film")
+                        .max_height(film_h - 8.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                for i in 0..total {
+                                    let p = &self.smoke.photos[i];
+                                    let st = self.smoke.thumbs.get(p);
+                                    let tex = match st {
+                                        Some(Thumb::Ready(t)) => Some(t),
+                                        _ => None,
+                                    };
+                                    let r = thumb_item(
+                                        ui,
+                                        tex,
+                                        i,
+                                        i == cur,
+                                        false,
+                                        false,
+                                        self.smoke.overrides.contains_key(p),
+                                        matches!(st, Some(Thumb::Failed)),
+                                    );
+                                    if r.clicked() {
+                                        goto = Some(i);
+                                    }
+                                    // 用方向鍵切張時把縮圖列捲到看得到的位置
+                                    if scroll_to && i == cur {
+                                        r.scroll_to_me(Some(egui::Align::Center));
+                                    }
+                                }
+                            });
+                        });
+                    ui.add_space(6.0);
+                }
 
                 ui.add_enabled_ui(busy != SmokeBusy::Saving, |ui| {
                     let mut p = eff;
