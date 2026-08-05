@@ -26,23 +26,26 @@ fn main() {
             y1: v[3],
         })
     });
-    // 保護色以環境變數帶入：SMOKE_PROTECT=r,g,b（0~255）、SMOKE_TOL=容差
-    let protect = std::env::var("SMOKE_PROTECT").ok().and_then(|s| {
-        let v: Vec<u8> = s.split(',').filter_map(|t| t.trim().parse().ok()).collect();
-        (v.len() == 3).then(|| [v[0], v[1], v[2]])
-    });
-    let p = dehaze::SmokeParams {
+    let mut p = dehaze::SmokeParams {
         strength: a.get(3).and_then(|s| s.parse().ok()).unwrap_or(80),
         detail: a.get(4).and_then(|s| s.parse().ok()).unwrap_or(60),
         black: a.get(5).and_then(|s| s.parse().ok()).unwrap_or(30),
         region,
-        protect,
         tolerance: std::env::var("SMOKE_TOL")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(30),
         ..Default::default()
     };
+    // 保護色以環境變數帶入：SMOKE_PROTECT=r,g,b[;r,g,b…]（0~255）、SMOKE_TOL=容差
+    if let Ok(s) = std::env::var("SMOKE_PROTECT") {
+        for one in s.split(';') {
+            let v: Vec<u8> = one.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+            if v.len() == 3 {
+                p.add_protect([v[0], v[1], v[2]]);
+            }
+        }
+    }
     let t0 = std::time::Instant::now();
     let img = image::open(&a[1]).expect("讀取失敗").to_rgb8();
     println!("輸入 {}x{}，參數 {:?}", img.width(), img.height(), p);

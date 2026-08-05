@@ -61,12 +61,15 @@ pub struct SmokeParams {
     /// 區塊邊緣的羽化寬度 0~100（相對於區塊短邊的比例）。
     /// 邊界硬切會在畫面上留下一條看得出來的接縫
     pub feather: i32,
-    /// 保護色（sRGB）：與它相近的像素不去煙，用來留住不想被扣掉的顏色；
-    /// None＝不做顏色保護
-    pub protect: Option<[u8; 3]>,
+    /// 保護色（sRGB）：與其中任一色相近的像素都不去煙，用來留住不想被扣掉的顏色。
+    /// 固定長度是為了讓參數維持 Copy；全為 None＝不做顏色保護
+    pub protect: [Option<[u8; 3]>; MAX_PROTECT],
     /// 保護色的容許範圍 0~100：越大則越多相近的顏色一起被保護
     pub tolerance: i32,
 }
+
+/// 最多可以指定幾個保護色
+pub const MAX_PROTECT: usize = 6;
 
 impl Default for SmokeParams {
     fn default() -> Self {
@@ -76,7 +79,7 @@ impl Default for SmokeParams {
             black: 30,
             region: None,
             feather: 25,
-            protect: None,
+            protect: [None; MAX_PROTECT],
             tolerance: 30,
         }
     }
@@ -98,6 +101,47 @@ impl SmokeParams {
 
     pub fn is_neutral(&self) -> bool {
         self.strength <= 0
+    }
+
+    // 以下幾個是給 GUI 用的，smoke_cli 只會用到 add_protect
+    /// 目前設定的保護色（依加入順序）
+    #[allow(dead_code)]
+    pub fn protect_colors(&self) -> impl Iterator<Item = (usize, [u8; 3])> + '_ {
+        self.protect
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| c.map(|c| (i, c)))
+    }
+
+    #[allow(dead_code)]
+    pub fn has_protect(&self) -> bool {
+        self.protect.iter().any(Option::is_some)
+    }
+
+    /// 加一個保護色；已經滿了或已存在同色則回傳 false
+    pub fn add_protect(&mut self, c: [u8; 3]) -> bool {
+        if self.protect.contains(&Some(c)) {
+            return false;
+        }
+        match self.protect.iter_mut().find(|s| s.is_none()) {
+            Some(slot) => {
+                *slot = Some(c);
+                true
+            }
+            None => false,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn remove_protect(&mut self, i: usize) {
+        if let Some(slot) = self.protect.get_mut(i) {
+            *slot = None;
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn clear_protect(&mut self) {
+        self.protect = [None; MAX_PROTECT];
     }
 }
 
@@ -448,50 +492,67 @@ impl RegionMask {
     }
 }
 
-/// 顏色保護：和指定顏色夠接近的像素不去煙，
+/// 顏色保護：和任一個指定顏色夠接近的像素都不去煙，
 /// 相當於 Photoshop 依「顏色範圍」建出來的遮色片。
 struct ColorProtect {
-    /// 保護色與容許距離的內外界；None＝不保護任何顏色
-    key: Option<([f32; 3], f32, f32)>,
+    /// 保護色（正規化 sRGB）；空的代表不保護任何顏色
+    keys: Vec<[f32; 3]>,
+    /// 容許距離的內外界
+    t0: f32,
+    t1: f32,
 }
 
 impl ColorProtect {
-    fn new(protect: Option<[u8; 3]>, tolerance: i32) -> Self {
-        let key = protect.map(|c| {
-            let rgb = [
-                c[0] as f32 / 255.0,
-                c[1] as f32 / 255.0,
-                c[2] as f32 / 255.0,
-            ];
-            // 距離在 sRGB 空間量（與眼睛看到的「顏色像不像」較接近，
-            // 也和 Photoshop 的顏色範圍一致）；最大距離為 √3，正規化到 0~1
-            let t1 = tolerance as f32 / 100.0 * 0.9;
-            (rgb, t1 * 0.6, t1)
-        });
-        Self { key }
+    fn new(protect: &[Option<[u8; 3]>; MAX_PROTECT], tolerance: i32) -> Self {
+        let keys = protect
+            .iter()
+            .flatten()
+            .map(|c| {
+                [
+                    c[0] as f32 / 255.0,
+                    c[1] as f32 / 255.0,
+                    c[2] as f32 / 255.0,
+                ]
+            })
+            .collect();
+        // 距離在 sRGB 空間量（與眼睛看到的「顏色像不像」較接近，
+        // 也和 Photoshop 的顏色範圍一致）；最大距離為 √3，正規化到 0~1
+        let t1 = tolerance as f32 / 100.0 * 0.9;
+        Self {
+            keys,
+            t0: t1 * 0.6,
+            t1,
+        }
     }
 
-    /// 回傳這個像素「要去煙的比例」：完全命中保護色為 0，離得夠遠為 1
+    /// 回傳這個像素「要去煙的比例」：完全命中任一保護色為 0，離每個都夠遠為 1
     fn at(&self, src: &Rgb<u8>) -> f32 {
-        let Some((key, t0, t1)) = self.key else {
+        if self.keys.is_empty() {
             return 1.0;
-        };
-        let d = (0..3)
-            .map(|c| {
-                let v = src[c] as f32 / 255.0 - key[c];
-                v * v
-            })
-            .sum::<f32>()
-            .sqrt()
-            / 3f32.sqrt();
-        if d <= t0 {
+        }
+        // 取離最近的那個保護色的距離：命中任一色就該被保護
+        let mut d = f32::INFINITY;
+        for key in &self.keys {
+            let dist = (0..3)
+                .map(|c| {
+                    let v = src[c] as f32 / 255.0 - key[c];
+                    v * v
+                })
+                .sum::<f32>()
+                .sqrt()
+                / 3f32.sqrt();
+            if dist < d {
+                d = dist;
+            }
+        }
+        if d <= self.t0 {
             return 0.0;
         }
-        if d >= t1 || t1 <= t0 {
+        if d >= self.t1 || self.t1 <= self.t0 {
             return 1.0;
         }
         // 邊界平滑，避免保護區外圍出現鋸齒狀的硬邊
-        let t = (d - t0) / (t1 - t0);
+        let t = (d - self.t0) / (self.t1 - self.t0);
         t * t * (3.0 - 2.0 * t)
     }
 }
@@ -502,7 +563,7 @@ pub fn mask_overlay(img: &RgbImage, params: SmokeParams) -> RgbImage {
     let p = params.clamped();
     let (fw, fh) = (img.width() as usize, img.height() as usize);
     let mask = RegionMask::new(p.region, p.feather, fw, fh);
-    let protect = ColorProtect::new(p.protect, p.tolerance);
+    let protect = ColorProtect::new(&p.protect, p.tolerance);
     let mut out = img.clone();
     for y in 0..fh {
         for x in 0..fw {
@@ -539,7 +600,7 @@ pub fn remove_smoke(img: &RgbImage, params: SmokeParams) -> RgbImage {
     let k = p.strength as f32 / 100.0 * 1.6;
     let blk = p.black as f32 / 100.0;
     let mask = RegionMask::new(p.region, p.feather, fw, fh);
-    let protect = ColorProtect::new(p.protect, p.tolerance);
+    let protect = ColorProtect::new(&p.protect, p.tolerance);
     let mut out = RgbImage::new(fw as u32, fh as u32);
     for y in 0..fh {
         for x in 0..fw {
@@ -786,28 +847,78 @@ mod tests {
                 img.put_pixel(x, y, Rgb(keep));
             }
         }
-        let p = SmokeParams {
+        let mut p = SmokeParams {
             strength: 100,
-            protect: Some(keep),
             tolerance: 20,
             ..Default::default()
         };
+        assert!(p.add_protect(keep));
         let out = remove_smoke(&img, p);
         assert_eq!(out.get_pixel(40, 40).0, keep, "保護色被扣掉了");
         // 保護色以外的煙霧照樣要被扣掉
         assert!(out.get_pixel(2, 2).0[2] < 170, "保護色以外沒有去煙");
     }
 
+    /// 指定多個保護色時，每一個都要生效
+    #[test]
+    fn every_protected_colour_survives() {
+        let keeps = [[40, 200, 210], [230, 90, 40], [90, 240, 110]];
+        let mut img = solid(160, 60, [120, 100, 170]);
+        // 三塊各自塗上一個要保住的顏色
+        for (k, c) in keeps.iter().enumerate() {
+            for y in 20..40 {
+                for x in (k as u32 * 50 + 10)..(k as u32 * 50 + 40) {
+                    img.put_pixel(x, y, Rgb(*c));
+                }
+            }
+        }
+        let mut p = SmokeParams {
+            strength: 100,
+            tolerance: 20,
+            ..Default::default()
+        };
+        for c in &keeps {
+            assert!(p.add_protect(*c));
+        }
+        let out = remove_smoke(&img, p);
+        for (k, c) in keeps.iter().enumerate() {
+            assert_eq!(
+                out.get_pixel(k as u32 * 50 + 25, 30).0,
+                *c,
+                "第 {k} 個保護色被扣掉了"
+            );
+        }
+        assert!(out.get_pixel(2, 2).0[2] < 170, "保護色以外沒有去煙");
+    }
+
+    /// 保護色有數量上限，重複的顏色不重複佔位
+    #[test]
+    fn protect_list_rejects_duplicates_and_overflow() {
+        let mut p = SmokeParams::default();
+        assert!(p.add_protect([10, 20, 30]));
+        assert!(!p.add_protect([10, 20, 30]), "同色不該重複加入");
+        for i in 1..MAX_PROTECT {
+            assert!(p.add_protect([i as u8, 0, 0]));
+        }
+        assert!(!p.add_protect([9, 9, 9]), "滿了還能再加");
+        assert_eq!(p.protect_colors().count(), MAX_PROTECT);
+        p.remove_protect(0);
+        assert_eq!(p.protect_colors().count(), MAX_PROTECT - 1);
+        assert!(p.add_protect([9, 9, 9]), "移除後空出來的位置沒被用到");
+        p.clear_protect();
+        assert!(!p.has_protect());
+    }
+
     /// 容差 0 時只有幾乎完全同色才受保護，不會整張都不處理
     #[test]
     fn zero_tolerance_barely_protects_anything() {
         let img = solid(64, 64, [120, 100, 170]);
-        let p = SmokeParams {
+        let mut p = SmokeParams {
             strength: 100,
-            protect: Some([40, 200, 210]),
             tolerance: 0,
             ..Default::default()
         };
+        p.add_protect([40, 200, 210]);
         let out = remove_smoke(&img, p);
         let brightest = out.pixels().map(|p| p.0.iter().copied().max().unwrap()).max();
         assert_eq!(brightest, Some(0), "與保護色差很遠卻沒被去煙");
