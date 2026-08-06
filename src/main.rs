@@ -1011,6 +1011,8 @@ struct SmokeTool {
     vis_range: Option<(usize, usize)>,
     /// 縮圖列要捲到目前這張（切張後才捲一次）
     scroll_to_cur: bool,
+    /// 「天空」區塊是否展開（清雲與夜空上色，預設收合不佔版面）
+    sky_open: bool,
 }
 
 impl Default for SmokeTool {
@@ -1038,6 +1040,7 @@ impl Default for SmokeTool {
             thumbs: HashMap::new(),
             vis_range: None,
             scroll_to_cur: false,
+            sky_open: false,
         }
     }
 }
@@ -4545,8 +4548,21 @@ impl App {
                 let has_region = eff.region.is_some();
                 let has_protect = eff.has_protect();
                 let film_h = if total > 1 { 100.0 } else { 0.0 };
+                // 「天空」區塊展開時佔的高度：標題＋雲朵滑桿＋色票列＋說明，
+                // 範圍與上色兩條滑桿依條件才出現
+                let sky_h = if self.smoke.sky_open {
+                    24.0
+                        + 31.0
+                        + 26.0
+                        + 20.0
+                        + if eff.sky_clean > 0 || eff.sky_color.is_some() { 31.0 } else { 0.0 }
+                        + if eff.sky_color.is_some() { 31.0 } else { 0.0 }
+                } else {
+                    24.0
+                };
                 let ctrl_h = 206.0
                     + film_h
+                    + sky_h
                     + if has_region { 31.0 } else { 0.0 }
                     + if has_protect { 31.0 } else { 0.0 };
                 let img_h = (ui.available_height() - ctrl_h).clamp(160.0, img_max_h);
@@ -4663,6 +4679,61 @@ impl App {
                     .color(theme::TEXT_WEAK),
                 );
                 ui.add_space(6.0);
+
+                // 天空：清掉雲朵、換夜空顏色。預設收合，不佔掉預覽的版面
+                section_toggle(ui, "天空", &mut self.smoke.sky_open);
+                if self.smoke.sky_open {
+                    ui.add_enabled_ui(busy != SmokeBusy::Saving, |ui| {
+                        let mut p = eff;
+                        slider_row(ui, &mut p.sky_clean, 0, 100, "雲朵");
+                        if p.sky_clean > 0 || p.sky_color.is_some() {
+                            slider_row(ui, &mut p.sky_range, 0, 100, "範圍");
+                        }
+                        ui.horizontal(|ui| {
+                            let (lb, _) = ui.allocate_exact_size(
+                                egui::vec2(30.0, 18.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().text(
+                                lb.left_center(),
+                                egui::Align2::LEFT_CENTER,
+                                "夜空",
+                                egui::FontId::proportional(12.5),
+                                theme::TEXT_WEAK,
+                            );
+                            // 沒設過色時給一個深藍當起點，比從純黑開始好調
+                            let mut c = p.sky_color.unwrap_or([22, 42, 100]);
+                            if ui.color_edit_button_srgb(&mut c).changed() {
+                                p.sky_color = Some(c);
+                            }
+                            if p.sky_color.is_some() {
+                                if ui.small_button("✕ 不改色").clicked() {
+                                    p.sky_color = None;
+                                }
+                            } else {
+                                ui.label(
+                                    egui::RichText::new("點色塊挑一個夜空顏色")
+                                        .size(11.0)
+                                        .color(theme::TEXT_WEAK),
+                                );
+                            }
+                        });
+                        if p.sky_color.is_some() {
+                            slider_row(ui, &mut p.sky_tint, 0, 100, "上色");
+                        }
+                        if p != eff {
+                            self.smoke.set_params(p);
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "雲朵＝把天空裡沒有紋理的暗面壓回夜色 · 範圍＝多亮的雲也算天空 · 水面與地面不受影響",
+                        )
+                        .size(11.0)
+                        .color(theme::TEXT_WEAK),
+                    );
+                    ui.add_space(6.0);
+                }
 
                 // 多張時的套用範圍：預設一起調，需要時只調目前這張
                 if total > 1 {

@@ -46,6 +46,23 @@ fn main() {
             }
         }
     }
+    // 天空：SMOKE_CLEAN=清雲強度、SMOKE_RANGE=判定範圍、
+    // SMOKE_SKY=r,g,b 夜空色、SMOKE_SKYTINT=上色強度
+    if let Ok(v) = std::env::var("SMOKE_CLEAN") {
+        p.sky_clean = v.parse().unwrap_or(0);
+    }
+    if let Ok(v) = std::env::var("SMOKE_RANGE") {
+        p.sky_range = v.parse().unwrap_or(40);
+    }
+    if let Ok(s) = std::env::var("SMOKE_SKY") {
+        let v: Vec<u8> = s.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+        if v.len() == 3 {
+            p.sky_color = Some([v[0], v[1], v[2]]);
+        }
+    }
+    if let Ok(v) = std::env::var("SMOKE_SKYTINT") {
+        p.sky_tint = v.parse().unwrap_or(60);
+    }
     let t0 = std::time::Instant::now();
     let img = image::open(&a[1]).expect("讀取失敗").to_rgb8();
     println!("輸入 {}x{}，參數 {:?}", img.width(), img.height(), p);
@@ -53,6 +70,12 @@ fn main() {
         let (layer, air) = dehaze::debug_smoke_layer(&img, p);
         println!("煙霧最濃處（線性 RGB）＝{air:?}");
         tm_save(&layer, &a[2]);
+    }
+    if std::env::var("SMOKE_SKYMASK").is_ok() {
+        let m = dehaze::debug_sky_mask(&img, p);
+        let path = a[2].replace(".jpg", "_sky.jpg");
+        m.save(&path).expect("寫出失敗");
+        println!("天空遮罩 → {path}");
     }
     let out = if std::env::var("SMOKE_MASK").is_ok() {
         // 遮色片檢視：紅色蓋住的地方不會被去煙

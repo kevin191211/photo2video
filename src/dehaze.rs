@@ -66,6 +66,14 @@ pub struct SmokeParams {
     pub protect: [Option<[u8; 3]>; MAX_PROTECT],
     /// 保護色的容許範圍 0~100：越大則越多相近的顏色一起被保護
     pub tolerance: i32,
+    /// 雲朵清除 0~100：把天空裡沒有紋理的暗面（雲、殘餘輝光）壓回乾淨的夜色
+    pub sky_clean: i32,
+    /// 天空判定的亮度範圍 0~100：越大則越亮的雲也會被認定成天空
+    pub sky_range: i32,
+    /// 夜空顏色；None＝維持原本的色調
+    pub sky_color: Option<[u8; 3]>,
+    /// 夜空上色強度 0~100
+    pub sky_tint: i32,
 }
 
 /// 最多可以指定幾個保護色
@@ -81,6 +89,10 @@ impl Default for SmokeParams {
             feather: 25,
             protect: [None; MAX_PROTECT],
             tolerance: 30,
+            sky_clean: 0,
+            sky_range: 40,
+            sky_color: None,
+            sky_tint: 60,
         }
     }
 }
@@ -92,6 +104,9 @@ impl SmokeParams {
         self.black = self.black.clamp(0, 100);
         self.feather = self.feather.clamp(0, 100);
         self.tolerance = self.tolerance.clamp(0, 100);
+        self.sky_clean = self.sky_clean.clamp(0, 100);
+        self.sky_range = self.sky_range.clamp(0, 100);
+        self.sky_tint = self.sky_tint.clamp(0, 100);
         self.region = self
             .region
             .map(Region::normalized)
@@ -99,8 +114,14 @@ impl SmokeParams {
         self
     }
 
+    /// 完全沒有要動到影像（去煙、清雲、夜空上色都關著）
     pub fn is_neutral(&self) -> bool {
-        self.strength <= 0
+        self.strength <= 0 && !self.touches_sky()
+    }
+
+    /// 有沒有要動天空（清雲或上色）
+    fn touches_sky(&self) -> bool {
+        self.sky_clean > 0 || (self.sky_color.is_some() && self.sky_tint > 0)
     }
 
     // 以下幾個是給 GUI 用的，smoke_cli 只會用到 add_protect
@@ -557,6 +578,86 @@ impl ColorProtect {
     }
 }
 
+/// 天空遮罩：夜空與雲朵都是「沒有紋理的暗面」，
+/// 煙火的線條、地景的燈火與建物則有明顯的高頻細節。
+/// 兩個條件相乘就分得出哪裡是天空，雲不必被單獨辨識出來——
+/// 它本來就是天空裡比較亮的那一塊，跟著一起壓掉就是「去雲」。
+fn sky_mask(lin: &[[f32; 3]], fw: usize, fh: usize, range: i32) -> Plane {
+    let long = fw.max(fh) as f32;
+    let mut y = Plane::new(fw, fh);
+    for (i, c) in lin.iter().enumerate() {
+        y.d[i] = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    }
+    // 高頻細節＝與「很小範圍」的平均的落差。半徑只取長邊的 0.15%，
+    // 大半徑會把雲本身的起伏也算成細節，雲就永遠不會被判定成天空
+    let r_hi = ((long * 0.0015).round() as usize).clamp(1, 6);
+    let blur_hi = box_mean(&y, r_hi);
+    let mut detail = Plane::new(fw, fh);
+    for i in 0..fw * fh {
+        detail.d[i] = (y.d[i] - blur_hi.d[i]).abs();
+    }
+    // 用平均而非最大值——最大值會讓單顆雜訊點汙染整個鄰域，
+    // 並在遮罩上留下方形結構元素的塊狀痕跡
+    let r_area = ((long * 0.01).round() as usize).clamp(4, 40);
+    // 這一帶整體的紋理與亮度（煙火簇、岸邊地景、水面倒影都偏高）
+    let detail_area = box_mean(&detail, r_area);
+    let blur_lo = box_mean(&y, r_area);
+    // 這個點本身的細節
+    let detail_pt = box_mean(&detail, r_hi);
+
+    // range 同時放寬亮度與紋理門檻：調高則更亮、更有紋理的雲也算天空
+    let rr = range as f32 / 100.0;
+    let y1 = 0.004 + rr * 0.14;
+    let y0 = y1 * 0.3;
+    let da1 = 0.0004 + rr * 0.0035;
+    let da0 = da1 * 0.25;
+    let dp1 = 0.002 + rr * 0.012;
+    let dp0 = dp1 * 0.25;
+
+    // 第一層：這「一帶」是不是天空。用區域統計判斷，
+    // 煙火簇、岸邊地景與水面倒影都會因為紋理或亮度被排除
+    let mut area = Plane::new(fw, fh);
+    for i in 0..fw * fh {
+        let dark = 1.0 - smoothstep(y0, y1, blur_lo.d[i]);
+        let flat = 1.0 - smoothstep(da0, da1, detail_area.d[i]);
+        area.d[i] = dark * flat;
+    }
+    // 從畫面上緣往下傳播：只有「從天空一路連過來」的區域才算天空。
+    // 水面同樣暗而平坦，但被岸邊地景與船隻的燈火隔開，傳不過去，
+    // 否則清雲會把照片下半部的水面一起壓黑
+    for y in 1..fh {
+        for x in 0..fw {
+            let lo = x.saturating_sub(1);
+            let hi = (x + 1).min(fw - 1);
+            let above = (lo..=hi).fold(0.0f32, |a, xx| a.max(area.d[(y - 1) * fw + xx]));
+            area.d[y * fw + x] *= above;
+        }
+    }
+    // 往外擴張再平滑：區域統計會讓煙火簇的影響範圍比簇本身大一圈，
+    // 不補回來的話簇周圍會留下一道沒被處理的黑邊，看起來像貼上去的。
+    // 擴張進來的部分安不安全，由下面的逐像素條件把關
+    let area = box_mean(&max_filter(&area, r_area), r_area);
+
+    // 第二層：逐像素把關。即使身處天空，也只動本身又暗又平坦的點——
+    // 煙火的線條與星點就是這樣保住的，而線條之間的空隙仍然算天空
+    let mut m = Plane::new(fw, fh);
+    for i in 0..fw * fh {
+        let dark_pt = 1.0 - smoothstep(y0, y1, blur_hi.d[i]);
+        let flat_pt = 1.0 - smoothstep(dp0, dp1, detail_pt.d[i]);
+        m.d[i] = area.d[i] * dark_pt * flat_pt;
+    }
+    // 遮罩本身再平滑一次，邊界才不會出現硬切的塊狀
+    box_mean(&m, r_hi * 2)
+}
+
+fn smoothstep(e0: f32, e1: f32, v: f32) -> f32 {
+    if e1 <= e0 {
+        return if v >= e1 { 1.0 } else { 0.0 };
+    }
+    let t = ((v - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 /// 遮色片預覽：把「不會去煙」的區域疊上紅色，
 /// 讓使用者看得到框選範圍與顏色保護實際蓋住哪裡（比照 Photoshop 的快速遮色片）
 pub fn mask_overlay(img: &RgbImage, params: SmokeParams) -> RgbImage {
@@ -582,6 +683,22 @@ pub fn mask_overlay(img: &RgbImage, params: SmokeParams) -> RgbImage {
     out
 }
 
+/// 診斷用（smoke_cli）：把天空遮罩輸出成灰階影像（白＝判定為天空）
+#[allow(dead_code)]
+pub fn debug_sky_mask(img: &RgbImage, params: SmokeParams) -> RgbImage {
+    let p = params.clamped();
+    let (fw, fh) = (img.width() as usize, img.height() as usize);
+    // 天空判定是在去煙後的影像上做的，診斷也要走同一條路才看得準
+    let (buf, _) = dehaze_to_linear(img, p);
+    let sky = sky_mask(&buf, fw, fh, p.sky_range);
+    let mut out = RgbImage::new(fw as u32, fh as u32);
+    for (i, px) in out.pixels_mut().enumerate() {
+        let v = (sky.d[i].clamp(0.0, 1.0) * 255.0) as u8;
+        *px = Rgb([v, v, v]);
+    }
+    out
+}
+
 /// 移除照片中的煙霧，保留煙火細節
 pub fn remove_smoke(img: &RgbImage, params: SmokeParams) -> RgbImage {
     let p = params.clamped();
@@ -589,8 +706,34 @@ pub fn remove_smoke(img: &RgbImage, params: SmokeParams) -> RgbImage {
         return img.clone();
     }
     let (fw, fh) = (img.width() as usize, img.height() as usize);
+    let (mut buf, weight) = dehaze_to_linear(img, p);
+
+    if p.touches_sky() {
+        apply_sky(&mut buf, &weight, fw, fh, p);
+    }
+
+    let mut out = RgbImage::new(fw as u32, fh as u32);
+    for (i, px) in out.pixels_mut().enumerate() {
+        *px = Rgb([
+            (linear_to_srgb(buf[i][0].min(1.0)) * 255.0).round().clamp(0.0, 255.0) as u8,
+            (linear_to_srgb(buf[i][1].min(1.0)) * 255.0).round().clamp(0.0, 255.0) as u8,
+            (linear_to_srgb(buf[i][2].min(1.0)) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ]);
+    }
+    out
+}
+
+/// 去煙的主體：回傳線性光的結果，以及每個像素的作用權重
+/// （框選範圍外與命中保護色處為 0，天空處理要沿用同一份權重）
+fn dehaze_to_linear(img: &RgbImage, p: SmokeParams) -> (Vec<[f32; 3]>, Vec<f32>) {
+    let (fw, fh) = (img.width() as usize, img.height() as usize);
     let lut = srgb_lut();
-    let smoke = estimate_smoke(img, p, &lut);
+    // 只想清雲或改夜空色時強度會是 0，這時不必花時間估煙霧層
+    let smoke = if p.strength > 0 {
+        estimate_smoke(img, p, &lut)
+    } else {
+        Vec::new()
+    };
 
     // --- 4. 相減：J = I − k·S ---
     // 煙霧散射光是加性的，直接扣掉即可；煙火線條的亮度是自身發光，
@@ -601,15 +744,23 @@ pub fn remove_smoke(img: &RgbImage, params: SmokeParams) -> RgbImage {
     let blk = p.black as f32 / 100.0;
     let mask = RegionMask::new(p.region, p.feather, fw, fh);
     let protect = ColorProtect::new(&p.protect, p.tolerance);
-    let mut out = RgbImage::new(fw as u32, fh as u32);
+    // 結果先留在線性空間：天空處理要在這上面做，最後才一次轉回 sRGB
+    let mut buf: Vec<[f32; 3]> = vec![[0.0; 3]; fw * fh];
+    // 每個像素的作用權重，天空處理要沿用（框外與保護色一樣不能動）
+    let mut weight: Vec<f32> = vec![0.0; fw * fh];
     for y in 0..fh {
         for x in 0..fw {
             let src = img.get_pixel(x as u32, y as u32);
             // 框選範圍外、或命中保護色的像素完全不動，
             // 省下整段運算也保證原樣輸出
             let w = mask.at(x, y) * protect.at(src);
+            weight[y * fw + x] = w;
             if w <= 0.0 {
-                out.put_pixel(x as u32, y as u32, *src);
+                buf[y * fw + x] = [
+                    lut[src[0] as usize],
+                    lut[src[1] as usize],
+                    lut[src[2] as usize],
+                ];
                 continue;
             }
             let k = k * w;
@@ -618,11 +769,15 @@ pub fn remove_smoke(img: &RgbImage, params: SmokeParams) -> RgbImage {
                 lut[src[1] as usize],
                 lut[src[2] as usize],
             ];
-            let s = [
-                smoke[0].d[y * fw + x],
-                smoke[1].d[y * fw + x],
-                smoke[2].d[y * fw + x],
-            ];
+            let s = if smoke.is_empty() {
+                [0.0; 3]
+            } else {
+                [
+                    smoke[0].d[y * fw + x],
+                    smoke[1].d[y * fw + x],
+                    smoke[2].d[y * fw + x],
+                ]
+            };
 
             let mut rgb = [0.0f32; 3];
             for c in 0..3 {
@@ -671,15 +826,57 @@ pub fn remove_smoke(img: &RgbImage, params: SmokeParams) -> RgbImage {
                     }
                 }
             }
-            let px = out.get_pixel_mut(x as u32, y as u32);
-            *px = Rgb([
-                (linear_to_srgb(rgb[0].min(1.0)) * 255.0).round().clamp(0.0, 255.0) as u8,
-                (linear_to_srgb(rgb[1].min(1.0)) * 255.0).round().clamp(0.0, 255.0) as u8,
-                (linear_to_srgb(rgb[2].min(1.0)) * 255.0).round().clamp(0.0, 255.0) as u8,
-            ]);
+            buf[y * fw + x] = rgb;
         }
     }
-    out
+    (buf, weight)
+}
+
+/// 清雲與夜空上色：都在去煙後的影像上做，作用範圍由天空遮罩決定
+fn apply_sky(buf: &mut [[f32; 3]], weight: &[f32], fw: usize, fh: usize, p: SmokeParams) {
+    let sky = sky_mask(buf, fw, fh, p.sky_range);
+    let clean = p.sky_clean as f32 / 100.0;
+    let tint = p.sky_tint as f32 / 100.0;
+    // 目標夜空色（線性光）與它的亮度。
+    // 不能只換色度：清完雲的夜空已經接近純黑，而黑色沒有色度可換，
+    // 乘上任何色度都還是黑。夜空的顏色本來就是「天空自己的微光」，
+    // 所以改成把這個顏色補上去
+    let tint_target = p.sky_color.filter(|_| tint > 0.0).map(|c| {
+        let lin = [
+            srgb_to_linear(c[0] as f32 / 255.0),
+            srgb_to_linear(c[1] as f32 / 255.0),
+            srgb_to_linear(c[2] as f32 / 255.0),
+        ];
+        let y = 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2];
+        (lin, y)
+    });
+
+    for i in 0..fw * fh {
+        let s = sky.d[i] * weight[i];
+        if s <= 0.0 {
+            continue;
+        }
+        let rgb = &mut buf[i];
+        // 清雲：把天空的亮度往下壓，雲與殘餘輝光跟著消失
+        if clean > 0.0 {
+            let k = 1.0 - clean * s;
+            for c in 0..3 {
+                rgb[c] *= k;
+            }
+        }
+        // 上色：把夜空色補到天空上。已經比目標色亮的地方（星點、刻意留下的
+        // 薄雲）幾乎不受影響，整片天空才不會被填成一塊死板的純色
+        if let Some((target, ty)) = tint_target {
+            if ty > 1e-6 {
+                let y = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+                let deficit = (1.0 - y / ty).clamp(0.0, 1.0);
+                let a = tint * s * deficit;
+                for c in 0..3 {
+                    rgb[c] += target[c] * a;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -922,6 +1119,61 @@ mod tests {
         let out = remove_smoke(&img, p);
         let brightest = out.pixels().map(|p| p.0.iter().copied().max().unwrap()).max();
         assert_eq!(brightest, Some(0), "與保護色差很遠卻沒被去煙");
+    }
+
+    /// 只清雲、不去煙時也要生效（強度 0 不能被當成「什麼都不做」）
+    #[test]
+    fn sky_clean_works_without_dehazing() {
+        // 上半部是均勻的暗雲、下半部純黑，中間沒有東西隔開
+        let mut img = solid(80, 80, [0, 0, 0]);
+        for y in 0..40 {
+            for x in 0..80 {
+                img.put_pixel(x, y, Rgb([40, 44, 60]));
+            }
+        }
+        let p = SmokeParams {
+            strength: 0,
+            sky_clean: 100,
+            sky_range: 60,
+            ..Default::default()
+        };
+        assert!(!p.is_neutral(), "只清雲時被當成什麼都不做");
+        let out = remove_smoke(&img, p);
+        let before = img.get_pixel(40, 10).0[2];
+        let after = out.get_pixel(40, 10).0[2];
+        assert!(after < before, "雲沒有被壓暗（{before} → {after}）");
+    }
+
+    /// 什麼都沒開時要原圖輸出
+    #[test]
+    fn nothing_enabled_returns_the_original() {
+        let img = solid(32, 32, [90, 80, 130]);
+        let p = SmokeParams {
+            strength: 0,
+            sky_clean: 0,
+            sky_color: None,
+            ..Default::default()
+        };
+        assert!(p.is_neutral());
+        assert_eq!(remove_smoke(&img, p), img);
+    }
+
+    /// 指定夜空色時，純黑的天空要被染上顏色（只換色度對黑色無效）
+    #[test]
+    fn sky_tint_colours_a_black_sky() {
+        let img = solid(80, 80, [0, 0, 0]);
+        let p = SmokeParams {
+            strength: 0,
+            sky_clean: 0,
+            sky_range: 60,
+            sky_color: Some([30, 60, 140]),
+            sky_tint: 100,
+            ..Default::default()
+        };
+        let out = remove_smoke(&img, p);
+        let px = out.get_pixel(40, 40).0;
+        assert!(px[2] > px[0], "夜空沒有被染成偏藍：{px:?}");
+        assert!(px[2] > 10, "夜空幾乎沒有上到色：{px:?}");
     }
 
     /// 滑動極值濾波要與暴力法一致
